@@ -37,13 +37,30 @@ impl Identity {
         let cert_der = cert.der().to_vec();
         let key_der = key_pair.serialize_der();
         fs::write(&cert_path, &cert_der)?;
-        fs::write(&key_path, &key_der)?;
+        Self::write_key_owner_only(&key_path, &key_der)?;
+        Ok(Self::from_parts(cert_der, key_der))
+    }
+
+    /// 私钥文件必须从创建那一刻起就是 0600,不能先写后收权限(TOCTOU)。
+    fn write_key_owner_only(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            f.write_all(data)?;
+            Ok(())
         }
-        Ok(Self::from_parts(cert_der, key_der))
+        #[cfg(not(unix))]
+        {
+            // Windows 无 POSIX 位;密钥位于用户 AppData,由账户 ACL 保护(M6 再评估 DPAPI)
+            fs::write(path, data)
+        }
     }
 
     fn from_parts(cert_der: Vec<u8>, key_der: Vec<u8>) -> Self {
