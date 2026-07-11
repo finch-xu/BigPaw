@@ -176,13 +176,24 @@ impl TransportManager {
                 Ok(tcp) => {
                     tcp.set_nodelay(true).ok();
                     let name = ServerName::try_from("bigpaw").expect("static name");
-                    let conn = rustls::ClientConnection::new(cfg.clone(), name)?;
-                    let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-                    proto::write_msg(&mut tls_stream, &Msg::Hello { v: proto::PROTO_V })?;
-                    // 对称:也从出站连接收消息(对端可能沿此连接回话)
-                    // 读线程需要独立的流——TcpStream 可 try_clone,TLS 状态不可,
-                    // 因此 M2 出站连接只写不读;对端回话走它自己的出站连接。
-                    return Ok(tls_stream);
+                    match rustls::ClientConnection::new(cfg.clone(), name) {
+                        Ok(conn) => {
+                            let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+                            match proto::write_msg(
+                                &mut tls_stream,
+                                &Msg::Hello { v: proto::PROTO_V },
+                            ) {
+                                Ok(()) => {
+                                    // 对称:也从出站连接收消息(对端可能沿此连接回话)
+                                    // 读线程需要独立的流——TcpStream 可 try_clone,TLS 状态不可,
+                                    // 因此 M2 出站连接只写不读;对端回话走它自己的出站连接。
+                                    return Ok(tls_stream);
+                                }
+                                Err(e) => last = Some(e),
+                            }
+                        }
+                        Err(e) => last = Some(io::Error::other(e)),
+                    }
                 }
                 Err(e) => last = Some(e),
             }
@@ -205,19 +216,18 @@ impl TransportManager {
     /// 紧跟着的 FIN,造成误判"仍存活"。正确做法是通过 TLS 层的 `read()`
     /// 把这些握手层记录喂给 rustls 处理掉(不产生应用层数据),直到确实
     /// 没有更多数据(`WouldBlock`,连接存活)或读到干净 EOF/错误(连接已
-    /// 死)为止。
+    /// 死)为止。若收到应用层数据,则为协议违反(出站连接只写不读),
+    /// 视连接为可疑,强制重拨。
     fn conn_is_dead(conn: &mut ClientTls) -> bool {
         if conn.sock.set_nonblocking(true).is_err() {
             return false; // 无法探测:乐观放行,交给写失败兜底
         }
         let mut buf = [0u8; 256];
-        let dead = loop {
-            match io::Read::read(conn, &mut buf) {
-                Ok(0) => break true,                                            // 干净 EOF:已死
-                Ok(_) => continue, // 消费掉握手层记录(如 ticket),继续排空
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break false, // 无更多数据:仍存活
-                Err(_) => break true, // 其他错误:视为已死
-            }
+        let dead = match io::Read::read(conn, &mut buf) {
+            Ok(0) => true,                                            // 干净 EOF:已死
+            Ok(_) => true,  // 收到应用数据:协议违反(出站连接只写),强制重拨
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => false, // 无更多数据:仍存活
+            Err(_) => true, // 其他错误:视为已死
         };
         let _ = conn.sock.set_nonblocking(false);
         dead
