@@ -11,7 +11,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.0",
