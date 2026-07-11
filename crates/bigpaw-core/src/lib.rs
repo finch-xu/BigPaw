@@ -5,6 +5,7 @@
 pub const PROTOCOL_VERSION: u16 = 1;
 
 pub mod identity;
+pub mod roster;
 
 #[cfg(test)]
 mod tests {
