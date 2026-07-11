@@ -2,3 +2,4 @@
 name = "bigpaw-core"
 version.workspace = true
 edition.workspace = true
+publish = false

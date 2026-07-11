@@ -2,6 +2,7 @@
 name = "bigpaw"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [lib]
 name = "bigpaw_lib"
