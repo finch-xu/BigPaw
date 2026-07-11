@@ -73,12 +73,12 @@ impl Core {
 
     /// 主动下线:注销 mDNS(发 goodbye),对端立刻收到 Lost 而不是等 TTL 过期。幂等。
     pub fn shutdown(&self) {
-        if let Some(d) = self
+        let discovery = self
             .discovery
             .lock()
             .expect("discovery lock poisoned")
-            .take()
-        {
+            .take();
+        if let Some(d) = discovery {
             d.shutdown();
         }
     }
