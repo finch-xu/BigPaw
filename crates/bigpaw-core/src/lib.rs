@@ -4,6 +4,7 @@
 /// 原生协议版本，握手帧携带（设计文档 §5.2）。
 pub const PROTOCOL_VERSION: u16 = 1;
 
+pub mod core;
 pub mod discovery;
 pub mod identity;
 pub mod roster;
