@@ -14,11 +14,15 @@ export default function App() {
     let cancelled = false;
     (async () => {
       try {
+        // 先订阅再拉快照:快照是全量状态,晚到的快照覆盖早到的事件也不会丢数据
+        const un = await listen<Peer[]>("roster://updated", (e) => setPeers(e.payload));
+        if (cancelled) {
+          un();
+          return;
+        }
+        unlisten = un;
         setSelf(await invoke<SelfInfo>("get_self_info"));
         setPeers(await invoke<Peer[]>("get_roster"));
-        const un = await listen<Peer[]>("roster://updated", (e) => setPeers(e.payload));
-        if (cancelled) un();
-        else unlisten = un;
       } catch (e) {
         console.error("初始化失败:", e);
       }
