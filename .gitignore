@@ -22,3 +22,10 @@ target
 
 # 内部设计文档,不进入公开仓库
 docs/
+
+# Node / 前端产物
+node_modules/
+ui/dist/
+
+# Tauri 生成物
+src-tauri/gen/schemas/
