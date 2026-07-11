@@ -29,3 +29,10 @@ ui/dist/
 
 # Tauri 生成物
 src-tauri/gen/schemas/
+
+# 会话工作文件与敏感文件,绝不提交
+.superpowers/
+*.log
+*.der
+*.pem
+*.key
