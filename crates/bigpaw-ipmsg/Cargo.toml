@@ -1,0 +1,4 @@
+[package]
+name = "bigpaw-ipmsg"
+version.workspace = true
+edition.workspace = true
