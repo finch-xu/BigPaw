@@ -3,3 +3,12 @@ name = "bigpaw-core"
 version.workspace = true
 edition.workspace = true
 publish = false
+
+[dependencies]
+rcgen = "0.13"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
