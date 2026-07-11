@@ -4,7 +4,11 @@
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
 use crate::roster::{Peer, Roster};
+use crate::transport::manager::{
+    MessageEvent, SentText, TransportError, TransportManager, DEFAULT_PORT,
+};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::watch;
 
@@ -14,6 +18,10 @@ pub enum CoreError {
     Identity(#[from] IdentityError),
     #[error("mdns: {0}")]
     Mdns(#[from] mdns_sd::Error),
+    #[error("transport: {0}")]
+    Transport(#[from] TransportError),
+    #[error("对端不在线或未知")]
+    UnknownPeer,
 }
 
 pub struct CoreConfig {
@@ -23,24 +31,32 @@ pub struct CoreConfig {
 }
 
 pub struct Core {
-    identity: Identity,
+    identity: Arc<Identity>,
     nickname: String,
     roster_rx: watch::Receiver<Vec<Peer>>,
+    roster_handle: Arc<Mutex<Roster>>,
     discovery: std::sync::Mutex<Option<Discovery>>,
+    transport: Arc<TransportManager>,
+    messages_rx: Mutex<Option<std::sync::mpsc::Receiver<MessageEvent>>>,
 }
 
 impl Core {
     pub fn start(cfg: CoreConfig) -> Result<Self, CoreError> {
-        let identity = Identity::load_or_create(&cfg.data_dir)?;
+        let identity = Arc::new(Identity::load_or_create(&cfg.data_dir)?);
         let nickname = cfg.nickname.unwrap_or_else(default_nickname);
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        let discovery = Discovery::start(&identity, &nickname, 0, tx)?;
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
 
+        let (tx, rx) = std::sync::mpsc::channel();
+        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx)?; // 真实端口进 SRV
+
+        let roster_handle = Arc::new(Mutex::new(Roster::new(identity.fingerprint.clone())));
         let (watch_tx, watch_rx) = watch::channel(Vec::new());
-        let mut roster = Roster::new(identity.fingerprint.clone());
+        let roster_for_thread = roster_handle.clone();
         std::thread::spawn(move || {
             while let Ok(ev) = rx.recv() {
+                let mut roster = roster_for_thread.lock().expect("roster lock");
                 if roster.apply(ev) && watch_tx.send(roster.snapshot()).is_err() {
                     break; // 订阅端全部销毁
                 }
@@ -51,7 +67,10 @@ impl Core {
             identity,
             nickname,
             roster_rx: watch_rx,
+            roster_handle,
             discovery: std::sync::Mutex::new(Some(discovery)),
+            transport,
+            messages_rx: Mutex::new(Some(msg_rx)),
         })
     }
 
@@ -69,6 +88,29 @@ impl Core {
 
     pub fn subscribe(&self) -> watch::Receiver<Vec<Peer>> {
         self.roster_rx.clone()
+    }
+
+    /// 给对端发文本。地址与端口取自 roster 当前快照。
+    pub fn send_text(&self, peer_fp: &str, body: &str) -> Result<SentText, CoreError> {
+        let (addrs, port) = {
+            let roster = self.roster_handle.lock().expect("roster lock");
+            let peer = roster
+                .snapshot()
+                .into_iter()
+                .find(|p| p.fingerprint == peer_fp)
+                .ok_or(CoreError::UnknownPeer)?;
+            (peer.addrs, peer.port)
+        };
+        Ok(self.transport.send_text(peer_fp, &addrs, port, body)?)
+    }
+
+    /// 取走消息接收端(只能取一次,由壳层的事件循环消费)。
+    pub fn take_messages(&self) -> Option<std::sync::mpsc::Receiver<MessageEvent>> {
+        self.messages_rx.lock().expect("messages lock").take()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.transport.port()
     }
 
     /// 主动下线:注销 mDNS(发 goodbye),对端立刻收到 Lost 而不是等 TTL 过期。幂等。
