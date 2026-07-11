@@ -1,14 +1,67 @@
-use bigpaw_core::PROTOCOL_VERSION;
+use bigpaw_core::core::{Core, CoreConfig};
+use bigpaw_core::roster::Peer;
+use serde::Serialize;
+use tauri::{Emitter, Manager, State};
 
-/// IPC 连通性验证：前端 → Tauri 壳 → bigpaw-core 链路贯通的证明。
+struct AppCore(Core);
+
+#[derive(Serialize)]
+struct SelfInfo {
+    nickname: String,
+    fingerprint: String,
+}
+
+/// IPC 连通性验证:前端 → Tauri 壳 → bigpaw-core 链路贯通的证明。
 #[tauri::command]
 fn ping() -> String {
-    format!("pong v{PROTOCOL_VERSION}")
+    format!("pong v{}", bigpaw_core::PROTOCOL_VERSION)
+}
+
+#[tauri::command]
+fn get_self_info(core: State<'_, AppCore>) -> SelfInfo {
+    SelfInfo {
+        nickname: core.0.nickname().to_string(),
+        fingerprint: core.0.fingerprint().to_string(),
+    }
+}
+
+#[tauri::command]
+fn get_roster(core: State<'_, AppCore>) -> Vec<Peer> {
+    core.0.roster_snapshot()
 }
 
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![ping])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            let core = Core::start(CoreConfig {
+                data_dir,
+                nickname: None,
+            })?;
+
+            let mut rx = core.subscribe();
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let snapshot = rx.borrow_and_update().clone();
+                    let _ = handle.emit("roster://updated", &snapshot);
+                    // 节流:两次推送至少间隔 200ms(设计文档 §2 铁律)
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            });
+
+            app.manage(AppCore(core));
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![ping, get_self_info, get_roster])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                // 退出前注销 mDNS,让对端立刻看到我们下线
+                if let Some(core) = app_handle.try_state::<AppCore>() {
+                    core.0.shutdown();
+                }
+            }
+        });
 }

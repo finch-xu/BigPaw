@@ -26,7 +26,7 @@ pub struct Core {
     identity: Identity,
     nickname: String,
     roster_rx: watch::Receiver<Vec<Peer>>,
-    _discovery: Discovery,
+    discovery: std::sync::Mutex<Option<Discovery>>,
 }
 
 impl Core {
@@ -51,7 +51,7 @@ impl Core {
             identity,
             nickname,
             roster_rx: watch_rx,
-            _discovery: discovery,
+            discovery: std::sync::Mutex::new(Some(discovery)),
         })
     }
 
@@ -69,6 +69,18 @@ impl Core {
 
     pub fn subscribe(&self) -> watch::Receiver<Vec<Peer>> {
         self.roster_rx.clone()
+    }
+
+    /// 主动下线:注销 mDNS(发 goodbye),对端立刻收到 Lost 而不是等 TTL 过期。幂等。
+    pub fn shutdown(&self) {
+        if let Some(d) = self
+            .discovery
+            .lock()
+            .expect("discovery lock poisoned")
+            .take()
+        {
+            d.shutdown();
+        }
     }
 }
 
@@ -100,5 +112,17 @@ mod tests {
         let n = default_nickname();
         assert!(!n.is_empty());
         assert!(!n.ends_with(".local"));
+    }
+
+    #[test]
+    fn shutdown_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        core.shutdown();
+        core.shutdown(); // 第二次调用不得 panic
     }
 }

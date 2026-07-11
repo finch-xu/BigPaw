@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>BigPaw 需要访问本地网络,以发现局域网内的其他 BigPaw 设备并与之通信。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_bigpaw._tcp</string>
+	</array>
+</dict>
+</plist>
