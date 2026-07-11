@@ -225,7 +225,7 @@ impl TransportManager {
         let mut buf = [0u8; 256];
         let dead = match io::Read::read(conn, &mut buf) {
             Ok(0) => true,                                            // 干净 EOF:已死
-            Ok(_) => true,  // 收到应用数据:协议违反(出站连接只写),强制重拨
+            Ok(_) => true, // 收到应用数据:协议违反(出站连接只写),强制重拨
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => false, // 无更多数据:仍存活
             Err(_) => true, // 其他错误:视为已死
         };
