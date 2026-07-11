@@ -16,11 +16,19 @@ pub enum IdentityError {
     IncompletePair,
 }
 
-#[derive(Debug)]
 pub struct Identity {
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
     pub fingerprint: String,
+}
+
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 绝不打印私钥/证书字节
+        f.debug_struct("Identity")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Identity {
@@ -141,5 +149,16 @@ mod tests {
         // 原 fingerprint 不应被覆盖:证书文件仍是旧的
         let cert = std::fs::read(dir.path().join("identity.cert.der")).unwrap();
         assert_eq!(a.fingerprint, hex::encode(sha2::Sha256::digest(&cert)));
+    }
+
+    #[test]
+    fn half_pair_missing_cert_is_also_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        Identity::load_or_create(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("identity.cert.der")).unwrap();
+        assert!(matches!(
+            Identity::load_or_create(dir.path()),
+            Err(IdentityError::IncompletePair)
+        ));
     }
 }
