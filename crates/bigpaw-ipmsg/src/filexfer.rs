@@ -113,10 +113,11 @@ fn parse_one_file_entry(chunk: &str) -> Option<IpmsgFileEntry> {
         return None;
     }
     let file_id = u32::from_str_radix(&fields[0], 16).ok()?;
-    let name = fields[1].clone();
-    if name.is_empty() {
-        return None;
-    }
+    // 安全关键:对端可在清单里塞任意字符串当文件名(协议本身不禁止 `/`/`..`)。
+    // 在这里就用 safe_basename 净化——非法(路径穿越/Windows 危险名/空)则整条丢弃,
+    // 这样 IpmsgFileEntry.name 从构造起就是一个安全 basename,FileOffered
+    // 事件永远不会携带危险文件名往下游传播(见 request_file_bytes 的第二层净化)。
+    let name = safe_basename(&fields[1])?;
     let size = u64::from_str_radix(&fields[2], 16).ok()?;
     let _mtime = u64::from_str_radix(&fields[3], 16).ok()?;
     let fileattr = u32::from_str_radix(&fields[4], 16).ok()?;
@@ -260,7 +261,8 @@ pub fn tcp_serve_loop(listener: TcpListener, stop: Arc<AtomicBool>, offered: Off
 // ---- TCP GETFILEDATA:客户端(拉取) ----
 
 /// 已连上对端 2425 的 TCP 流上:发送 GETFILEDATA 请求 + 读回 `size` 字节落盘。
-/// `save_path` 的文件名部分会被 basename 化(拒绝穿越/危险名),最终写入路径为
+/// `save_path` 的文件名部分会被 basename 化(拒绝穿越/危险名),且整条路径不允许
+/// 出现任何 `..` 段(见 `sanitize_save_path`);最终写入路径为
 /// `save_path 所在目录 / 净化后的文件名`。offset 固定为 0(M5 不做断点续传)。
 #[allow(clippy::too_many_arguments)]
 pub fn request_file_bytes(
@@ -302,7 +304,26 @@ pub fn request_file_bytes(
 
 /// `save_path` 的文件名部分 basename 化;目录部分按需创建。落盘文件名安全性的
 /// 最后一道防线(不完全信任调用方已经净化过)。
+///
+/// 安全关键(纵深防御第二层):`IpmsgFileEntry.name`(唯一的不可信输入来源)
+/// 已经在解析层(`parse_one_file_entry`)被 `safe_basename` 净化,不可能再带
+/// `/`/`\`/`..`,所以正常的 `download_dir.join(&entry.name)` 不会产生穿越路径。
+/// 但这里仍不完全信任调用方——如果 `save_path` 途中**任何一段**是 `..`
+/// (`Component::ParentDir`),整条直接拒绝,而不是像旧实现那样只检查最后一段
+/// (`file_name()`)、对 `parent()` 里可能残留的穿越段视而不见:那样的话,一旦
+/// 调用方在解析层被绕过之前就拼出 `download_dir.join("../../../tmp/evil.txt")`
+/// 这样的路径,`file_name()` 只会看到末尾的 `evil.txt`(能通过 basename 校验),
+/// `parent()` 却仍然带着中间的 `..` 段,写盘时会被 OS 解析到 `download_dir`
+/// 之外。这一层检查不额外校验 `save_path` 的合法目录名部分(避免对真实存在、
+/// 恰好撞上 Windows 保留名/尾随空格等规则的合法目录名造成误伤),只专门堵
+/// `..` 这一个逃逸向量,与解析层的 `safe_basename` 校验相互独立、互为冗余。
 fn sanitize_save_path(save_path: &Path) -> Result<PathBuf, IpmsgError> {
+    if save_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(IpmsgError::BadName);
+    }
     let file_name = save_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -513,12 +534,68 @@ mod tests {
         assert_eq!(files[0].name, "ok.txt");
     }
 
+    /// 安全回归:恶意对端在清单里塞一个路径穿越文件名(如 `../../../etc/passwd`),
+    /// 该条目必须在解析阶段就被整条丢弃(不出现在返回的 files 里),绝不能作为
+    /// `IpmsgFileEntry.name` 流向下游、被某个调用方 `download_dir.join(name)` 后
+    /// 逃出下载目录。同批次里的合法中文文件名条目仍应正常解析,证明畸形条目
+    /// 不会连累其余条目(与既有的"坏 hex 条目不影响好条目"同一模式)。
     #[test]
-    fn colon_in_filename_escapes_and_roundtrips() {
-        let extra = build_file_offer_extra("", 0, "10:30 会议记录.txt", 5, 0, FILE_REGULAR);
-        assert!(extra.contains("10::30")); // 转义成了 "::"
+    fn parse_file_attach_extra_drops_traversal_entry_name() {
+        let evil = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            0u32, "../../../etc/passwd", 10u64, 0u64, FILE_REGULAR
+        );
+        let good = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            1u32, "你好.txt", 5u64, 0u64, FILE_REGULAR
+        );
+        let extra = format!("m\u{0}{evil}\u{7}{good}");
         let (_, files) = parse_file_attach_extra(&extra);
-        assert_eq!(files[0].name, "10:30 会议记录.txt");
+        assert_eq!(files.len(), 1, "穿越文件名条目必须被丢弃,只剩合法的那条");
+        assert_eq!(files[0].name, "你好.txt");
+        assert!(files.iter().all(|f| !f.name.contains('/')));
+    }
+
+    /// 同上,但穿越 payload 用反斜杠(Windows 风格)——同样必须被丢弃。
+    #[test]
+    fn parse_file_attach_extra_drops_backslash_traversal_entry_name() {
+        let evil = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            0u32, "..\\..\\evil.txt", 4u64, 0u64, FILE_REGULAR
+        );
+        let extra = format!("m\u{0}{evil}");
+        let (_, files) = parse_file_attach_extra(&extra);
+        assert!(files.is_empty());
+    }
+
+    /// 转义机制本身(`escape_colon`/`split_escaped_fields`)必须正确处理字段内
+    /// 字面 `:` 与分隔符 `:` 的区别——这是清单里所有 `:` 分隔字段共享的机制,不是
+    /// 文件名专属。刻意在字段拆分这一层验证,避免跟 `safe_basename` 的"文件名
+    /// 不允许出现 `:`(NTFS 备用数据流防护)"规则的断言混在一起。
+    #[test]
+    fn colon_escaping_roundtrips_at_the_field_splitting_level() {
+        let escaped = escape_colon("10:30 会议记录");
+        assert_eq!(escaped, "10::30 会议记录");
+        let fields = split_escaped_fields(&format!("{escaped}:next"));
+        assert_eq!(
+            fields,
+            vec!["10:30 会议记录".to_string(), "next".to_string()]
+        );
+    }
+
+    /// Fix 1 的直接后果:文件名里若真的带 `:`,即使 wire 上转义/反转义完全正确
+    /// (上一条测试已证明),`parse_one_file_entry` 也必须把整条目丢弃——
+    /// `IpmsgFileEntry.name` 必须始终是 `safe_basename` 认可的安全 basename,
+    /// 不允许把 NTFS 备用数据流风险的名字传播到 FileOffered 事件里。
+    #[test]
+    fn parse_file_attach_extra_drops_colon_in_filename_entry() {
+        let extra = build_file_offer_extra("", 0, "10:30 会议记录.txt", 5, 0, FILE_REGULAR);
+        assert!(extra.contains("10::30")); // wire 上确实转义成了 "::"
+        let (_, files) = parse_file_attach_extra(&extra);
+        assert!(
+            files.is_empty(),
+            "文件名含 ':' 必须被拒绝,不能作为安全 basename 往下游传播"
+        );
     }
 
     // ---- GETFILEDATA extra ----
@@ -637,9 +714,6 @@ mod tests {
 
     #[test]
     fn request_file_bytes_sanitizes_save_path_basename() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener); // 只需要一个不会被连接成功的地址来触发早期的净化失败路径
         let dir = tempfile::tempdir().unwrap();
         let bad_path = dir.path().join("..");
         // file_name() 对 ".." 返回 None → sanitize 阶段就应该失败,不会真的去 connect。
@@ -656,7 +730,43 @@ mod tests {
             &bad_path,
         );
         assert!(matches!(result, Err(IpmsgError::BadName)));
-        let _ = addr;
+    }
+
+    /// 安全回归(Fix 1 第二层,纵深防御):即使某个调用方按最自然的写法
+    /// `download_dir.join(&entry.name)` 拼出 `save_path`(而不是分别传入受信目录
+    /// 与不可信文件名),只要拼接结果里任何一段是 `..`,`request_file_bytes` 也
+    /// 必须拒绝并且**不写任何字节**——既不写到 tmpdir 之外,也不在 tmpdir 内留下
+    /// 任何文件(sanitize 在打开文件之前就失败了)。这一层不依赖解析层
+    /// (`parse_one_file_entry`)是否已经净化过 `entry.name`,是独立的第二道防线。
+    #[test]
+    fn request_file_bytes_rejects_traversal_save_path_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // 模拟调用方对未净化文件名做 `download_dir.join(&entry.name)` 的经典穿越写法。
+        let malicious_name = "../../evil-traversal-test.bin";
+        let save_path = dir.path().join(malicious_name);
+        let escaping_target = dir.path().join("..").join("evil-traversal-test.bin");
+        let mut fake = Vec::<u8>::new(); // 不会被用到:sanitize 在网络 IO 之前发生
+        let result = request_file_bytes(
+            &mut Cursor::new(&mut fake),
+            "1",
+            1,
+            "bob",
+            "HOST-B",
+            1,
+            1,
+            0,
+            &save_path,
+        );
+        assert!(matches!(result, Err(IpmsgError::BadName)));
+        assert!(
+            !escaping_target.exists(),
+            "净化必须在任何落盘发生前失败,tmpdir 之外不应出现文件"
+        );
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "tmpdir 内也不应留下任何文件"
+        );
     }
 
     // ---- GETDIRFILES 接收方向解析 ----

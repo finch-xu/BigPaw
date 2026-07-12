@@ -32,6 +32,12 @@ const RECV_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 const ENTRY_INTERVAL: Duration = Duration::from_secs(30);
 /// 中断式休眠的步长,让停止标志能被及时观察到。
 const SLEEP_STEP: Duration = Duration::from_millis(200);
+/// 出站 TCP(request_file/request_dir)连接超时:防止对端网络黑洞导致
+/// `TcpStream::connect` 无限期挂起调用线程。
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 出站 TCP 读超时,与服务端 `tcp_serve_loop` 的 10s 读超时对称:对端卡住
+/// 不发数据/发一半就停,`read_exact` 会在 10s 后返回超时错误而不是永久阻塞。
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 发现事件:上线(含弱身份 key、昵称、主机名、来源地址、是否为 BigPaw 对端)/下线。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,7 +563,12 @@ impl IpmsgService {
 
     /// TCP 连 `sender_addr`(对端 IPMsg 端口,通常与 `packet.src` 相同),按
     /// `packetID:fileID:offset`(全十六进制)请求单个文件,读回 `size` 字节写入
-    /// `save_path`(文件名会被 basename 化)。M5 不做断点续传,offset 固定 0。
+    /// `save_path`(文件名会被 basename 化,整条路径不允许出现 `..` 段——见
+    /// `filexfer::sanitize_save_path`)。M5 不做断点续传,offset 固定 0。
+    ///
+    /// 连接/读超时:`connect_timeout` 5s + `set_read_timeout` 10s,与服务端
+    /// (`tcp_serve_loop` 侧的 10s 读超时)对称,避免对端连上不发数据/发一半就
+    /// 卡住时把调用线程永久挂起在 `read_exact` 里。
     pub fn request_file(
         &self,
         sender_addr: SocketAddr,
@@ -566,7 +577,8 @@ impl IpmsgService {
         size: u64,
         save_path: &Path,
     ) -> Result<PathBuf, IpmsgError> {
-        let mut stream = TcpStream::connect(sender_addr)?;
+        let mut stream = TcpStream::connect_timeout(&sender_addr, CLIENT_CONNECT_TIMEOUT)?;
+        stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
         let my_packet_no = next_packet_no(&self.packet_no);
         filexfer::request_file_bytes(
             &mut stream,
@@ -584,6 +596,9 @@ impl IpmsgService {
     /// TCP 连 `sender_addr`,发 `GETDIRFILES`(extra=`packetID:fileID` 全十六进制)
     /// 请求一个文件夹,解析对端的目录流并落盘到 `save_dir`。仅接收方向
     /// (设计文档 §6 冻结:文件夹仅接收,本服务不响应对端的 GETDIRFILES 请求)。
+    ///
+    /// 连接/读超时同 `request_file`:5s 连接超时 + 10s 读超时,防止对端卡住
+    /// 目录流传输时把调用线程挂死。
     pub fn request_dir(
         &self,
         sender_addr: SocketAddr,
@@ -591,7 +606,8 @@ impl IpmsgService {
         file_id: u32,
         save_dir: &Path,
     ) -> Result<PathBuf, IpmsgError> {
-        let mut stream = TcpStream::connect(sender_addr)?;
+        let mut stream = TcpStream::connect_timeout(&sender_addr, CLIENT_CONNECT_TIMEOUT)?;
+        stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
         let packet = Packet {
             version: IPMSG_VERSION.to_string(),
             packet_no: next_packet_no(&self.packet_no),
