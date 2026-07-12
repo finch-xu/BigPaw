@@ -8,6 +8,7 @@ pub mod core;
 pub mod discovery;
 pub mod identity;
 pub mod roster;
+pub mod storage;
 pub mod transport;
 
 #[cfg(test)]

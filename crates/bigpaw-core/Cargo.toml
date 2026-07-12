@@ -21,6 +21,7 @@ blake3 = "1"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
 bigpaw-ipmsg = { path = "../bigpaw-ipmsg" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
