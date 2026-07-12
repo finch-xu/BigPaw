@@ -138,7 +138,11 @@ impl Core {
     pub fn start(cfg: CoreConfig) -> Result<Self, CoreError> {
         let identity = Arc::new(Identity::load_or_create(&cfg.data_dir)?);
         let storage = Arc::new(Storage::open(&cfg.data_dir)?);
-        let nickname = cfg.nickname.unwrap_or_else(default_nickname);
+        let settings = crate::settings::load(&cfg.data_dir);
+        let nickname = cfg
+            .nickname
+            .or_else(|| settings.nickname.clone())
+            .unwrap_or_else(default_nickname);
 
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         // 留一份克隆给 IPMsg 兼容层的事件转发线程(见下):TextReceived/
@@ -152,14 +156,17 @@ impl Core {
         // 标志供 `ipmsg_available()`/壳层 `ipmsg_status()` 命令查询。
         let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
         let ipmsg_host = hostname_no_local();
-        let (ipmsg_service, ipmsg_available) =
+        let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
             match IpmsgService::start(&nickname, &ipmsg_host, IPMSG_PORT, ipmsg_evt_tx) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
                     eprintln!("ipmsg: {IPMSG_PORT} 端口不可用({e}),兼容层已禁用(原生栈不受影响)");
                     (None, false)
                 }
-            };
+            }
+        } else {
+            (None, false) // 用户在设置里关闭了兼容层
+        };
         let ipmsg_offers: Arc<Mutex<HashMap<String, IpmsgOffer>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
@@ -195,8 +202,34 @@ impl Core {
             });
         }
 
-        let roster_handle = Arc::new(Mutex::new(Roster::new(identity.fingerprint.clone())));
-        let (watch_tx, watch_rx) = watch::channel(Vec::new());
+        let mut roster_init = Roster::new(identity.fingerprint.clone());
+        match storage.known_peers() {
+            Ok(known) => roster_init.seed_offline(
+                known
+                    .into_iter()
+                    .map(|k| Peer {
+                        fingerprint: k.fingerprint,
+                        nickname: k.nickname,
+                        addrs: k
+                            .last_addr
+                            .and_then(|a| a.parse().ok())
+                            .into_iter()
+                            .collect(),
+                        port: 0,
+                        protocol: if k.protocol == "ipmsg" {
+                            Protocol::Ipmsg
+                        } else {
+                            Protocol::Native
+                        },
+                        state: PeerState::Offline,
+                    })
+                    .collect(),
+            ),
+            Err(e) => eprintln!("storage: 读取已知 peer 失败(跳过预热): {e}"),
+        }
+        let initial_snapshot = roster_init.snapshot();
+        let roster_handle = Arc::new(Mutex::new(roster_init));
+        let (watch_tx, watch_rx) = watch::channel(initial_snapshot);
         let roster_for_thread = roster_handle.clone();
         let history = Arc::new(Mutex::new(HistoryStore::load(&cfg.data_dir)));
 
@@ -222,6 +255,7 @@ impl Core {
         let transport_for_thread = transport.clone();
         let roster_stop = Arc::new(AtomicBool::new(false));
         let roster_stop_for_thread = roster_stop.clone();
+        let storage_for_roster = storage.clone();
         let roster_thread = std::thread::spawn(move || {
             let transport = transport_for_thread;
             // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
@@ -230,8 +264,29 @@ impl Core {
             loop {
                 match rx.recv_timeout(ROSTER_TICK) {
                     Ok(ev) => {
-                        if let DiscoveryEvent::Seen { fingerprint, .. } = &ev {
+                        if let DiscoveryEvent::Seen {
+                            fingerprint,
+                            nickname,
+                            addrs,
+                            protocol,
+                            ..
+                        } = &ev
+                        {
                             last_seen.insert(fingerprint.clone(), Instant::now());
+                            let proto = match protocol {
+                                Protocol::Native => "native",
+                                Protocol::Ipmsg => "ipmsg",
+                            };
+                            let addr = addrs.first().map(|a| a.to_string());
+                            if let Err(e) = storage_for_roster.upsert_peer(
+                                fingerprint,
+                                nickname,
+                                proto,
+                                addr.as_deref(),
+                                crate::transport::proto::now_ms() as i64,
+                            ) {
+                                eprintln!("storage: peer 回写失败: {e}");
+                            }
                         }
                         // Seen 事件在被 apply 消费掉之前,先取出探测需要的字段。
                         // 只对 Native 协议做回连探测:ipmsg 对端的 TCP 2425 说的是
@@ -1382,6 +1437,74 @@ mod tests {
             }
             other => panic!("期望 File,得到 {other:?}"),
         }
+        core.shutdown();
+    }
+
+    // ---- 启动预热/settings 接入(M6 task6) ----
+
+    #[test]
+    fn start_seeds_offline_peers_from_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = Storage::open(dir.path()).unwrap();
+            s.upsert_peer("fpZ", "zoe", "native", Some("192.168.1.7"), 123)
+                .unwrap();
+        }
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        let snap = core.roster_snapshot();
+        let zoe = snap
+            .iter()
+            .find(|p| p.fingerprint == "fpZ")
+            .expect("已知 peer 应预热进 roster");
+        assert_eq!(zoe.state, PeerState::Offline);
+        assert_eq!(zoe.nickname, "zoe");
+        assert_eq!(zoe.addrs, vec!["192.168.1.7".parse::<IpAddr>().unwrap()]);
+        core.shutdown();
+    }
+
+    #[test]
+    fn start_uses_nickname_from_settings_when_cfg_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::settings::save(
+            dir.path(),
+            &crate::settings::Settings {
+                nickname: Some("设置里的名字".to_string()),
+                download_dir: None,
+                ipmsg_enabled: true,
+            },
+        )
+        .unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: None,
+        })
+        .unwrap();
+        assert_eq!(core.nickname(), "设置里的名字");
+        core.shutdown();
+    }
+
+    #[test]
+    fn start_skips_ipmsg_when_disabled_in_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::settings::save(
+            dir.path(),
+            &crate::settings::Settings {
+                nickname: None,
+                download_dir: None,
+                ipmsg_enabled: false,
+            },
+        )
+        .unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        assert!(!core.ipmsg_available(), "设置关闭时兼容层不启动");
         core.shutdown();
     }
 }
