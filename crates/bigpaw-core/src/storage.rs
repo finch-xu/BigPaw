@@ -13,6 +13,18 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
 }
 
+/// 全局搜索命中:只带定位与摘要,点击后用 history_around 拉上下文。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub peer_fp: String,
+    pub ts_ms: i64,
+    /// 命中的消息正文或文件名(原文,截断交给前端 CSS)
+    pub snippet: String,
+    /// "text" | "file"
+    pub kind: String,
+}
+
 /// 会话时间线里的一条记录:文本消息或文件传输。
 /// serde tag="kind" → 前端按 `item.kind === "text" | "file"` 判别。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -145,6 +157,81 @@ impl Storage {
             .collect::<Result<_, _>>()?;
         items.reverse();
         Ok(items)
+    }
+
+    /// 搜索定位的上下文窗:目标时间戳前 `half` 条 + 目标及之后 `half` 条,
+    /// 升序返回。两个方向各查一次再拼接,不依赖 OFFSET。
+    pub fn history_around(
+        &self,
+        peer_fp: &str,
+        ts_ms: i64,
+        half: u32,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        let mut before = self.history(peer_fp, Some(ts_ms), half)?;
+        let conn = self.conn.lock().expect("storage lock");
+        let mut stmt = conn.prepare(
+            "SELECT * FROM (
+               SELECT 'text' AS kind, id AS k1, peer_fp, direction, body AS k2,
+                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms
+               FROM messages WHERE peer_fp = ?1 AND ts_ms >= ?2
+               UNION ALL
+               SELECT 'file' AS kind, xfer_id AS k1, peer_fp, direction, name AS k2,
+                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms
+               FROM transfers WHERE peer_fp = ?1 AND ts_ms >= ?2
+             ) ORDER BY ts_ms ASC LIMIT ?3",
+        )?;
+        let after: Vec<HistoryItem> = stmt
+            .query_map(params![peer_fp, ts_ms, half + 1], row_to_item)?
+            .collect::<Result<_, _>>()?;
+        before.extend(after);
+        Ok(before)
+    }
+
+    /// 全局 LIKE 搜索(消息正文 + 文件名),新→旧。`\` 为转义符,
+    /// 用户输入里的 % _ \ 都按字面匹配。
+    pub fn search(&self, query: &str, limit: u32) -> Result<Vec<SearchHit>, StorageError> {
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let conn = self.conn.lock().expect("storage lock");
+        let mut stmt = conn.prepare(
+            "SELECT peer_fp, ts_ms, snippet, kind FROM (
+               SELECT peer_fp, ts_ms, body AS snippet, 'text' AS kind
+               FROM messages WHERE body LIKE ?1 ESCAPE '\\'
+               UNION ALL
+               SELECT peer_fp, ts_ms, name AS snippet, 'file' AS kind
+               FROM transfers WHERE name LIKE ?1 ESCAPE '\\'
+             ) ORDER BY ts_ms DESC LIMIT ?2",
+        )?;
+        let hits = stmt
+            .query_map(params![pattern, limit], |row| {
+                Ok(SearchHit {
+                    peer_fp: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    snippet: row.get(2)?,
+                    kind: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(hits)
+    }
+
+    /// 清空历史:`Some(fp)` 单会话,`None` 全部。messages 与 transfers 同删。
+    pub fn clear_history(&self, peer_fp: Option<&str>) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        match peer_fp {
+            Some(fp) => {
+                conn.execute("DELETE FROM messages WHERE peer_fp = ?1", params![fp])?;
+                conn.execute("DELETE FROM transfers WHERE peer_fp = ?1", params![fp])?;
+            }
+            None => {
+                conn.execute("DELETE FROM messages", [])?;
+                conn.execute("DELETE FROM transfers", [])?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -312,5 +399,57 @@ mod tests {
         s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
         s.insert_message("m2", "peerB", "in", "b", 2).unwrap();
         assert_eq!(s.history("peerA", None, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn history_around_returns_context_window() {
+        let s = mem();
+        for i in 0..20 {
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100).unwrap();
+        }
+        // 目标 ts=1000,前后各 3 条 → [700..=1300],含目标本身
+        let items = s.history_around("peerA", 1000, 3).unwrap();
+        assert_eq!(
+            items.iter().map(HistoryItem::ts_ms).collect::<Vec<_>>(),
+            vec![700, 800, 900, 1000, 1100, 1200, 1300]
+        );
+    }
+
+    #[test]
+    fn search_covers_message_body_and_file_name() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "明天开会记得带电脑", 1000).unwrap();
+        s.insert_message("m2", "peerB", "out", "好的", 2000).unwrap();
+        s.insert_transfer("x1", "peerB", "in", "会议纪要.docx", 10, false, "done", 3000)
+            .unwrap();
+        let hits = s.search("会", 50).unwrap();
+        assert_eq!(hits.len(), 2, "命中消息正文与文件名各一");
+        assert_eq!(hits[0].ts_ms, 3000, "新的在前");
+        assert_eq!(hits[0].kind, "file");
+        assert_eq!(hits[1].peer_fp, "peerA");
+    }
+
+    #[test]
+    fn search_escapes_like_wildcards() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "百分号%字面量", 1000).unwrap();
+        s.insert_message("m2", "peerA", "in", "别的", 2000).unwrap();
+        let hits = s.search("%", 50).unwrap();
+        assert_eq!(hits.len(), 1, "% 应按字面匹配,不是通配一切");
+    }
+
+    #[test]
+    fn clear_history_single_peer_and_all() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        s.insert_transfer("x1", "peerA", "in", "f", 1, false, "done", 2).unwrap();
+        s.insert_message("m2", "peerB", "in", "b", 3).unwrap();
+
+        s.clear_history(Some("peerA")).unwrap();
+        assert!(s.history("peerA", None, 50).unwrap().is_empty());
+        assert_eq!(s.history("peerB", None, 50).unwrap().len(), 1, "别的会话不受影响");
+
+        s.clear_history(None).unwrap();
+        assert!(s.history("peerB", None, 50).unwrap().is_empty(), "None = 全部清空");
     }
 }
