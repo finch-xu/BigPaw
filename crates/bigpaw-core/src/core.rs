@@ -7,6 +7,7 @@ use crate::discovery::announce::{
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
+use crate::storage::Storage;
 use crate::transport::manager::{
     MessageEvent, SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
@@ -67,6 +68,8 @@ pub enum CoreError {
     IpmsgUnavailable,
     #[error("对端不在线或未知")]
     UnknownPeer,
+    #[error("storage: {0}")]
+    Storage(#[from] crate::storage::StorageError),
 }
 
 pub struct CoreConfig {
@@ -111,6 +114,9 @@ pub struct Core {
     /// 本地生成的 `xfer_id -> (packet_no, file_id, 文件名, 大小)` 登记表,
     /// 供 `respond_file` 决定接受时反查、发起 `IpmsgService::request_file`。
     ipmsg_offers: Arc<Mutex<HashMap<String, IpmsgOffer>>>,
+    /// SQLite 持久化(M6):持久化泵线程、send_text/offer_file 落库、壳层
+    /// 历史查询命令共用。`Arc` 是因为泵线程与查询命令并发使用。
+    storage: Arc<Storage>,
 }
 
 /// 一条待决的 ipmsg 文件报价(见 `Core::ipmsg_offers` 字段注释)。
@@ -131,6 +137,7 @@ struct IpmsgOffer {
 impl Core {
     pub fn start(cfg: CoreConfig) -> Result<Self, CoreError> {
         let identity = Arc::new(Identity::load_or_create(&cfg.data_dir)?);
+        let storage = Arc::new(Storage::open(&cfg.data_dir)?);
         let nickname = cfg.nickname.unwrap_or_else(default_nickname);
 
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
@@ -308,6 +315,19 @@ impl Core {
             }
         });
 
+        // 持久化泵(M6):transport/ipmsg 的事件先写库、再转发给壳层。
+        // take_events() 对外签名不变——壳层拿到的是泵的出口端。
+        let (pump_tx, pump_rx) = std::sync::mpsc::channel();
+        let storage_for_pump = storage.clone();
+        std::thread::spawn(move || {
+            while let Ok(ev) = msg_rx.recv() {
+                persist_event(&storage_for_pump, &ev);
+                if pump_tx.send(ev).is_err() {
+                    break; // 消费端已销毁
+                }
+            }
+        });
+
         Ok(Self {
             identity,
             nickname,
@@ -316,13 +336,14 @@ impl Core {
             discovery: std::sync::Mutex::new(Some(discovery)),
             announce,
             transport,
-            events_rx: Mutex::new(Some(msg_rx)),
+            events_rx: Mutex::new(Some(pump_rx)),
             events_tx,
             roster_stop,
             roster_thread: Mutex::new(Some(roster_thread)),
             ipmsg: Mutex::new(ipmsg_service),
             ipmsg_available,
             ipmsg_offers,
+            storage,
         })
     }
 
@@ -357,14 +378,19 @@ impl Core {
     /// 调用方(壳层命令)不需要关心协议差异。
     pub fn send_text(&self, peer_fp: &str, body: &str) -> Result<SentText, CoreError> {
         let peer = self.find_peer(peer_fp)?;
-        match peer.protocol {
-            Protocol::Native => {
-                Ok(self
-                    .transport
-                    .send_text(peer_fp, &peer.addrs, peer.port, body)?)
-            }
-            Protocol::Ipmsg => self.send_text_ipmsg(&peer, body),
+        let sent = match peer.protocol {
+            Protocol::Native => self
+                .transport
+                .send_text(peer_fp, &peer.addrs, peer.port, body)?,
+            Protocol::Ipmsg => self.send_text_ipmsg(&peer, body)?,
+        };
+        if let Err(e) =
+            self.storage
+                .insert_message(&sent.id, peer_fp, "out", body, sent.ts_ms as i64)
+        {
+            eprintln!("storage: 出站消息落库失败: {e}");
         }
+        Ok(sent)
     }
 
     /// 给对端发起一次文件传输报价;同样按 `peer.protocol` 分派。原生一侧
@@ -372,15 +398,32 @@ impl Core {
     /// 事件都带着它,供调用方关联;ipmsg 一侧见 `offer_file_ipmsg` 注释。
     pub fn offer_file(&self, peer_fp: &str, path: &Path) -> Result<String, CoreError> {
         let peer = self.find_peer(peer_fp)?;
-        match peer.protocol {
+        let xfer_id = match peer.protocol {
             Protocol::Native => {
-                let handle = self
-                    .transport
-                    .offer_file(peer_fp, &peer.addrs, peer.port, path)?;
-                Ok(handle.xfer_id)
+                self.transport
+                    .offer_file(peer_fp, &peer.addrs, peer.port, path)?
+                    .xfer_id
             }
-            Protocol::Ipmsg => self.offer_file_ipmsg(&peer, path),
+            Protocol::Ipmsg => self.offer_file_ipmsg(&peer, path)?,
+        };
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0);
+        if let Err(e) = self.storage.insert_transfer(
+            &xfer_id,
+            peer_fp,
+            "out",
+            &name,
+            size,
+            false,
+            "active",
+            crate::transport::proto::now_ms() as i64,
+        ) {
+            eprintln!("storage: 出站文件记录落库失败: {e}");
         }
+        Ok(xfer_id)
     }
 
     /// 接收方对一个待决的文件报价做出决定(接受/拒绝)。先查 `ipmsg_offers`
@@ -398,10 +441,17 @@ impl Core {
             .lock()
             .expect("ipmsg offers lock")
             .remove(xfer_id);
-        match ipmsg_offer {
+        let route_result = match ipmsg_offer {
             Some(offer) => self.respond_file_ipmsg(xfer_id, offer, accept, download_dir),
             None => Ok(self.transport.respond_file(xfer_id, accept, download_dir)?),
+        };
+        if route_result.is_ok() {
+            let status = if accept { "active" } else { "rejected" };
+            if let Err(e) = self.storage.update_transfer(xfer_id, status, None) {
+                eprintln!("storage: 传输状态落库失败: {e}");
+            }
         }
+        route_result
     }
 
     /// 短暂持锁克隆出一份 `Arc<IpmsgService>` 立即释放锁——`send_text`/
@@ -498,6 +548,11 @@ impl Core {
         self.events_rx.lock().expect("events lock").take()
     }
 
+    /// 持久化层句柄:壳层历史查询/搜索/清空命令直接用它,不经过 Core 转发。
+    pub fn storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
     pub fn port(&self) -> u16 {
         self.transport.port()
     }
@@ -557,6 +612,42 @@ impl Core {
         if let Some(h) = roster_thread {
             let _ = h.join();
         }
+    }
+}
+
+/// 事件落库(M6 持久化泵)。写失败不阻断消息流(spec §6):实时聊天的
+/// 可用性优先于持久化,但必须 eprintln 留痕。FileProgress 太密,不落库。
+fn persist_event(storage: &Storage, ev: &TransportEvent) {
+    let result = match ev {
+        TransportEvent::Message(m) => {
+            storage.insert_message(&m.id, &m.peer_fp, "in", &m.body, m.ts_ms as i64)
+        }
+        TransportEvent::FileOffered {
+            xfer_id,
+            peer_fp,
+            name,
+            size,
+            is_dir,
+        } => storage.insert_transfer(
+            xfer_id,
+            peer_fp,
+            "in",
+            name,
+            *size as i64,
+            *is_dir,
+            "offered",
+            crate::transport::proto::now_ms() as i64,
+        ),
+        TransportEvent::FileDone { xfer_id, path } => {
+            storage.update_transfer(xfer_id, "done", Some(&path.to_string_lossy()))
+        }
+        TransportEvent::FileFailed { xfer_id, .. } => {
+            storage.update_transfer(xfer_id, "failed", None)
+        }
+        TransportEvent::FileProgress { .. } => Ok(()),
+    };
+    if let Err(e) = result {
+        eprintln!("storage: 事件落库失败(不阻断消息流): {e}");
     }
 }
 
@@ -1223,6 +1314,74 @@ mod tests {
             "接受目录 offer 必须发 GETDIRFILES,而不是 GETFILEDATA"
         );
 
+        core.shutdown();
+    }
+
+    // ---- 持久化泵(M6):事件先写库、再转发 ----
+
+    #[test]
+    fn pump_persists_incoming_message_before_forwarding() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        let rx = core.take_events().expect("events_rx");
+        // 直接从内部发送端注入(与 respond_file_ipmsg 上报同一条路径)
+        core.events_tx
+            .send(TransportEvent::Message(MessageEvent {
+                peer_fp: "peerX".to_string(),
+                id: "id1".to_string(),
+                body: "你好".to_string(),
+                ts_ms: 1234,
+            }))
+            .unwrap();
+        // 事件到达消费端时,数据库必须已经写入(先写库、再转发)
+        match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+            TransportEvent::Message(m) => assert_eq!(m.id, "id1"),
+            other => panic!("期望 Message,得到 {other:?}"),
+        }
+        let items = core.storage().history("peerX", None, 10).unwrap();
+        assert_eq!(items.len(), 1, "转发之前应已落库");
+        core.shutdown();
+    }
+
+    #[test]
+    fn pump_records_file_offer_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        let rx = core.take_events().expect("events_rx");
+        core.events_tx
+            .send(TransportEvent::FileOffered {
+                xfer_id: "x1".to_string(),
+                peer_fp: "peerX".to_string(),
+                name: "a.zip".to_string(),
+                size: 2048,
+                is_dir: false,
+            })
+            .unwrap();
+        core.events_tx
+            .send(TransportEvent::FileDone {
+                xfer_id: "x1".to_string(),
+                path: PathBuf::from("/tmp/a.zip"),
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let items = core.storage().history("peerX", None, 10).unwrap();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            crate::storage::HistoryItem::File { status, path, .. } => {
+                assert_eq!(status, "done");
+                assert_eq!(path.as_deref(), Some("/tmp/a.zip"));
+            }
+            other => panic!("期望 File,得到 {other:?}"),
+        }
         core.shutdown();
     }
 }
