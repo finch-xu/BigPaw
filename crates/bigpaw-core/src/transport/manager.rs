@@ -115,6 +115,10 @@ struct IncomingState {
     name: String,
     size: u64,
     blake3: String,
+    /// respond_file 为断点续传计算并写进 FileAccept 回复的 offset——唯一
+    /// 权威值。随后到达的 FileStart 数据连接自带的 offset 必须与此一致
+    /// (见 `handle_file_receive`),否则说明发送方状态过期/被篡改,不能信。
+    offset: u64,
 }
 
 type ClientTls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
@@ -355,6 +359,17 @@ impl TransportManager {
             });
             return;
         }
+        // 校验数据连接自带的 FileStart.offset 与 respond_file 当初算出、写进
+        // FileAccept 回复里的续传点一致——不能信任发送方在数据连接上重新
+        // 声称的 offset(状态可能过期,或被篡改)。不一致就判失败,不写任何
+        // 字节(不调用 receive_into)。
+        if offset != state.offset {
+            let _ = events.send(TransportEvent::FileFailed {
+                xfer_id,
+                reason: "续传位置不一致".to_string(),
+            });
+            return;
+        }
 
         let total = state.size;
         let mut last_emit: Option<Instant> = None;
@@ -378,7 +393,7 @@ impl TransportManager {
             &state.download_dir,
             &state.name,
             state.size,
-            offset,
+            state.offset,
             &state.blake3,
             tls_stream,
             &mut on_progress,
@@ -638,6 +653,12 @@ impl TransportManager {
         port: u16,
         mut ctrl: ClientTls,
     ) {
+        // 对端可能迟迟不 accept/reject(等人工确认),但也不能无限占用这条
+        // 阻塞读线程 + 底层 socket——给够时间(120s)但不是永久,超时后
+        // read_msg 返回 Err,走下面既有的清理分支(见该分支注释)。
+        let _ = ctrl
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(120)));
         let reply = proto::read_msg(&mut ctrl);
         match reply {
             Ok(Msg::FileAccept { offset, .. }) => {
@@ -708,6 +729,17 @@ impl TransportManager {
                     });
                 }
             }
+            // 读失败:包括上面设的 120s 超时(对端一直未 accept/reject)以及
+            // 其他连接错误——都清理 outgoing 并上报,不留悬挂状态。
+            Err(_) => {
+                if let Some(m) = mgr.upgrade() {
+                    m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
+                }
+                let _ = events.send(TransportEvent::FileFailed {
+                    xfer_id,
+                    reason: "对端无响应".to_string(),
+                });
+            }
             _ => {
                 if let Some(m) = mgr.upgrade() {
                     m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
@@ -765,6 +797,7 @@ impl TransportManager {
                     name: safe_name,
                     size: po.size,
                     blake3: po.blake3,
+                    offset,
                 },
             );
             let _ = po.reply_tx.send(Msg::FileAccept {
