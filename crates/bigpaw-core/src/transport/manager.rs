@@ -116,6 +116,8 @@ impl TransportManager {
                         cleanup();
                         return;
                     };
+                    // 未发 Hello 的连接不能无限占用线程/套接字:握手阶段设读超时。
+                    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
                     // 等待 Hello 完成握手并确认协议
                     let Ok(Msg::Hello { .. }) = proto::read_msg(&mut tls_stream) else {
@@ -126,6 +128,8 @@ impl TransportManager {
                         cleanup();
                         return;
                     };
+                    // Hello 已收到,进入长连接读取阶段:取消握手期超时。
+                    let _ = tls_stream.get_ref().set_read_timeout(None);
                     Self::read_loop(&events, peer_fp, &mut tls_stream);
                     cleanup();
                 });
