@@ -74,6 +74,11 @@ pub enum TransportEvent {
         peer_fp: String,
         name: String,
         size: u64,
+        /// 是否为文件夹报价(M5 IPMsg 兼容层新增,设计文档 §6):原生传输目前
+        /// 只支持单文件,恒为 `false`;ipmsg 一侧的 `forward_ipmsg_event` 会
+        /// 按 `IpmsgFileEntry::is_dir` 如实转发,供 UI 区分"文件夹接受时走
+        /// GETDIRFILES/`request_dir`"还是"文件接受时走 GETFILEDATA/`request_file`"。
+        is_dir: bool,
     },
     FileProgress {
         xfer_id: String,
@@ -305,6 +310,7 @@ impl TransportManager {
                             peer_fp: peer_fp.clone(),
                             name,
                             size,
+                            is_dir: false, // 原生传输 M3 冻结范围:只支持单文件
                         })
                         .is_err()
                     {

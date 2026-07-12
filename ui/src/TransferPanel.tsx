@@ -69,9 +69,13 @@ export default function TransferPanel({ fp }: { fp: string }) {
             <li key={t.xferId} className="text-sm">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate" title={t.name}>
-                  {t.name}
+                  {t.isDir ? `📁 文件夹: ${t.name}` : t.name}
                 </span>
-                <span className="shrink-0 text-xs text-amber-600">{formatSize(t.size)}</span>
+                {/* 文件夹大小/进度是尽力而为(整棵树可能未知总大小),
+                    size===0 时不展示误导性的 "0 B"。 */}
+                {!(t.isDir && t.size === 0) && (
+                  <span className="shrink-0 text-xs text-amber-600">{formatSize(t.size)}</span>
+                )}
               </div>
               <div className="h-1.5 w-full overflow-hidden rounded bg-amber-100">
                 <div

@@ -1,5 +1,10 @@
 //! IPMsg/飞秋兼容层。范围冻结（设计文档 §6）：仅标准命令集，不做方言扩展。
 
+pub mod command;
+pub mod discovery;
+pub mod filexfer;
+pub mod proto;
+
 /// IPMsg 标准端口（UDP 与 TCP 同号）。
 pub const IPMSG_PORT: u16 = 2425;
 

@@ -3,7 +3,7 @@
 //! 浏览同类型服务,解析出的对端转成 DiscoveryEvent 发往 roster。
 
 use crate::identity::Identity;
-use crate::roster::DiscoveryEvent;
+use crate::roster::{DiscoveryEvent, Protocol};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -65,6 +65,7 @@ impl Discovery {
                                 nickname,
                                 addrs,
                                 port: info.get_port(),
+                                protocol: Protocol::Native,
                             })
                             .is_err()
                         {

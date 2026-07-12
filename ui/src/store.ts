@@ -31,6 +31,8 @@ export interface Transfer {
   direction: "in" | "out";
   status: "offered" | "active" | "done" | "failed" | "rejected";
   path?: string;
+  /** 是否为文件夹 offer(M5 IPMsg 文件夹接收):原生/单文件 offer 恒为 false。 */
+  isDir?: boolean;
 }
 
 interface AppState {
@@ -39,11 +41,14 @@ interface AppState {
   selectedFp: string | null;
   messages: Record<string, ChatMessage[]>;
   transfers: Record<string, Transfer>;
+  /** IPMsg 兼容层是否启用(2425 端口):null = 尚未查询到。 */
+  ipmsgAvailable: boolean | null;
   setSelf: (self: SelfInfo) => void;
   setPeers: (peers: Peer[]) => void;
   select: (fp: string | null) => void;
   appendMessage: (m: ChatMessage) => void;
   upsertTransfer: (t: Partial<Transfer> & { xferId: string }) => void;
+  setIpmsgAvailable: (available: boolean) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -52,6 +57,7 @@ export const useAppStore = create<AppState>((set) => ({
   selectedFp: null,
   messages: {},
   transfers: {},
+  ipmsgAvailable: null,
   setSelf: (self) => set({ self }),
   setPeers: (peers) => set({ peers }),
   select: (selectedFp) => set({ selectedFp }),
@@ -66,4 +72,5 @@ export const useAppStore = create<AppState>((set) => ({
         [t.xferId]: { ...s.transfers[t.xferId], ...t } as Transfer,
       },
     })),
+  setIpmsgAvailable: (ipmsgAvailable) => set({ ipmsgAvailable }),
 }));
