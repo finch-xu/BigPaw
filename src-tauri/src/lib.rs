@@ -117,6 +117,10 @@ struct FileOfferedDto {
     peer_fp: String,
     name: String,
     size: u64,
+    /// 是否为文件夹报价(M5):原生传输恒为 `false`;ipmsg 对端发来的
+    /// `IpmsgFileEntry::is_dir` 如实透传,前端据此展示"文件夹" offer,
+    /// 接受时仍走同一个 `respond_file` 命令(Core 内部按 is_dir 路由)。
+    is_dir: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -183,6 +187,7 @@ pub fn run() {
                                 peer_fp,
                                 name,
                                 size,
+                                is_dir,
                             } => {
                                 let _ = handle.emit(
                                     "file://offered",
@@ -191,6 +196,7 @@ pub fn run() {
                                         peer_fp,
                                         name,
                                         size,
+                                        is_dir,
                                     },
                                 );
                             }

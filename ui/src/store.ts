@@ -31,6 +31,8 @@ export interface Transfer {
   direction: "in" | "out";
   status: "offered" | "active" | "done" | "failed" | "rejected";
   path?: string;
+  /** 是否为文件夹 offer(M5 IPMsg 文件夹接收):原生/单文件 offer 恒为 false。 */
+  isDir?: boolean;
 }
 
 interface AppState {

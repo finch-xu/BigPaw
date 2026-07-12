@@ -37,6 +37,7 @@ export default function App() {
           peerFp: string;
           name: string;
           size: number;
+          isDir: boolean;
         }>("file://offered", (e) =>
           upsertTransfer({
             ...e.payload,

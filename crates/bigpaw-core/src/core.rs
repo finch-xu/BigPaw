@@ -123,6 +123,9 @@ struct IpmsgOffer {
     /// basename,可以直接 `download_dir.join(name)`,不需要再次净化。
     name: String,
     size: u64,
+    /// 这条报价是文件夹还是单文件(`IpmsgFileEntry::is_dir`);
+    /// `respond_file_ipmsg` 据此分派 `request_file` 还是 `request_dir`。
+    is_dir: bool,
 }
 
 impl Core {
@@ -443,11 +446,16 @@ impl Core {
         Ok(crate::transport::proto::new_id())
     }
 
-    /// 接受/拒绝一条 ipmsg 文件报价。拒绝:IPMsg 协议没有"我拒绝了"的回执,
-    /// 不请求就是拒绝,静默即可。接受:反查 roster 拿地址,后台线程发起
-    /// `IpmsgService::request_file`(阻塞网络 IO,不能占着调用方线程——与
-    /// 原生 `offer_file` 的 `await_offer_reply` 后台线程同一个道理),完成/
-    /// 失败时复用原生一致的 `TransportEvent::FileDone`/`FileFailed` 上报。
+    /// 接受/拒绝一条 ipmsg 文件报价(单文件或文件夹)。拒绝:IPMsg 协议没有
+    /// "我拒绝了"的回执,不请求就是拒绝,静默即可。接受:反查 roster 拿地址,
+    /// 后台线程按 `offer.is_dir` 分派发起 `IpmsgService::request_file`(单文件)
+    /// 或 `request_dir`(文件夹,GETDIRFILES,整棵树落到 `download_dir/<name>`
+    /// 下——`receive_dir_stream` 内部只按流里的相对路径写子项,不会自己重建
+    /// 顶层文件夹名,因此这里必须显式 `join` 一次)。两者都是阻塞网络 IO,
+    /// 不能占着调用方线程——与原生 `offer_file` 的 `await_offer_reply` 后台
+    /// 线程同一个道理,完成/失败时复用原生一致的
+    /// `TransportEvent::FileDone`/`FileFailed` 上报(文件夹场景下 `FileDone`
+    /// 的 `path` 就是这个新建的顶层文件夹路径)。
     fn respond_file_ipmsg(
         &self,
         xfer_id: &str,
@@ -465,7 +473,12 @@ impl Core {
         let events = self.events_tx.clone();
         let xfer_id = xfer_id.to_string();
         std::thread::spawn(move || {
-            match svc.request_file(addr, offer.packet_no, offer.file_id, offer.size, &save_path) {
+            let result = if offer.is_dir {
+                svc.request_dir(addr, offer.packet_no, offer.file_id, &save_path)
+            } else {
+                svc.request_file(addr, offer.packet_no, offer.file_id, offer.size, &save_path)
+            };
+            match result {
                 Ok(path) => {
                     let _ = events.send(TransportEvent::FileDone { xfer_id, path });
                 }
@@ -631,10 +644,11 @@ fn default_nickname() -> String {
 ///   就是无操作,这里不需要额外判断。
 /// - `TextReceived`/`FileOffered`:转成与原生传输层同形状的
 ///   `TransportEvent`,复用既有的 `message://received`/`file://offered`
-///   转发路径,UI 不需要区分协议来源。文件 offer 顺带把
-///   `(peer_fp, packet_no, file_id, name, size)` 登记进 `offers`,供
-///   `Core::respond_file` 决定接受时反查、发起 `request_file`;目录条目
-///   (`is_dir`)跳过——M5 冻结范围只接单文件。
+///   转发路径,UI 不需要区分协议来源。文件/文件夹 offer 都顺带把
+///   `(peer_fp, packet_no, file_id, name, size, is_dir)` 登记进 `offers`,供
+///   `Core::respond_file` 决定接受时反查、按 `is_dir` 分派
+///   `request_file`/`request_dir`(文件夹仅接收,§6 冻结范围——发送文件夹
+///   仍不支持,但接收侧不再过滤掉目录条目)。
 fn forward_ipmsg_event(
     ev: IpmsgEvent,
     disc_tx: &Sender<DiscoveryEvent>,
@@ -680,7 +694,7 @@ fn forward_ipmsg_event(
             ..
         } => {
             let peer_fp = format!("ipmsg:{key}");
-            for f in files.into_iter().filter(|f| !f.is_dir) {
+            for f in files {
                 let xfer_id = crate::transport::proto::new_id();
                 offers.lock().expect("ipmsg offers lock").insert(
                     xfer_id.clone(),
@@ -690,6 +704,7 @@ fn forward_ipmsg_event(
                         file_id: f.file_id,
                         name: f.name.clone(),
                         size: f.size,
+                        is_dir: f.is_dir,
                     },
                 );
                 let _ = msg_tx.send(TransportEvent::FileOffered {
@@ -697,6 +712,7 @@ fn forward_ipmsg_event(
                     peer_fp: peer_fp.clone(),
                     name: f.name,
                     size: f.size,
+                    is_dir: f.is_dir,
                 });
             }
         }
@@ -1052,10 +1068,12 @@ mod tests {
                 peer_fp,
                 name,
                 size,
+                is_dir,
             } => {
                 assert_eq!(peer_fp, "ipmsg:192.168.1.9:HOST-B");
                 assert_eq!(name, "report.pdf");
                 assert_eq!(size, 2048);
+                assert!(!is_dir);
                 xfer_id
             }
             other => panic!("期望 FileOffered,却收到 {other:?}"),
@@ -1068,11 +1086,14 @@ mod tests {
         assert_eq!(registered.file_id, 0);
         assert_eq!(registered.name, "report.pdf");
         assert_eq!(registered.size, 2048);
+        assert!(!registered.is_dir);
     }
 
     #[test]
-    fn forward_ipmsg_event_file_offered_skips_dir_entries() {
-        // M5 冻结范围只接单文件:目录条目跳过,不生成 xfer_id、不登记。
+    fn forward_ipmsg_event_file_offered_surfaces_dir_entries() {
+        // M5 folder-receive:目录条目不再被过滤——必须像文件一样生成 xfer_id、
+        // 登记进 offers(带 is_dir=true),并上报 FileOffered 供 UI 展示成
+        // 可接受的"文件夹"offer(回归此前 filter(|f| !f.is_dir) 丢弃目录的 bug)。
         let (disc_tx, _disc_rx) = std::sync::mpsc::channel();
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
@@ -1094,10 +1115,114 @@ mod tests {
             &offers,
         );
 
-        assert!(
-            msg_rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "目录条目应跳过,不上报 FileOffered"
+        let xfer_id = match msg_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TransportEvent::FileOffered {
+                xfer_id,
+                name,
+                is_dir,
+                ..
+            } => {
+                assert_eq!(name, "照片");
+                assert!(is_dir, "目录条目应带 is_dir=true 上报,不再被过滤");
+                xfer_id
+            }
+            other => panic!("期望 FileOffered(目录),却收到 {other:?}"),
+        };
+
+        let table = offers.lock().unwrap();
+        let registered = table
+            .get(&xfer_id)
+            .expect("目录 offer 也应登记,供 respond 时反查");
+        assert!(registered.is_dir);
+    }
+
+    /// respond 路由回归:接受一条 `is_dir=true` 的 ipmsg offer 必须真的调用
+    /// `IpmsgService::request_dir`(走 GETDIRFILES),而不是 `request_file`
+    /// (GETFILEDATA)。用一个裸 TCP 监听器充当"对端"——它不实现真正的
+    /// GETDIRFILES 响应协议,只读出客户端发来的请求报文并解码,断言其
+    /// `command` 字段确实是 `GETDIRFILES`(直接读 header-size 时遇到 EOF,
+    /// `receive_dir_stream` 视作"干净的空目录流"返回 Ok,不算错误)。
+    #[test]
+    fn respond_file_routes_dir_offer_to_request_dir_over_tcp() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        if !core.ipmsg_available() {
+            eprintln!("2425 端口不可用(可能被其它进程/测试占用),跳过本测试");
+            return;
+        }
+
+        // 裸 TCP "假对端":接受一条连接,读出请求报文的 command 字段后立即关闭
+        // (不回任何目录流字节),验证发起方发的是 GETDIRFILES。
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let fake_peer_addr = listener.local_addr().unwrap();
+        let received_command = Arc::new(Mutex::new(None::<u32>));
+        let received_command_for_server = received_command.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            if let Ok(n) = stream.read(&mut buf) {
+                if let Some(packet) = bigpaw_ipmsg::proto::decode(&buf[..n]) {
+                    *received_command_for_server.lock().unwrap() =
+                        Some(bigpaw_ipmsg::command::Command(packet.command).num());
+                }
+            }
+            // 故意不发任何目录流字节就断开连接:receive_dir_stream 在
+            // header-size 阶段读到 EOF 视为"干净结束",返回 Ok(空目录)。
+        });
+
+        // 手工把这个"假对端"注入 roster(伪 fingerprint,Protocol::Ipmsg)和
+        // ipmsg_offers(is_dir=true),模拟 forward_ipmsg_event 本该做的登记——
+        // 跳过真实 UDP 发现,只测 respond_file 的路由决策本身。
+        let peer_fp = "ipmsg:test-dir-peer".to_string();
+        core.roster_handle
+            .lock()
+            .unwrap()
+            .apply(DiscoveryEvent::Seen {
+                fingerprint: peer_fp.clone(),
+                nickname: "fake-feiq".to_string(),
+                addrs: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+                port: fake_peer_addr.port(),
+                protocol: Protocol::Ipmsg,
+            });
+        let xfer_id = "test-xfer-dir".to_string();
+        core.ipmsg_offers.lock().unwrap().insert(
+            xfer_id.clone(),
+            IpmsgOffer {
+                peer_fp,
+                packet_no: 7,
+                file_id: 0,
+                name: "照片".to_string(),
+                size: 0,
+                is_dir: true,
+            },
         );
-        assert!(offers.lock().unwrap().is_empty());
+
+        let events_rx = core.take_events().expect("events_rx 应可取走");
+        core.respond_file(&xfer_id, true, dir.path()).unwrap();
+
+        // respond_file_ipmsg 的后台线程完成(对端立刻断连,Ok(空目录))后应
+        // 上报 FileDone;这就是"确实沿着目录路径完整跑完一次 request_dir"的
+        // 端到端证明,而不仅仅是路由决策本身。
+        let done = events_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        match done {
+            TransportEvent::FileDone { xfer_id: got, .. } => assert_eq!(got, xfer_id),
+            other => panic!("期望 FileDone,却收到 {other:?}"),
+        }
+
+        server.join().unwrap();
+        assert_eq!(
+            *received_command.lock().unwrap(),
+            Some(bigpaw_ipmsg::command::GETDIRFILES),
+            "接受目录 offer 必须发 GETDIRFILES,而不是 GETFILEDATA"
+        );
+
+        core.shutdown();
     }
 }
