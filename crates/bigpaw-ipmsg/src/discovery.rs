@@ -51,9 +51,11 @@ pub enum IpmsgError {
     PortInUse,
 }
 
-/// extra 尾部附带 BIGPAW_TAG,供对端识别我方为 BigPaw(飞秋会忽略这段附加数据)。
-fn entry_extra(nick: &str) -> String {
-    format!("{nick}{BIGPAW_TAG}")
+/// extra 尾部附带 BIGPAW_TAG + self_token,供对端识别我方为 BigPaw,
+/// 同时让自己能在 recv 侧识别出这是自己发出去又被操作系统广播回环的报文
+/// (飞秋/feiq 会忽略这段附加数据,不影响与真实飞秋互通)。
+fn entry_extra(nick: &str, self_token: &str) -> String {
+    format!("{nick}{BIGPAW_TAG}{self_token}")
 }
 
 fn next_packet_no(counter: &AtomicU32) -> u32 {
@@ -96,14 +98,21 @@ fn broadcast(socket: &UdpSocket, buf: &[u8], port: u16) {
     let _ = socket.send_to(buf, dest);
 }
 
-fn send_entry(socket: &UdpSocket, packet_no: &AtomicU32, nick: &str, host: &str, port: u16) {
+fn send_entry(
+    socket: &UdpSocket,
+    packet_no: &AtomicU32,
+    nick: &str,
+    host: &str,
+    port: u16,
+    self_token: &str,
+) {
     let packet = Packet {
         version: IPMSG_VERSION.to_string(),
         packet_no: next_packet_no(packet_no),
         sender: nick.to_string(),
         host: host.to_string(),
         command: command::BR_ENTRY,
-        extra: entry_extra(nick),
+        extra: entry_extra(nick, self_token),
     };
     broadcast(socket, &proto::encode(&packet), port);
 }
@@ -116,14 +125,15 @@ fn send_loop(
     nick: String,
     host: String,
     port: u16,
+    self_token: Arc<String>,
 ) {
-    send_entry(&socket, &packet_no, &nick, &host, port);
+    send_entry(&socket, &packet_no, &nick, &host, port, &self_token);
     loop {
         interruptible_sleep(&stop, ENTRY_INTERVAL);
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        send_entry(&socket, &packet_no, &nick, &host, port);
+        send_entry(&socket, &packet_no, &nick, &host, port, &self_token);
     }
 }
 
@@ -139,13 +149,23 @@ enum Action {
 
 /// 按 `Command(p.command).num()` 分派:BR_ENTRY → 回 ANSENTRY + Online;
 /// ANSENTRY → Online;BR_EXIT → Offline;其它命令号静默忽略。
+///
+/// 自过滤:`extra` 携带自己的 `self_token` → 这是自己发出去、被 OS 广播回环
+/// 反射回本机 recv 的报文(标准 UDP 广播行为),必须在分派前拦下——不回包、
+/// 不上报事件,否则会把自己误判为新发现的对端(见任务说明)。真实对端
+/// (无论是否 BigPaw)不会携带我方 token,不受影响。
 fn dispatch(
     packet: Packet,
     src: SocketAddr,
     nick: &str,
     host: &str,
     packet_no: &AtomicU32,
+    self_token: &str,
 ) -> Action {
+    if packet.extra.contains(self_token) {
+        return Action::None;
+    }
+
     let key = format!("{}:{}", src.ip(), packet.host);
     let is_bigpaw = packet.extra.contains(BIGPAW_TAG);
 
@@ -157,7 +177,7 @@ fn dispatch(
                 sender: nick.to_string(),
                 host: host.to_string(),
                 command: command::ANSENTRY,
-                extra: entry_extra(nick),
+                extra: entry_extra(nick, self_token),
             };
             let online = IpmsgEvent::Online {
                 key,
@@ -188,6 +208,7 @@ fn recv_loop(
     nick: String,
     host: String,
     tx: Sender<IpmsgEvent>,
+    self_token: Arc<String>,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
@@ -215,7 +236,7 @@ fn recv_loop(
             continue; // decode None → 丢弃
         };
 
-        match dispatch(packet, src, &nick, &host, &packet_no) {
+        match dispatch(packet, src, &nick, &host, &packet_no, &self_token) {
             Action::None => {}
             Action::Emit(ev) => {
                 if tx.send(ev).is_err() {
@@ -232,6 +253,21 @@ fn recv_loop(
     }
 }
 
+/// 进程唯一 token:纳秒级时间戳的十六进制串,埋进每个报文的 extra 尾部。
+/// 用于在 recv 侧识别"这是自己发出去、被 OS 广播回环反射回本机的报文"
+/// (标准 UDP 广播行为:发给 255.255.255.255 的包,内核会把它也送回本机
+/// 自己的 recv socket)。原生发现层用 `fingerprint == self_fp` 做同样的事,
+/// IPMsg 协议没有 fingerprint 字段,所以用这个 token 顶替。
+fn new_self_token() -> String {
+    format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
 /// IPMsg 发现服务:UDP 2425 上的 BR_ENTRY/ANSENTRY/BR_EXIT 收发。
 /// 独立 crate:零 Tauri、零异步运行时,仅 std::net + socket2 线程模型。
 pub struct IpmsgService {
@@ -241,6 +277,7 @@ pub struct IpmsgService {
     nick: String,
     host: String,
     port: u16,
+    self_token: Arc<String>,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -257,6 +294,7 @@ impl IpmsgService {
         let socket = Arc::new(bind_socket(port)?);
         let stop = Arc::new(AtomicBool::new(false));
         let packet_no = Arc::new(AtomicU32::new(1));
+        let self_token = Arc::new(new_self_token());
 
         let send_handle = {
             let socket = Arc::clone(&socket);
@@ -264,7 +302,10 @@ impl IpmsgService {
             let packet_no = Arc::clone(&packet_no);
             let nick = nick.to_string();
             let host = host.to_string();
-            std::thread::spawn(move || send_loop(socket, stop, packet_no, nick, host, port))
+            let self_token = Arc::clone(&self_token);
+            std::thread::spawn(move || {
+                send_loop(socket, stop, packet_no, nick, host, port, self_token)
+            })
         };
 
         let recv_handle = {
@@ -273,7 +314,10 @@ impl IpmsgService {
             let packet_no = Arc::clone(&packet_no);
             let nick = nick.to_string();
             let host = host.to_string();
-            std::thread::spawn(move || recv_loop(socket, stop, packet_no, nick, host, tx))
+            let self_token = Arc::clone(&self_token);
+            std::thread::spawn(move || {
+                recv_loop(socket, stop, packet_no, nick, host, tx, self_token)
+            })
         };
 
         Ok(IpmsgService {
@@ -283,6 +327,7 @@ impl IpmsgService {
             nick: nick.to_string(),
             host: host.to_string(),
             port,
+            self_token,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
         })
@@ -296,7 +341,7 @@ impl IpmsgService {
             sender: self.nick.clone(),
             host: self.host.clone(),
             command: command::BR_EXIT,
-            extra: String::new(),
+            extra: self.self_token.to_string(),
         };
         broadcast(&self.socket, &proto::encode(&packet), self.port);
 
@@ -331,11 +376,15 @@ mod tests {
         "192.168.1.42:2425".parse().unwrap()
     }
 
+    /// dispatch 测试专用的"本机 token":不出现在下面任何测试报文的 extra 里,
+    /// 确保现有的正常分派用例不会被自过滤逻辑误伤。
+    const TEST_TOKEN: &str = "test-self-token-deadbeef";
+
     #[test]
     fn dispatch_br_entry_replies_ansentry_and_emits_online() {
         let counter = AtomicU32::new(1);
-        let packet = br_entry("alice", "HOST-A", &entry_extra("alice"));
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter) {
+        let packet = br_entry("alice", "HOST-A", &entry_extra("alice", "peer-token"));
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(
                 reply,
                 IpmsgEvent::Online {
@@ -365,7 +414,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         // 真实飞秋不会带 BIGPAW_TAG。
         let packet = br_entry("feiq-user", "HOST-B", "");
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter) {
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(_, IpmsgEvent::Online { is_bigpaw, .. }) => {
                 assert!(!is_bigpaw);
             }
@@ -376,9 +425,9 @@ mod tests {
     #[test]
     fn dispatch_ansentry_emits_online_without_reply() {
         let counter = AtomicU32::new(1);
-        let mut packet = br_entry("bob", "HOST-B", &entry_extra("bob"));
+        let mut packet = br_entry("bob", "HOST-B", &entry_extra("bob", "peer-token"));
         packet.command = command::ANSENTRY;
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter) {
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::Online {
                 key, nick, host, ..
             }) => {
@@ -395,7 +444,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         let mut packet = br_entry("bob", "HOST-B", "");
         packet.command = command::BR_EXIT;
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter) {
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::Offline { key }) => {
                 assert_eq!(key, "192.168.1.42:HOST-B");
             }
@@ -410,16 +459,48 @@ mod tests {
         let mut packet = br_entry("bob", "HOST-B", "");
         packet.command = command::SENDMSG;
         assert!(matches!(
-            dispatch(packet, src_addr(), "me", "HOST-ME", &counter),
+            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
             Action::None
         ));
     }
 
     #[test]
-    fn entry_extra_embeds_bigpaw_tag() {
-        let extra = entry_extra("nick");
+    fn entry_extra_embeds_bigpaw_tag_and_self_token() {
+        let extra = entry_extra("nick", "tok123");
         assert!(extra.starts_with("nick"));
         assert!(extra.contains(BIGPAW_TAG));
+        assert!(extra.contains("tok123"));
+    }
+
+    /// 核心自过滤回归测试:一个带有本机 self_token 的报文(即自己的 BR_ENTRY/
+    /// BR_EXIT 被 OS 广播回环反射回本机 recv 的场景)必须被 dispatch 拦下,
+    /// 不回包、不上报任何事件——否则会把自己误判为新上线/下线的对端。
+    #[test]
+    fn dispatch_packet_with_own_self_token_is_ignored() {
+        let counter = AtomicU32::new(1);
+        let packet = br_entry("me", "HOST-ME", &entry_extra("me", TEST_TOKEN));
+        assert!(matches!(
+            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            Action::None
+        ));
+    }
+
+    /// 同样的报文形状,但换成一个真实 BigPaw 对端的不同 token → 必须正常
+    /// 分派为 Online,不能被误伤(否则就是把所有 BigPaw 对端都过滤掉了)。
+    #[test]
+    fn dispatch_packet_with_different_token_is_not_filtered() {
+        let counter = AtomicU32::new(1);
+        let packet = br_entry(
+            "alice",
+            "HOST-A",
+            &entry_extra("alice", "a-different-token"),
+        );
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::ReplyAndEmit(_, IpmsgEvent::Online { is_bigpaw, .. }) => {
+                assert!(is_bigpaw);
+            }
+            _ => panic!("expected ReplyAndEmit(Online) for a real peer with a different token"),
+        }
     }
 
     /// 端口被占用必须明确报错,不能静默失败。
