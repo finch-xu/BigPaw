@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore, type Peer, type SelfInfo } from "./store";
 import ChatPane from "./ChatPane";
+import SettingsModal from "./SettingsModal";
 
 const statusDotClass = (state: Peer["state"]) => {
   switch (state) {
@@ -218,7 +219,7 @@ export default function App() {
           大脚猫在等对面上线
         </section>
       )}
-      {showSettings && null /* Task 11 挂载 <SettingsModal /> */}
+      {showSettings && <SettingsModal />}
     </main>
   );
 }
