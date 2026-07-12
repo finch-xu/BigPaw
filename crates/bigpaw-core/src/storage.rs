@@ -80,8 +80,47 @@ impl Storage {
         Ok(())
     }
 
-    /// 会话时间线一页:`before_ts` 之前(不含)最近的 `limit` 条,**升序**返回。
-    /// 本任务先只查 messages;Task 2 扩成 messages+transfers 的 UNION。
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_transfer(
+        &self,
+        xfer_id: &str,
+        peer_fp: &str,
+        direction: &str,
+        name: &str,
+        size: i64,
+        is_dir: bool,
+        status: &str,
+        ts_ms: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        conn.execute(
+            "INSERT OR IGNORE INTO transfers
+               (xfer_id, peer_fp, direction, name, size, is_dir, status, path, ts_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8)",
+            params![xfer_id, peer_fp, direction, name, size, is_dir as i32, status, ts_ms],
+        )?;
+        Ok(())
+    }
+
+    /// 状态推进(offered→active→done/failed/rejected)。`path` 仅完成时有值。
+    /// 未知 xfer_id 无操作(与 TransportManager::respond_file 的幂等语义一致)。
+    pub fn update_transfer(
+        &self,
+        xfer_id: &str,
+        status: &str,
+        path: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        conn.execute(
+            "UPDATE transfers SET status = ?2, path = COALESCE(?3, path)
+             WHERE xfer_id = ?1",
+            params![xfer_id, status, path],
+        )?;
+        Ok(())
+    }
+
+    /// 会话时间线一页:messages 与 transfers 合并,`before_ts` 之前(不含)
+    /// 最近 `limit` 条,升序返回。kind 列区分两表来源。
     pub fn history(
         &self,
         peer_fp: &str,
@@ -91,23 +130,48 @@ impl Storage {
         let conn = self.conn.lock().expect("storage lock");
         let before = before_ts.unwrap_or(i64::MAX);
         let mut stmt = conn.prepare(
-            "SELECT id, peer_fp, direction, body, ts_ms FROM messages
-             WHERE peer_fp = ?1 AND ts_ms < ?2
-             ORDER BY ts_ms DESC LIMIT ?3",
+            "SELECT * FROM (
+               SELECT 'text' AS kind, id AS k1, peer_fp, direction, body AS k2,
+                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms
+               FROM messages WHERE peer_fp = ?1 AND ts_ms < ?2
+               UNION ALL
+               SELECT 'file' AS kind, xfer_id AS k1, peer_fp, direction, name AS k2,
+                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms
+               FROM transfers WHERE peer_fp = ?1 AND ts_ms < ?2
+             ) ORDER BY ts_ms DESC LIMIT ?3",
         )?;
         let mut items: Vec<HistoryItem> = stmt
-            .query_map(params![peer_fp, before, limit], |row| {
-                Ok(HistoryItem::Text {
-                    id: row.get(0)?,
-                    peer_fp: row.get(1)?,
-                    direction: row.get(2)?,
-                    body: row.get(3)?,
-                    ts_ms: row.get(4)?,
-                })
-            })?
+            .query_map(params![peer_fp, before, limit], row_to_item)?
             .collect::<Result<_, _>>()?;
-        items.reverse(); // DESC 取页 → 升序返回
+        items.reverse();
         Ok(items)
+    }
+}
+
+/// UNION 行 → HistoryItem。列序固定:kind, k1(id/xfer_id), peer_fp,
+/// direction, k2(body/name), k3(status), k4(size), k5(is_dir), k6(path), ts_ms。
+fn row_to_item(row: &rusqlite::Row<'_>) -> Result<HistoryItem, rusqlite::Error> {
+    let kind: String = row.get(0)?;
+    if kind == "text" {
+        Ok(HistoryItem::Text {
+            id: row.get(1)?,
+            peer_fp: row.get(2)?,
+            direction: row.get(3)?,
+            body: row.get(4)?,
+            ts_ms: row.get(9)?,
+        })
+    } else {
+        Ok(HistoryItem::File {
+            xfer_id: row.get(1)?,
+            peer_fp: row.get(2)?,
+            direction: row.get(3)?,
+            name: row.get(4)?,
+            status: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            size: row.get(6)?,
+            is_dir: row.get::<_, i32>(7)? != 0,
+            path: row.get(8)?,
+            ts_ms: row.get(9)?,
+        })
     }
 }
 
@@ -194,6 +258,59 @@ mod tests {
         s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
         // 同 id 再插不报错(INSERT OR IGNORE)
         s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        assert_eq!(s.history("peerA", None, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transfer_insert_update_and_merged_history() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "先发一句", 1000).unwrap();
+        s.insert_transfer("x1", "peerA", "in", "a.zip", 2048, false, "offered", 1500)
+            .unwrap();
+        s.update_transfer("x1", "done", Some("/tmp/a.zip")).unwrap();
+        s.insert_message("m2", "peerA", "out", "收到了吗", 2000).unwrap();
+
+        let items = s.history("peerA", None, 50).unwrap();
+        assert_eq!(items.len(), 3, "文本与文件合并进同一条时间线");
+        assert_eq!(
+            items.iter().map(HistoryItem::ts_ms).collect::<Vec<_>>(),
+            vec![1000, 1500, 2000],
+            "升序"
+        );
+        match &items[1] {
+            HistoryItem::File { status, path, .. } => {
+                assert_eq!(status, "done");
+                assert_eq!(path.as_deref(), Some("/tmp/a.zip"));
+            }
+            other => panic!("期望 File,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_cursor_pagination() {
+        let s = mem();
+        for i in 0..10 {
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100).unwrap();
+        }
+        let page1 = s.history("peerA", None, 4).unwrap();
+        assert_eq!(
+            page1.iter().map(HistoryItem::ts_ms).collect::<Vec<_>>(),
+            vec![600, 700, 800, 900],
+            "第一页是最新 4 条"
+        );
+        let page2 = s.history("peerA", Some(600), 4).unwrap();
+        assert_eq!(
+            page2.iter().map(HistoryItem::ts_ms).collect::<Vec<_>>(),
+            vec![200, 300, 400, 500],
+            "游标之前的一页,不含游标本身"
+        );
+    }
+
+    #[test]
+    fn history_isolates_peers() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        s.insert_message("m2", "peerB", "in", "b", 2).unwrap();
         assert_eq!(s.history("peerA", None, 50).unwrap().len(), 1);
     }
 }
