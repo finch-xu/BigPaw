@@ -20,6 +20,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 blake3 = "1"
 socket2 = { version = "0.5", features = ["all"] }
 if-addrs = "0.13"
+bigpaw-ipmsg = { path = "../bigpaw-ipmsg" }
 
 [dev-dependencies]
 tempfile = "3"

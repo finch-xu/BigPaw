@@ -123,6 +123,7 @@ dependencies = [
 name = "bigpaw-core"
 version = "0.1.0"
 dependencies = [
+ "bigpaw-ipmsg",
  "blake3",
  "gethostname",
  "hex",

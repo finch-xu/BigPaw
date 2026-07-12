@@ -6,12 +6,14 @@ use crate::discovery::announce::{
 };
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
-use crate::roster::{DiscoveryEvent, Peer, PeerState, Roster};
+use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::transport::manager::{
-    SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
+    MessageEvent, SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
+use bigpaw_ipmsg::discovery::{IpmsgError, IpmsgEvent, IpmsgService};
+use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
@@ -59,6 +61,10 @@ pub enum CoreError {
     Announce(#[from] AnnounceError),
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
+    #[error("ipmsg: {0}")]
+    Ipmsg(#[from] IpmsgError),
+    #[error("IPMsg 兼容层未启用(2425 端口被占用,可能本机在跑飞秋)")]
+    IpmsgUnavailable,
     #[error("对端不在线或未知")]
     UnknownPeer,
 }
@@ -81,6 +87,10 @@ pub struct Core {
     announce: Arc<Mutex<Option<AnnounceService>>>,
     transport: Arc<TransportManager>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
+    /// `events_rx` 那条 `TransportEvent` 通道的发送端克隆:`respond_file_ipmsg`
+    /// 起的后台下载线程要在完成/失败时上报 `FileDone`/`FileFailed`,复用与
+    /// 原生文件传输相同的事件形状与转发路径(见 `take_events` 消费方)。
+    events_tx: Sender<TransportEvent>,
     /// roster 消费线程的停止信号:`recv_timeout` 每 `ROSTER_TICK` 醒一次
     /// 检查它,`shutdown` 靠它让线程可终止,不必等 `rx` 断开(见线程内自
     /// 持的 `tx` 克隆——那把克隆本身就保证了 `rx.recv()` 永不返回 `Err`)。
@@ -88,6 +98,31 @@ pub struct Core {
     /// `shutdown` 时 `.take()` 拿到唯一所有权后 `join`,与 `discovery`/
     /// `announce` 字段一致的幂等模式:重复调用第二次拿到 `None` 直接跳过。
     roster_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// IPMsg 兼容层(M5):`Arc` 包裹是因为 `send_text`/`offer_file`/
+    /// `respond_file` 处理 ipmsg 对端时都要用它做阻塞网络 IO——克隆一份
+    /// `Arc` 后立即释放这把锁,不能让锁跨越网络调用(参见 `ipmsg_handle`)。
+    /// `None` 表示 2425 端口被占用(通常是本机在跑飞秋),兼容层已禁用,
+    /// 但不影响原生栈(见 `Core::start` 里的处理)。
+    ipmsg: Mutex<Option<Arc<IpmsgService>>>,
+    /// 启动时 IPMsg 兼容层是否成功启用,供壳层 `ipmsg_status()` 命令查询,
+    /// 让前端能提示"IPMsg 兼容层未启用(2425 被占用)"。启动后固定不变。
+    ipmsg_available: bool,
+    /// 对端(ipmsg 协议)通过 `SENDMSG|FILEATTACHOPT` 报价的文件:
+    /// 本地生成的 `xfer_id -> (packet_no, file_id, 文件名, 大小)` 登记表,
+    /// 供 `respond_file` 决定接受时反查、发起 `IpmsgService::request_file`。
+    ipmsg_offers: Arc<Mutex<HashMap<String, IpmsgOffer>>>,
+}
+
+/// 一条待决的 ipmsg 文件报价(见 `Core::ipmsg_offers` 字段注释)。
+struct IpmsgOffer {
+    /// 报价方的伪 fingerprint(`ipmsg:<key>`),接受时要反查 roster 拿地址。
+    peer_fp: String,
+    packet_no: u32,
+    file_id: u32,
+    /// 已在 `bigpaw_ipmsg::filexfer::parse_one_file_entry` 净化过的安全
+    /// basename,可以直接 `download_dir.join(name)`,不需要再次净化。
+    name: String,
+    size: u64,
 }
 
 impl Core {
@@ -96,7 +131,27 @@ impl Core {
         let nickname = cfg.nickname.unwrap_or_else(default_nickname);
 
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        // 留一份克隆给 IPMsg 兼容层的事件转发线程(见下):TextReceived/
+        // FileOffered 复用与原生传输层相同的 TransportEvent 转发路径。
+        let events_tx = msg_tx.clone();
         let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
+
+        // IPMsg/飞秋兼容层(M5,设计文档 §6):独立 crate,启动失败(最常见
+        // 是 2425 已被占用,比如本机在跑飞秋)绝不能让 Core::start 整体失败
+        // ——原生栈已经就绪,只是"旧协议兼容"这一层降级为不可用,记一个
+        // 标志供 `ipmsg_available()`/壳层 `ipmsg_status()` 命令查询。
+        let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
+        let ipmsg_host = hostname_no_local();
+        let (ipmsg_service, ipmsg_available) =
+            match IpmsgService::start(&nickname, &ipmsg_host, IPMSG_PORT, ipmsg_evt_tx) {
+                Ok(svc) => (Some(Arc::new(svc)), true),
+                Err(e) => {
+                    eprintln!("ipmsg: {IPMSG_PORT} 端口不可用({e}),兼容层已禁用(原生栈不受影响)");
+                    (None, false)
+                }
+            };
+        let ipmsg_offers: Arc<Mutex<HashMap<String, IpmsgOffer>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // discovery 事件通道:mDNS 发现线程通过 tx 送 Seen/Lost;下面同一个
         // 线程里为新对端起的回连探测线程也复用这条通道的克隆,把探测结论
@@ -115,6 +170,20 @@ impl Core {
             tx.clone(),
         )?;
         let announce = Arc::new(Mutex::new(Some(announce_service)));
+
+        // IPMsg 事件 → roster/transport 事件转发线程:只在兼容层真正启用时
+        // 才起(未启用时 ipmsg_evt_tx 已在 start() 失败分支里被丢弃,
+        // ipmsg_evt_rx.recv() 会立刻返回 Err,起了也是白起)。
+        if ipmsg_available {
+            let disc_tx = tx.clone();
+            let msg_tx_for_ipmsg = events_tx.clone();
+            let offers_for_thread = ipmsg_offers.clone();
+            std::thread::spawn(move || {
+                while let Ok(ev) = ipmsg_evt_rx.recv() {
+                    forward_ipmsg_event(ev, &disc_tx, &msg_tx_for_ipmsg, &offers_for_thread);
+                }
+            });
+        }
 
         let roster_handle = Arc::new(Mutex::new(Roster::new(identity.fingerprint.clone())));
         let (watch_tx, watch_rx) = watch::channel(Vec::new());
@@ -155,11 +224,15 @@ impl Core {
                             last_seen.insert(fingerprint.clone(), Instant::now());
                         }
                         // Seen 事件在被 apply 消费掉之前,先取出探测需要的字段。
+                        // 只对 Native 协议做回连探测:ipmsg 对端的 TCP 2425 说的是
+                        // GETFILEDATA 而不是原生 TLS 握手,拿 probe_reachable 去拨
+                        // 只会误判 Unreachable,没有意义(见 protocol 字段注释)。
                         let probe_target = match &ev {
                             DiscoveryEvent::Seen {
                                 fingerprint,
                                 addrs,
                                 port,
+                                protocol: Protocol::Native,
                                 ..
                             } => Some((fingerprint.clone(), addrs.clone(), *port)),
                             _ => None,
@@ -241,8 +314,12 @@ impl Core {
             announce,
             transport,
             events_rx: Mutex::new(Some(msg_rx)),
+            events_tx,
             roster_stop,
             roster_thread: Mutex::new(Some(roster_thread)),
+            ipmsg: Mutex::new(ipmsg_service),
+            ipmsg_available,
+            ipmsg_offers,
         })
     }
 
@@ -262,40 +339,145 @@ impl Core {
         self.roster_rx.clone()
     }
 
-    /// 从 roster 当前快照查一个对端的地址与端口(send_text/offer_file 共用)。
-    fn peer_addr(&self, peer_fp: &str) -> Result<(Vec<std::net::IpAddr>, u16), CoreError> {
+    /// 从 roster 当前快照查一个对端的完整记录:M5 起 send_text/offer_file
+    /// 除了地址/端口,还要看 `protocol` 决定走原生传输还是 IPMsg 兼容层。
+    fn find_peer(&self, peer_fp: &str) -> Result<Peer, CoreError> {
         let roster = self.roster_handle.lock().expect("roster lock");
-        let peer = roster
+        roster
             .snapshot()
             .into_iter()
             .find(|p| p.fingerprint == peer_fp)
-            .ok_or(CoreError::UnknownPeer)?;
-        Ok((peer.addrs, peer.port))
+            .ok_or(CoreError::UnknownPeer)
     }
 
-    /// 给对端发文本。地址与端口取自 roster 当前快照。
+    /// 给对端发文本;按 `peer.protocol` 分派到原生传输或 IPMsg 兼容层,
+    /// 调用方(壳层命令)不需要关心协议差异。
     pub fn send_text(&self, peer_fp: &str, body: &str) -> Result<SentText, CoreError> {
-        let (addrs, port) = self.peer_addr(peer_fp)?;
-        Ok(self.transport.send_text(peer_fp, &addrs, port, body)?)
+        let peer = self.find_peer(peer_fp)?;
+        match peer.protocol {
+            Protocol::Native => {
+                Ok(self
+                    .transport
+                    .send_text(peer_fp, &peer.addrs, peer.port, body)?)
+            }
+            Protocol::Ipmsg => self.send_text_ipmsg(&peer, body),
+        }
     }
 
-    /// 给对端发起一次文件传输报价。地址与端口同 send_text,取自 roster 当前快照。
+    /// 给对端发起一次文件传输报价;同样按 `peer.protocol` 分派。原生一侧
     /// 返回 xfer_id,后续的 FileOffered/FileProgress/FileDone/FileFailed
-    /// 事件都带着它,供调用方关联。
+    /// 事件都带着它,供调用方关联;ipmsg 一侧见 `offer_file_ipmsg` 注释。
     pub fn offer_file(&self, peer_fp: &str, path: &Path) -> Result<String, CoreError> {
-        let (addrs, port) = self.peer_addr(peer_fp)?;
-        let handle = self.transport.offer_file(peer_fp, &addrs, port, path)?;
-        Ok(handle.xfer_id)
+        let peer = self.find_peer(peer_fp)?;
+        match peer.protocol {
+            Protocol::Native => {
+                let handle = self
+                    .transport
+                    .offer_file(peer_fp, &peer.addrs, peer.port, path)?;
+                Ok(handle.xfer_id)
+            }
+            Protocol::Ipmsg => self.offer_file_ipmsg(&peer, path),
+        }
     }
 
-    /// 接收方对一个待决的文件报价做出决定(接受/拒绝)。
+    /// 接收方对一个待决的文件报价做出决定(接受/拒绝)。先查 `ipmsg_offers`
+    /// (M5 新增):命中说明这是一条 ipmsg 报价,走 `respond_file_ipmsg`;
+    /// 否则落回原生 `TransportManager::respond_file`(未知 xfer_id 时它自己
+    /// 静默忽略,保持既有的幂等语义)。
     pub fn respond_file(
         &self,
         xfer_id: &str,
         accept: bool,
         download_dir: &Path,
     ) -> Result<(), CoreError> {
-        Ok(self.transport.respond_file(xfer_id, accept, download_dir)?)
+        let ipmsg_offer = self
+            .ipmsg_offers
+            .lock()
+            .expect("ipmsg offers lock")
+            .remove(xfer_id);
+        match ipmsg_offer {
+            Some(offer) => self.respond_file_ipmsg(xfer_id, offer, accept, download_dir),
+            None => Ok(self.transport.respond_file(xfer_id, accept, download_dir)?),
+        }
+    }
+
+    /// 短暂持锁克隆出一份 `Arc<IpmsgService>` 立即释放锁——`send_text`/
+    /// `send_file`/`request_file` 都是阻塞网络 IO,绝不能让它们跨越这把锁
+    /// (否则同时互相排队,还会拖住 `shutdown` 的 `.take()`)。
+    /// 兼容层未启用(2425 被占用)时返回 `IpmsgUnavailable`。
+    fn ipmsg_handle(&self) -> Result<Arc<IpmsgService>, CoreError> {
+        self.ipmsg
+            .lock()
+            .expect("ipmsg lock")
+            .clone()
+            .ok_or(CoreError::IpmsgUnavailable)
+    }
+
+    /// ipmsg 对端只有一个来源地址(发现时的 UDP 源地址),`port` 也就是它的
+    /// IPMsg 监听端口(UDP/TCP 同号)。
+    fn ipmsg_socket_addr(peer: &Peer) -> Result<SocketAddr, CoreError> {
+        let ip = peer.addrs.first().copied().ok_or(CoreError::UnknownPeer)?;
+        Ok(SocketAddr::new(ip, peer.port))
+    }
+
+    fn send_text_ipmsg(&self, peer: &Peer, body: &str) -> Result<SentText, CoreError> {
+        let addr = Self::ipmsg_socket_addr(peer)?;
+        let svc = self.ipmsg_handle()?;
+        svc.send_text(addr, body)?;
+        // IPMsg 协议本身没有给调用方回一个 id/时间戳;本地生成,和原生一侧
+        // 的 SentText 同形状,壳层命令因此不需要区分协议来源。
+        Ok(SentText {
+            id: crate::transport::proto::new_id(),
+            ts_ms: crate::transport::proto::now_ms(),
+        })
+    }
+
+    /// M5 冻结范围:单文件发送。发出 offer 后本端观察不到对端何时/是否真的
+    /// 用 GETFILEDATA 拉取——这是 IPMsg 协议本身的性质(报价即忘),真实
+    /// 飞秋客户端同样不会给发送方任何完成回执,因此这里只生成一个本地
+    /// xfer_id 供 UI 记账,不会再有后续的 FileDone/FileFailed 事件。
+    fn offer_file_ipmsg(&self, peer: &Peer, path: &Path) -> Result<String, CoreError> {
+        let addr = Self::ipmsg_socket_addr(peer)?;
+        let svc = self.ipmsg_handle()?;
+        svc.send_file(addr, path)?;
+        Ok(crate::transport::proto::new_id())
+    }
+
+    /// 接受/拒绝一条 ipmsg 文件报价。拒绝:IPMsg 协议没有"我拒绝了"的回执,
+    /// 不请求就是拒绝,静默即可。接受:反查 roster 拿地址,后台线程发起
+    /// `IpmsgService::request_file`(阻塞网络 IO,不能占着调用方线程——与
+    /// 原生 `offer_file` 的 `await_offer_reply` 后台线程同一个道理),完成/
+    /// 失败时复用原生一致的 `TransportEvent::FileDone`/`FileFailed` 上报。
+    fn respond_file_ipmsg(
+        &self,
+        xfer_id: &str,
+        offer: IpmsgOffer,
+        accept: bool,
+        download_dir: &Path,
+    ) -> Result<(), CoreError> {
+        if !accept {
+            return Ok(());
+        }
+        let peer = self.find_peer(&offer.peer_fp)?;
+        let addr = Self::ipmsg_socket_addr(&peer)?;
+        let save_path = download_dir.join(&offer.name);
+        let svc = self.ipmsg_handle()?;
+        let events = self.events_tx.clone();
+        let xfer_id = xfer_id.to_string();
+        std::thread::spawn(move || {
+            match svc.request_file(addr, offer.packet_no, offer.file_id, offer.size, &save_path) {
+                Ok(path) => {
+                    let _ = events.send(TransportEvent::FileDone { xfer_id, path });
+                }
+                Err(e) => {
+                    let _ = events.send(TransportEvent::FileFailed {
+                        xfer_id,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        });
+        Ok(())
     }
 
     /// 取走事件接收端(只能取一次,由壳层的事件循环消费)。
@@ -305,6 +487,13 @@ impl Core {
 
     pub fn port(&self) -> u16 {
         self.transport.port()
+    }
+
+    /// IPMsg 兼容层是否已启用(启动时 2425 端口绑定成功)。供壳层
+    /// `ipmsg_status()` 命令查询,让前端能提示"2425 被占用,可能本机在跑
+    /// 飞秋"。启动后固定不变。
+    pub fn ipmsg_available(&self) -> bool {
+        self.ipmsg_available
     }
 
     /// 主动下线:注销 mDNS(发 goodbye)+ 停止 UDP 宣告收发,对端立刻收到
@@ -328,6 +517,22 @@ impl Core {
         let announce = self.announce.lock().expect("announce lock poisoned").take();
         if let Some(a) = announce {
             a.shutdown();
+        }
+
+        // IPMsg 兼容层:同样"take 拿唯一所有权再 shutdown"的幂等模式,但
+        // 这里存的是 `Arc`(供 send_text_ipmsg/offer_file_ipmsg/
+        // respond_file_ipmsg 在锁外并发使用,见 `ipmsg` 字段注释),
+        // `IpmsgService::shutdown` 又要求按值消费 self。若此刻仍有并发的
+        // 后台线程(比如一次 respond_file_ipmsg 正在跑的 request_file)持有
+        // 克隆,`Arc::try_unwrap` 会失败——这种情况下放弃优雅关闭(不广播
+        // BR_EXIT、不 join 内部线程),而不是阻塞 shutdown 等一个时长未知的
+        // 下载完成:与 roster 线程"最长阻塞一个 ROSTER_TICK"的既有承诺一致,
+        // shutdown 不应该被网络 IO 无限期拖住。
+        let ipmsg = self.ipmsg.lock().expect("ipmsg lock poisoned").take();
+        if let Some(arc) = ipmsg {
+            if let Ok(svc) = Arc::try_unwrap(arc) {
+                svc.shutdown();
+            }
         }
 
         self.roster_stop.store(true, Ordering::Relaxed);
@@ -402,9 +607,100 @@ fn spawn_probe(
     });
 }
 
-fn default_nickname() -> String {
+/// 去掉 `.local` 后缀的真实主机名。既用作 `nickname` 的默认值(用户可覆盖),
+/// 也用作 IPMsg 报文里的 `host` 字段(设计上恒为真实机器名,不随
+/// `CoreConfig::nickname` 覆盖而变化——两者语义不同:nickname 是"顶给别人
+/// 看的昵称",host 是"这台机器叫什么")。
+fn hostname_no_local() -> String {
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     host.trim_end_matches(".local").to_string()
+}
+
+fn default_nickname() -> String {
+    hostname_no_local()
+}
+
+/// IPMsg 事件 → roster/transport 事件的映射(M5,设计文档 §6):
+/// - `Online`:**自动升级去重**——`is_bigpaw=true` 说明对端也是 BigPaw,
+///   原生发现层(mDNS/UDP 宣告)迟早会(或已经)发现同一台设备并注册为
+///   `Protocol::Native` 联系人,这里直接跳过、不注入 ipmsg 联系人,否则同
+///   一对端会在联系人列表里出现两次。转成 roster 的 `Seen` 时用伪指纹
+///   `ipmsg:<key>`(ipmsg 对端没有真实指纹),`protocol: Ipmsg`。
+/// - `Offline`:转成 `Lost`;若这个伪指纹从未被 `Seen` 加入过(比如它当初
+///   因为 `is_bigpaw=true` 被跳过),`Roster::apply` 本身对未知 fingerprint
+///   就是无操作,这里不需要额外判断。
+/// - `TextReceived`/`FileOffered`:转成与原生传输层同形状的
+///   `TransportEvent`,复用既有的 `message://received`/`file://offered`
+///   转发路径,UI 不需要区分协议来源。文件 offer 顺带把
+///   `(peer_fp, packet_no, file_id, name, size)` 登记进 `offers`,供
+///   `Core::respond_file` 决定接受时反查、发起 `request_file`;目录条目
+///   (`is_dir`)跳过——M5 冻结范围只接单文件。
+fn forward_ipmsg_event(
+    ev: IpmsgEvent,
+    disc_tx: &Sender<DiscoveryEvent>,
+    msg_tx: &Sender<TransportEvent>,
+    offers: &Mutex<HashMap<String, IpmsgOffer>>,
+) {
+    match ev {
+        IpmsgEvent::Online {
+            key,
+            nick,
+            addr,
+            is_bigpaw,
+            ..
+        } => {
+            if is_bigpaw {
+                return; // 自动升级:交给原生发现层,不重复注入联系人
+            }
+            let _ = disc_tx.send(DiscoveryEvent::Seen {
+                fingerprint: format!("ipmsg:{key}"),
+                nickname: nick,
+                addrs: vec![addr.ip()],
+                port: addr.port(),
+                protocol: Protocol::Ipmsg,
+            });
+        }
+        IpmsgEvent::Offline { key } => {
+            let _ = disc_tx.send(DiscoveryEvent::Lost {
+                fingerprint: format!("ipmsg:{key}"),
+            });
+        }
+        IpmsgEvent::TextReceived { key, body, .. } => {
+            let _ = msg_tx.send(TransportEvent::Message(MessageEvent {
+                peer_fp: format!("ipmsg:{key}"),
+                id: crate::transport::proto::new_id(),
+                body,
+                ts_ms: crate::transport::proto::now_ms(),
+            }));
+        }
+        IpmsgEvent::FileOffered {
+            key,
+            packet_no,
+            files,
+            ..
+        } => {
+            let peer_fp = format!("ipmsg:{key}");
+            for f in files.into_iter().filter(|f| !f.is_dir) {
+                let xfer_id = crate::transport::proto::new_id();
+                offers.lock().expect("ipmsg offers lock").insert(
+                    xfer_id.clone(),
+                    IpmsgOffer {
+                        peer_fp: peer_fp.clone(),
+                        packet_no,
+                        file_id: f.file_id,
+                        name: f.name.clone(),
+                        size: f.size,
+                    },
+                );
+                let _ = msg_tx.send(TransportEvent::FileOffered {
+                    xfer_id,
+                    peer_fp: peer_fp.clone(),
+                    name: f.name,
+                    size: f.size,
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -614,5 +910,194 @@ mod tests {
                 .expect("测试机器已启动超过 60s"),
         );
         assert!(stale_fingerprints(&last_seen, now, Duration::from_secs(60)).is_empty());
+    }
+
+    // ---- forward_ipmsg_event:IPMsg → roster/transport 事件映射(M5) ----
+
+    fn ipmsg_online(key: &str, is_bigpaw: bool) -> IpmsgEvent {
+        IpmsgEvent::Online {
+            key: key.to_string(),
+            nick: "bob-feiq".to_string(),
+            host: "HOST-B".to_string(),
+            addr: "192.168.1.9:2425".parse().unwrap(),
+            is_bigpaw,
+        }
+    }
+
+    #[test]
+    fn forward_ipmsg_event_online_becomes_seen_with_ipmsg_protocol() {
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            ipmsg_online("192.168.1.9:HOST-B", false),
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        match disc_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            DiscoveryEvent::Seen {
+                fingerprint,
+                protocol,
+                addrs,
+                port,
+                ..
+            } => {
+                assert_eq!(fingerprint, "ipmsg:192.168.1.9:HOST-B");
+                assert_eq!(protocol, Protocol::Ipmsg);
+                assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))]);
+                assert_eq!(port, 2425);
+            }
+            other => panic!("期望 Seen,却收到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_ipmsg_event_skips_bigpaw_peer_for_auto_upgrade() {
+        // 自动升级去重:对端也是 BigPaw 时不注入 ipmsg 联系人,原生发现层接管。
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            ipmsg_online("192.168.1.9:HOST-B", true),
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        assert!(
+            disc_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "is_bigpaw=true 不该注入 ipmsg 联系人"
+        );
+    }
+
+    #[test]
+    fn forward_ipmsg_event_offline_becomes_lost() {
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, _msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            IpmsgEvent::Offline {
+                key: "192.168.1.9:HOST-B".to_string(),
+            },
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        match disc_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            DiscoveryEvent::Lost { fingerprint } => {
+                assert_eq!(fingerprint, "ipmsg:192.168.1.9:HOST-B")
+            }
+            other => panic!("期望 Lost,却收到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_ipmsg_event_text_received_becomes_message() {
+        let (disc_tx, _disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            IpmsgEvent::TextReceived {
+                key: "192.168.1.9:HOST-B".to_string(),
+                from: "bob".to_string(),
+                body: "你好".to_string(),
+            },
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        match msg_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TransportEvent::Message(m) => {
+                assert_eq!(m.peer_fp, "ipmsg:192.168.1.9:HOST-B");
+                assert_eq!(m.body, "你好");
+            }
+            other => panic!("期望 Message,却收到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forward_ipmsg_event_file_offered_registers_offer_and_emits_event() {
+        let (disc_tx, _disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            IpmsgEvent::FileOffered {
+                key: "192.168.1.9:HOST-B".to_string(),
+                from: "bob".to_string(),
+                packet_no: 42,
+                files: vec![bigpaw_ipmsg::filexfer::IpmsgFileEntry {
+                    file_id: 0,
+                    name: "report.pdf".to_string(),
+                    size: 2048,
+                    is_dir: false,
+                }],
+            },
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        let xfer_id = match msg_rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+            TransportEvent::FileOffered {
+                xfer_id,
+                peer_fp,
+                name,
+                size,
+            } => {
+                assert_eq!(peer_fp, "ipmsg:192.168.1.9:HOST-B");
+                assert_eq!(name, "report.pdf");
+                assert_eq!(size, 2048);
+                xfer_id
+            }
+            other => panic!("期望 FileOffered,却收到 {other:?}"),
+        };
+
+        let table = offers.lock().unwrap();
+        let registered = table.get(&xfer_id).expect("offer 应已登记");
+        assert_eq!(registered.peer_fp, "ipmsg:192.168.1.9:HOST-B");
+        assert_eq!(registered.packet_no, 42);
+        assert_eq!(registered.file_id, 0);
+        assert_eq!(registered.name, "report.pdf");
+        assert_eq!(registered.size, 2048);
+    }
+
+    #[test]
+    fn forward_ipmsg_event_file_offered_skips_dir_entries() {
+        // M5 冻结范围只接单文件:目录条目跳过,不生成 xfer_id、不登记。
+        let (disc_tx, _disc_rx) = std::sync::mpsc::channel();
+        let (msg_tx, msg_rx) = std::sync::mpsc::channel();
+        let offers: Mutex<HashMap<String, IpmsgOffer>> = Mutex::new(HashMap::new());
+
+        forward_ipmsg_event(
+            IpmsgEvent::FileOffered {
+                key: "192.168.1.9:HOST-B".to_string(),
+                from: "bob".to_string(),
+                packet_no: 1,
+                files: vec![bigpaw_ipmsg::filexfer::IpmsgFileEntry {
+                    file_id: 0,
+                    name: "照片".to_string(),
+                    size: 0,
+                    is_dir: true,
+                }],
+            },
+            &disc_tx,
+            &msg_tx,
+            &offers,
+        );
+
+        assert!(
+            msg_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "目录条目应跳过,不上报 FileOffered"
+        );
+        assert!(offers.lock().unwrap().is_empty());
     }
 }

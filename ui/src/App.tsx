@@ -8,11 +8,13 @@ export default function App() {
   const self = useAppStore((s) => s.self);
   const peers = useAppStore((s) => s.peers);
   const selectedFp = useAppStore((s) => s.selectedFp);
+  const ipmsgAvailable = useAppStore((s) => s.ipmsgAvailable);
   const setSelf = useAppStore((s) => s.setSelf);
   const setPeers = useAppStore((s) => s.setPeers);
   const select = useAppStore((s) => s.select);
   const appendMessage = useAppStore((s) => s.appendMessage);
   const upsertTransfer = useAppStore((s) => s.upsertTransfer);
+  const setIpmsgAvailable = useAppStore((s) => s.setIpmsgAvailable);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -76,6 +78,8 @@ export default function App() {
         unFileFailed = unFailed;
         setSelf(await invoke<SelfInfo>("get_self_info"));
         setPeers(await invoke<Peer[]>("get_roster"));
+        const status = await invoke<{ available: boolean }>("ipmsg_status");
+        setIpmsgAvailable(status.available);
       } catch (e) {
         console.error("初始化失败:", e);
       }
@@ -89,7 +93,7 @@ export default function App() {
       unFileDone?.();
       unFileFailed?.();
     };
-  }, [setSelf, setPeers, appendMessage, upsertTransfer]);
+  }, [setSelf, setPeers, appendMessage, upsertTransfer, setIpmsgAvailable]);
 
   const online = peers.filter((p) => p.state !== "offline");
 
@@ -132,8 +136,18 @@ export default function App() {
                     : undefined
                 }
               />
-              <div className="min-w-0">
-                <div className="truncate font-medium">{p.nickname}</div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate font-medium">{p.nickname}</span>
+                  {p.protocol === "ipmsg" && (
+                    <span
+                      className="shrink-0 rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-medium text-amber-800"
+                      title="旧协议(IPMsg/飞秋兼容),消息为明文传输"
+                    >
+                      旧协议
+                    </span>
+                  )}
+                </div>
                 <div className="truncate text-xs text-amber-700">{p.addrs[0] ?? ""}</div>
               </div>
             </li>
@@ -142,6 +156,11 @@ export default function App() {
             <li className="px-4 py-6 text-sm text-amber-600">正在搜索局域网设备…</li>
           )}
         </ul>
+        {ipmsgAvailable === false && (
+          <p className="border-t border-amber-200 px-4 py-2 text-xs text-amber-600">
+            IPMsg 兼容层未启用(2425 端口被占用,可能本机在跑飞秋)
+          </p>
+        )}
       </aside>
       {selectedFp ? (
         <ChatPane fp={selectedFp} />

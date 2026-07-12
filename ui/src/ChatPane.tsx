@@ -49,11 +49,18 @@ export default function ChatPane({ fp }: { fp: string }) {
     }
   }
 
+  const isIpmsg = peer?.protocol === "ipmsg";
+
   return (
     <section className="flex flex-1 flex-col">
       <header className="border-b border-amber-200 p-3 font-medium">
         {peer?.nickname ?? fp.slice(0, 8)}
       </header>
+      {isIpmsg && (
+        <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-700">
+          ⚠ 明文传输,对方为飞秋/旧客户端(仅支持文本与单文件,不加密)
+        </p>
+      )}
       <ul className="flex-1 space-y-2 overflow-y-auto p-4">
         {messages.map((m) => (
           <li key={m.id} className={m.direction === "out" ? "text-right" : "text-left"}>

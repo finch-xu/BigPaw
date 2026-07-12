@@ -48,6 +48,9 @@ pub enum DiscoveryEvent {
         nickname: String,
         addrs: Vec<IpAddr>,
         port: u16,
+        /// 发现来源:mDNS/UDP 宣告(原生栈)恒为 `Native`;IPMsg 兼容层(M5)
+        /// 喂入的 Seen 恒为 `Ipmsg`,让 roster 记录下这个对端走哪条协议栈。
+        protocol: Protocol,
     },
     Lost {
         fingerprint: String,
@@ -83,6 +86,7 @@ impl Roster {
                 nickname,
                 mut addrs,
                 port,
+                protocol,
             } => {
                 if fingerprint == self.self_fingerprint {
                     return false;
@@ -105,7 +109,7 @@ impl Roster {
                     nickname,
                     addrs,
                     port,
-                    protocol: Protocol::Native,
+                    protocol,
                     state,
                 };
                 match self.peers.get(&fingerprint) {
@@ -174,6 +178,17 @@ mod tests {
             nickname: nick.to_string(),
             addrs: vec![ip(5)],
             port: 0,
+            protocol: Protocol::Native,
+        }
+    }
+
+    fn seen_ipmsg(fp: &str, nick: &str) -> DiscoveryEvent {
+        DiscoveryEvent::Seen {
+            fingerprint: fp.to_string(),
+            nickname: nick.to_string(),
+            addrs: vec![ip(9)],
+            port: 2425,
+            protocol: Protocol::Ipmsg,
         }
     }
 
@@ -310,6 +325,18 @@ mod tests {
             fingerprint: "bbbb".to_string()
         }));
         assert_eq!(r.snapshot()[0].state, PeerState::Reachable);
+    }
+
+    #[test]
+    fn seen_with_ipmsg_protocol_records_ipmsg_peer() {
+        // M5:IPMsg 兼容层喂入的 Seen 带 protocol=Ipmsg,伪 fingerprint 形如
+        // `ipmsg:<key>`——roster 应如实记录 protocol,而不是硬编码成 Native。
+        let mut r = Roster::new(SELF_FP.to_string());
+        assert!(r.apply(seen_ipmsg("ipmsg:192.168.1.9:HOST-B", "bob-feiq")));
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].protocol, Protocol::Ipmsg);
+        assert_eq!(snap[0].port, 2425);
     }
 
     #[test]

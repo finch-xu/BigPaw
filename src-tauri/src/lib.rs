@@ -32,6 +32,20 @@ fn get_roster(core: State<'_, AppCore>) -> Vec<Peer> {
     core.0.roster_snapshot()
 }
 
+#[derive(Serialize)]
+struct IpmsgStatusDto {
+    available: bool,
+}
+
+/// IPMsg 兼容层状态(M5):2425 端口被占用(常见于本机在跑飞秋)时
+/// `available=false`,原生栈不受影响,前端据此提示"旧协议兼容层未启用"。
+#[tauri::command]
+fn ipmsg_status(core: State<'_, AppCore>) -> IpmsgStatusDto {
+    IpmsgStatusDto {
+        available: core.0.ipmsg_available(),
+    }
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MessageDto {
@@ -224,7 +238,8 @@ pub fn run() {
             send_text,
             offer_file,
             respond_file,
-            default_download_dir
+            default_download_dir,
+            ipmsg_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

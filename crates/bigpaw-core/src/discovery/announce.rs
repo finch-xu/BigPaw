@@ -7,7 +7,7 @@
 //! - 启动快速宣告(2s/4s/8s 退避)后转周期(~25s),发送批次间隔 ≥1s。
 
 use crate::identity::Identity;
-use crate::roster::DiscoveryEvent;
+use crate::roster::{DiscoveryEvent, Protocol};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::{HashMap, VecDeque};
@@ -276,6 +276,7 @@ fn recv_loop(
             nickname: ann.nick,
             addrs: vec![src_ip],
             port: ann.tport,
+            protocol: Protocol::Native,
         };
         if tx.send(ev).is_err() {
             return; // 接收端已销毁,退出线程
