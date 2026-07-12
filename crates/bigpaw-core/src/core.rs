@@ -5,9 +5,9 @@ use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
 use crate::roster::{Peer, Roster};
 use crate::transport::manager::{
-    MessageEvent, SentText, TransportError, TransportManager, DEFAULT_PORT,
+    SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -37,7 +37,7 @@ pub struct Core {
     roster_handle: Arc<Mutex<Roster>>,
     discovery: std::sync::Mutex<Option<Discovery>>,
     transport: Arc<TransportManager>,
-    messages_rx: Mutex<Option<std::sync::mpsc::Receiver<MessageEvent>>>,
+    events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
 }
 
 impl Core {
@@ -70,7 +70,7 @@ impl Core {
             roster_handle,
             discovery: std::sync::Mutex::new(Some(discovery)),
             transport,
-            messages_rx: Mutex::new(Some(msg_rx)),
+            events_rx: Mutex::new(Some(msg_rx)),
         })
     }
 
@@ -90,23 +90,45 @@ impl Core {
         self.roster_rx.clone()
     }
 
+    /// 从 roster 当前快照查一个对端的地址与端口(send_text/offer_file 共用)。
+    fn peer_addr(&self, peer_fp: &str) -> Result<(Vec<std::net::IpAddr>, u16), CoreError> {
+        let roster = self.roster_handle.lock().expect("roster lock");
+        let peer = roster
+            .snapshot()
+            .into_iter()
+            .find(|p| p.fingerprint == peer_fp)
+            .ok_or(CoreError::UnknownPeer)?;
+        Ok((peer.addrs, peer.port))
+    }
+
     /// 给对端发文本。地址与端口取自 roster 当前快照。
     pub fn send_text(&self, peer_fp: &str, body: &str) -> Result<SentText, CoreError> {
-        let (addrs, port) = {
-            let roster = self.roster_handle.lock().expect("roster lock");
-            let peer = roster
-                .snapshot()
-                .into_iter()
-                .find(|p| p.fingerprint == peer_fp)
-                .ok_or(CoreError::UnknownPeer)?;
-            (peer.addrs, peer.port)
-        };
+        let (addrs, port) = self.peer_addr(peer_fp)?;
         Ok(self.transport.send_text(peer_fp, &addrs, port, body)?)
     }
 
-    /// 取走消息接收端(只能取一次,由壳层的事件循环消费)。
-    pub fn take_messages(&self) -> Option<std::sync::mpsc::Receiver<MessageEvent>> {
-        self.messages_rx.lock().expect("messages lock").take()
+    /// 给对端发起一次文件传输报价。地址与端口同 send_text,取自 roster 当前快照。
+    /// 返回 xfer_id,后续的 FileOffered/FileProgress/FileDone/FileFailed
+    /// 事件都带着它,供调用方关联。
+    pub fn offer_file(&self, peer_fp: &str, path: &Path) -> Result<String, CoreError> {
+        let (addrs, port) = self.peer_addr(peer_fp)?;
+        let handle = self.transport.offer_file(peer_fp, &addrs, port, path)?;
+        Ok(handle.xfer_id)
+    }
+
+    /// 接收方对一个待决的文件报价做出决定(接受/拒绝)。
+    pub fn respond_file(
+        &self,
+        xfer_id: &str,
+        accept: bool,
+        download_dir: &Path,
+    ) -> Result<(), CoreError> {
+        Ok(self.transport.respond_file(xfer_id, accept, download_dir)?)
+    }
+
+    /// 取走事件接收端(只能取一次,由壳层的事件循环消费)。
+    pub fn take_events(&self) -> Option<std::sync::mpsc::Receiver<TransportEvent>> {
+        self.events_rx.lock().expect("events lock").take()
     }
 
     pub fn port(&self) -> u16 {

@@ -81,19 +81,24 @@ pub fn run() {
                 }
             });
 
-            if let Some(msg_rx) = core.take_messages() {
+            if let Some(events_rx) = core.take_events() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    while let Ok(ev) = msg_rx.recv() {
-                        let _ = handle.emit(
-                            "message://received",
-                            MessageDto {
-                                peer_fp: ev.peer_fp,
-                                id: ev.id,
-                                body: ev.body,
-                                ts_ms: ev.ts_ms,
-                            },
-                        );
+                    while let Ok(ev) = events_rx.recv() {
+                        // M3:events 现在是 TransportEvent(文本消息之外还有文件传输
+                        // 生命周期事件)。壳层的文件传输 UI/IPC 不在本任务范围内,
+                        // 这里先只保留原有的文本消息转发,其余事件先忽略。
+                        if let bigpaw_core::transport::manager::TransportEvent::Message(ev) = ev {
+                            let _ = handle.emit(
+                                "message://received",
+                                MessageDto {
+                                    peer_fp: ev.peer_fp,
+                                    id: ev.id,
+                                    body: ev.body,
+                                    ts_ms: ev.ts_ms,
+                                },
+                            );
+                        }
                     }
                 });
             }

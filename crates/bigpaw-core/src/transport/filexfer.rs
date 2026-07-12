@@ -135,6 +135,46 @@ pub fn receive_into(
     Ok(final_path)
 }
 
+/// 算文件 blake3 与大小(发送前)。
+pub fn hash_file(path: &Path) -> io::Result<(u64, String)> {
+    let mut f = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut size = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((size, hasher.finalize().to_hex().to_string()))
+}
+
+/// 从 offset 起把文件字节推给 writer。
+pub fn send_from(
+    path: &Path,
+    offset: u64,
+    size: u64,
+    writer: &mut impl Write,
+    on_progress: &mut dyn FnMut(u64),
+) -> io::Result<()> {
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut done = offset;
+    let mut buf = vec![0u8; CHUNK];
+    while done < size {
+        let want = CHUNK.min((size - done) as usize);
+        f.read_exact(&mut buf[..want])?;
+        writer.write_all(&buf[..want])?;
+        done += want as u64;
+        on_progress(done);
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +301,63 @@ mod tests {
         assert!(err.is_err());
         // 校验失败保留 part 供续传/排查,不留半个"成品"
         assert!(!dir.path().join("x.bin").exists());
+    }
+
+    #[test]
+    fn hash_file_matches_blake3_of_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![9u8; 2_000_000];
+        let path = dir.path().join("src.bin");
+        std::fs::write(&path, &data).unwrap();
+        let (size, hash) = hash_file(&path).unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(hash, blake3::hash(&data).to_hex().to_string());
+    }
+
+    #[test]
+    fn send_from_then_receive_into_roundtrips() {
+        let dir = dir_pair();
+        let (src_dir, dst_dir) = (&dir.0, &dir.1);
+        let data = vec![3u8; 2_500_000];
+        let src = src_dir.path().join("payload.bin");
+        std::fs::write(&src, &data).unwrap();
+        let (size, hash) = hash_file(&src).unwrap();
+
+        let mut wire = Vec::new();
+        let mut send_progress = Vec::new();
+        send_from(&src, 0, size, &mut wire, &mut |d| send_progress.push(d)).unwrap();
+        assert_eq!(wire, data);
+        assert_eq!(*send_progress.last().unwrap(), size);
+
+        let mut recv_progress = Vec::new();
+        let path = receive_into(
+            dst_dir.path(),
+            "payload.bin",
+            size,
+            0,
+            &hash,
+            &mut Cursor::new(wire),
+            &mut |d| recv_progress.push(d),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+
+    /// 小工具:两个独立临时目录(发送侧源文件目录、接收侧下载目录)。
+    fn dir_pair() -> (tempfile::TempDir, tempfile::TempDir) {
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn send_from_resumes_from_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![6u8; 3_000_000];
+        let src = dir.path().join("resume.bin");
+        std::fs::write(&src, &data).unwrap();
+        let offset = 1_048_576u64;
+        let size = data.len() as u64;
+        let mut wire = Vec::new();
+        send_from(&src, offset, size, &mut wire, &mut |_| {}).unwrap();
+        assert_eq!(wire, data[offset as usize..]);
     }
 }
