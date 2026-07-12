@@ -7,12 +7,13 @@
 use crate::command::{self, Command};
 use crate::proto::{self, Packet, BIGPAW_TAG};
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// 报文里不透明的版本字段;真实飞秋会带更复杂的版本串,我方只需固定一个值。
@@ -39,6 +40,12 @@ pub enum IpmsgEvent {
     },
     Offline {
         key: String,
+    },
+    /// 收到一条 SENDMSG 文本消息(`from` = 对端 nick,`body` = extra 原文)。
+    TextReceived {
+        key: String,
+        from: String,
+        body: String,
     },
 }
 
@@ -139,12 +146,16 @@ fn send_loop(
 
 /// 收到报文后的处理结果:纯函数,便于脱离真实 socket 单元测试。
 enum Action {
-    /// 未知命令号(SENDMSG 等留给后续任务)或其它不需处理的情况:静默忽略。
+    /// 未知命令号(GETFILEDATA 等留给后续任务)或其它不需处理的情况:静默忽略。
     None,
-    /// 直接上报事件,无需回包(ANSENTRY / BR_EXIT)。
+    /// 直接上报事件,无需回包(ANSENTRY / BR_EXIT / 无回执要求的 SENDMSG)。
     Emit(IpmsgEvent),
-    /// 单播回一个 ANSENTRY 报文,并上报 Online 事件(收到对端 BR_ENTRY)。
+    /// 单播回一个报文,并上报事件——BR_ENTRY→ANSENTRY+Online,
+    /// 或 SENDMSG|SENDCHECKOPT→RECVMSG 回执+TextReceived。
     ReplyAndEmit(Packet, IpmsgEvent),
+    /// 收到 RECVMSG 回执:从待回执表里摘掉这个 packet_no,不上报事件
+    /// (M5 不做重发/超时,recv_loop 只需把它从 pending map 里移除)。
+    Ack(u32),
 }
 
 /// 按 `Command(p.command).num()` 分派:BR_ENTRY → 回 ANSENTRY + Online;
@@ -196,11 +207,38 @@ fn dispatch(
             is_bigpaw,
         }),
         command::BR_EXIT => Action::Emit(IpmsgEvent::Offline { key }),
+        command::SENDMSG => {
+            let text = IpmsgEvent::TextReceived {
+                key,
+                from: packet.sender.clone(),
+                body: packet.extra.clone(),
+            };
+            if Command(packet.command).has_opt(command::SENDCHECKOPT) {
+                let reply = Packet {
+                    version: IPMSG_VERSION.to_string(),
+                    packet_no: next_packet_no(packet_no),
+                    sender: nick.to_string(),
+                    host: host.to_string(),
+                    command: command::RECVMSG,
+                    // 回执 extra = 原始消息的 packet_no(十进制串),让发送方知道哪条消息被确认。
+                    extra: packet.packet_no.to_string(),
+                };
+                Action::ReplyAndEmit(reply, text)
+            } else {
+                Action::Emit(text)
+            }
+        }
+        // RECVMSG 的 extra 就是被确认消息的原始 packet_no;解析失败(畸形报文)静默忽略。
+        command::RECVMSG => match packet.extra.parse::<u32>() {
+            Ok(acked_no) => Action::Ack(acked_no),
+            Err(_) => Action::None,
+        },
         _ => Action::None,
     }
 }
 
 /// 接收线程主循环:recv_from → proto::decode(畸形报文静默丢弃)→ dispatch → 执行动作。
+#[allow(clippy::too_many_arguments)]
 fn recv_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
@@ -209,6 +247,7 @@ fn recv_loop(
     host: String,
     tx: Sender<IpmsgEvent>,
     self_token: Arc<String>,
+    pending_acks: Arc<Mutex<HashMap<u32, Instant>>>,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
@@ -249,6 +288,10 @@ fn recv_loop(
                     return;
                 }
             }
+            Action::Ack(acked_no) => {
+                // 短临界区:只是一次 HashMap::remove,绝不跨越阻塞 IO。
+                pending_acks.lock().unwrap().remove(&acked_no);
+            }
         }
     }
 }
@@ -278,6 +321,9 @@ pub struct IpmsgService {
     host: String,
     port: u16,
     self_token: Arc<String>,
+    /// 已发出、待对端 RECVMSG 回执确认的 packet_no → 发送时刻。
+    /// M5 不做重发/超时,Instant 目前只为将来扩展预留,收到 RECVMSG 即移除。
+    pending_acks: Arc<Mutex<HashMap<u32, Instant>>>,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -295,6 +341,7 @@ impl IpmsgService {
         let stop = Arc::new(AtomicBool::new(false));
         let packet_no = Arc::new(AtomicU32::new(1));
         let self_token = Arc::new(new_self_token());
+        let pending_acks: Arc<Mutex<HashMap<u32, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
         let send_handle = {
             let socket = Arc::clone(&socket);
@@ -315,8 +362,18 @@ impl IpmsgService {
             let nick = nick.to_string();
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
+            let pending_acks = Arc::clone(&pending_acks);
             std::thread::spawn(move || {
-                recv_loop(socket, stop, packet_no, nick, host, tx, self_token)
+                recv_loop(
+                    socket,
+                    stop,
+                    packet_no,
+                    nick,
+                    host,
+                    tx,
+                    self_token,
+                    pending_acks,
+                )
             })
         };
 
@@ -328,9 +385,32 @@ impl IpmsgService {
             host: host.to_string(),
             port,
             self_token,
+            pending_acks,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
         })
+    }
+
+    /// 单播发送一条 SENDMSG|SENDCHECKOPT 文本消息到 `addr`,body 走 GBK 编码。
+    /// packet_no 记入待回执表(收到对端 RECVMSG 后由 recv_loop 摘除);
+    /// M5 不做重发/超时,记录仅供将来扩展使用。
+    pub fn send_text(&self, addr: SocketAddr, body: &str) -> Result<(), IpmsgError> {
+        let packet_no = next_packet_no(&self.packet_no);
+        let packet = Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no,
+            sender: self.nick.clone(),
+            host: self.host.clone(),
+            command: command::build(command::SENDMSG, &[command::SENDCHECKOPT]),
+            extra: body.to_string(),
+        };
+        self.socket.send_to(&proto::encode(&packet), addr)?;
+        // 锁只覆盖这一次 insert,发送(阻塞 IO)已在上一行完成,不跨锁。
+        self.pending_acks
+            .lock()
+            .unwrap()
+            .insert(packet_no, Instant::now());
+        Ok(())
     }
 
     /// 广播 BR_EXIT,停线程,关闭 socket。
@@ -452,12 +532,109 @@ mod tests {
         }
     }
 
+    fn sendmsg_packet(sender: &str, host: &str, extra: &str, with_checkopt: bool) -> Packet {
+        let command = if with_checkopt {
+            command::build(command::SENDMSG, &[command::SENDCHECKOPT])
+        } else {
+            command::SENDMSG
+        };
+        Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no: 7,
+            sender: sender.to_string(),
+            host: host.to_string(),
+            command,
+            extra: extra.to_string(),
+        }
+    }
+
+    fn recvmsg_packet(sender: &str, host: &str, acked_no: &str) -> Packet {
+        Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no: 8,
+            sender: sender.to_string(),
+            host: host.to_string(),
+            command: command::RECVMSG,
+            extra: acked_no.to_string(),
+        }
+    }
+
+    #[test]
+    fn dispatch_sendmsg_with_checkopt_emits_text_and_replies_recvmsg() {
+        let counter = AtomicU32::new(1);
+        let packet = sendmsg_packet("alice", "HOST-A", "你好,BigPaw", true);
+        let original_no = packet.packet_no;
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::ReplyAndEmit(reply, IpmsgEvent::TextReceived { key, from, body }) => {
+                assert_eq!(Command(reply.command).num(), command::RECVMSG);
+                assert_eq!(reply.extra, original_no.to_string());
+                assert_eq!(reply.sender, "me");
+                assert_eq!(reply.host, "HOST-ME");
+                assert_eq!(key, "192.168.1.42:HOST-A");
+                assert_eq!(from, "alice");
+                assert_eq!(body, "你好,BigPaw");
+            }
+            _ => panic!("expected ReplyAndEmit(TextReceived)"),
+        }
+    }
+
+    #[test]
+    fn dispatch_sendmsg_without_checkopt_emits_text_without_reply() {
+        let counter = AtomicU32::new(1);
+        let packet = sendmsg_packet("bob", "HOST-B", "hello", false);
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::Emit(IpmsgEvent::TextReceived { key, from, body }) => {
+                assert_eq!(key, "192.168.1.42:HOST-B");
+                assert_eq!(from, "bob");
+                assert_eq!(body, "hello");
+            }
+            _ => panic!("expected Emit(TextReceived) without reply"),
+        }
+    }
+
+    #[test]
+    fn dispatch_recvmsg_acks_original_packet_no() {
+        let counter = AtomicU32::new(1);
+        let packet = recvmsg_packet("alice", "HOST-A", "42");
+        assert!(matches!(
+            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            Action::Ack(42)
+        ));
+    }
+
+    #[test]
+    fn dispatch_recvmsg_with_garbage_extra_is_ignored() {
+        let counter = AtomicU32::new(1);
+        let packet = recvmsg_packet("alice", "HOST-A", "not-a-number");
+        assert!(matches!(
+            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            Action::None
+        ));
+    }
+
+    /// 中文正文经 GBK 编解码往返后,dispatch 仍能还原出正确的 body
+    /// (emoji 无 GBK 映射 → '?',符合 proto 层既有约定)。
+    #[test]
+    fn dispatch_sendmsg_chinese_body_roundtrips_through_wire() {
+        let counter = AtomicU32::new(1);
+        let packet = sendmsg_packet("alice", "HOST-A", "你好,世界🐾", true);
+        let wire = proto::encode(&packet);
+        let decoded = proto::decode(&wire).unwrap();
+        match dispatch(decoded, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::ReplyAndEmit(_, IpmsgEvent::TextReceived { body, .. }) => {
+                assert!(body.starts_with("你好,世界"));
+                assert!(body.contains('?'));
+            }
+            _ => panic!("expected ReplyAndEmit(TextReceived)"),
+        }
+    }
+
     #[test]
     fn dispatch_unknown_command_is_ignored() {
         let counter = AtomicU32::new(1);
-        // SENDMSG 等留给后续任务,此阶段静默忽略。
+        // GETFILEDATA 等留给后续任务(文件传输),此阶段静默忽略。
         let mut packet = br_entry("bob", "HOST-B", "");
-        packet.command = command::SENDMSG;
+        packet.command = command::GETFILEDATA;
         assert!(matches!(
             dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
             Action::None
