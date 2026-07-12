@@ -2,6 +2,7 @@
 
 pub mod command;
 pub mod discovery;
+pub mod filexfer;
 pub mod proto;
 
 /// IPMsg 标准端口（UDP 与 TCP 同号）。

@@ -1,0 +1,759 @@
+//! IPMsg 文件传输(设计文档 §6):`SENDMSG|FILEATTACHOPT` 文件清单编解码 +
+//! TCP `GETFILEDATA` 请求/供给的字节级实现 + `GETDIRFILES` 目录流**仅接收**解析。
+//!
+//! 报文格式依据 IPMsg 协议 Draft-10(<https://github.com/shirouzu/ipmsg/blob/master/prot-eng.txt>):
+//! - 文件清单:`msgbody` + `\0` + `fileID:filename:size:mtime:fileattr[:extend-attr=...]:`,
+//!   多个文件条目以 `\a`(0x07,BEL)分隔;size/mtime/fileattr 为十六进制;
+//!   文件名中的 `:` 需转义为 `::`。
+//! - `GETFILEDATA` 请求 extra:`packetID:fileID:offset`,全部十六进制;响应为裸字节流,无信封。
+//! - `GETDIRFILES` 目录流:`header-size:filename:file-size:fileattr[...]:` + 紧跟的
+//!   `file-size` 字节内容,连续多条;`header-size` 是从本条目起始到"内容前最后一个冒号"
+//!   (含该冒号)的字节数,用于在文件名可能含转义冒号时仍能无歧义地找到头部终点。
+//!   `fileattr` 低 8 位为 `FILE_DIR`(进入子目录,无内容)或 `FILE_RETPARENT`(文件名固定为
+//!   `"."`,返回上级目录)。
+//!
+//! 本 crate 独立(不依赖 bigpaw-core),`safe_basename` 从 M3
+//! (`bigpaw-core/src/transport/filexfer.rs`)复制而来,保持同等的路径穿越/
+//! Windows 危险名防护。
+
+use crate::command::{self, Command};
+use crate::discovery::IpmsgError;
+use crate::proto::{self, Packet};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// fileattr 低 8 位取值(IPMsg 协议 Draft-10 §1.4,是一组互斥的类型枚举,不是位标志)。
+pub const FILE_REGULAR: u32 = 0x01;
+pub const FILE_DIR: u32 = 0x02;
+pub const FILE_RETPARENT: u32 = 0x03;
+
+/// 一次 `SENDMSG|FILEATTACHOPT` 清单里的单个文件/目录条目。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpmsgFileEntry {
+    pub file_id: u32,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+}
+
+/// `packet_no -> file_id -> 磁盘路径` 的已提供文件登记表:TCP 侧只应答已登记的
+/// (packet_no, file_id) 组合,防止 GETFILEDATA 被用来读任意路径。
+pub type OfferedFiles = Arc<Mutex<HashMap<u32, HashMap<u32, PathBuf>>>>;
+
+pub fn new_offered_files() -> OfferedFiles {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// 文件名里的 `:` 转义为 `::`(IPMsg 规范:冒号是清单/目录流的字段分隔符)。
+fn escape_colon(s: &str) -> String {
+    s.replace(':', "::")
+}
+
+/// 按 IPMsg 转义规则切分字段:单个 `:` 是分隔符,`::` 是字段内字面 `:`。
+fn split_escaped_fields(s: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' {
+            if chars.peek() == Some(&':') {
+                chars.next();
+                current.push(':');
+            } else {
+                fields.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+/// 构造单文件 offer 的 extra(M5 单文件发送:一次 SENDMSG 只带一个文件条目)。
+pub fn build_file_offer_extra(
+    msg_body: &str,
+    file_id: u32,
+    name: &str,
+    size: u64,
+    mtime: u64,
+    fileattr: u32,
+) -> String {
+    format!(
+        "{msg_body}\u{0}{file_id:x}:{}:{size:x}:{mtime:x}:{fileattr:x}:",
+        escape_colon(name)
+    )
+}
+
+/// 解析 `SENDMSG|FILEATTACHOPT` 的 extra → (消息正文, 文件清单)。
+/// 纯函数,不做 IO;畸形条目(hex 解析失败/字段不足)静默跳过,不 panic、不影响其余条目。
+pub fn parse_file_attach_extra(extra: &str) -> (String, Vec<IpmsgFileEntry>) {
+    let Some(nul_pos) = extra.find('\u{0}') else {
+        return (extra.to_string(), Vec::new());
+    };
+    let msg_body = extra[..nul_pos].to_string();
+    let rest = &extra[nul_pos + 1..];
+    let files = rest
+        .split('\u{7}')
+        .filter(|chunk| !chunk.is_empty())
+        .filter_map(parse_one_file_entry)
+        .collect();
+    (msg_body, files)
+}
+
+fn parse_one_file_entry(chunk: &str) -> Option<IpmsgFileEntry> {
+    let fields = split_escaped_fields(chunk);
+    if fields.len() < 5 {
+        return None;
+    }
+    let file_id = u32::from_str_radix(&fields[0], 16).ok()?;
+    let name = fields[1].clone();
+    if name.is_empty() {
+        return None;
+    }
+    let size = u64::from_str_radix(&fields[2], 16).ok()?;
+    let _mtime = u64::from_str_radix(&fields[3], 16).ok()?;
+    let fileattr = u32::from_str_radix(&fields[4], 16).ok()?;
+    let is_dir = (fileattr & 0xff) == FILE_DIR;
+    Some(IpmsgFileEntry {
+        file_id,
+        name,
+        size,
+        is_dir,
+    })
+}
+
+/// `GETFILEDATA` 请求 extra:`packetID:fileID:offset`,全部十六进制(规范原文
+/// "Use all hex format")。
+pub fn build_getfiledata_extra(target_packet_no: u32, file_id: u32, offset: u64) -> String {
+    format!("{target_packet_no:x}:{file_id:x}:{offset:x}")
+}
+
+/// 解析失败(字段不足/非十六进制)→ None,不 panic。
+pub fn parse_getfiledata_extra(extra: &str) -> Option<(u32, u32, u64)> {
+    let parts: Vec<&str> = extra.split(':').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let packet_no = u32::from_str_radix(parts[0], 16).ok()?;
+    let file_id = u32::from_str_radix(parts[1], 16).ok()?;
+    let offset = u64::from_str_radix(parts[2], 16).ok()?;
+    Some((packet_no, file_id, offset))
+}
+
+// ---- safe_basename:从 bigpaw-core M3 `transport/filexfer.rs` 复制,保持 crate 独立 ----
+
+/// Windows 保留设备名(不区分大小写,只匹配第一个 '.' 之前的 stem)。
+const WINDOWS_RESERVED_STEMS: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// 含 Unicode 双向/格式控制字符(RTLO 等仿冒手法)。
+fn contains_bidi_control(name: &str) -> bool {
+    name.chars()
+        .any(|c| matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'))
+}
+
+/// 只取文件名部分,拒绝任何含路径分隔符/父目录/绝对路径的名字,
+/// 以及会在 Windows 上引发问题的名字(保留设备名、尾部点/空格、NTFS ADS、双向控制字符仿冒)。
+pub fn safe_basename(name: &str) -> Option<String> {
+    if name.is_empty() || name == ".." || name == "." {
+        return None;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return None;
+    }
+    if name.contains(':') {
+        return None; // NTFS 备用数据流(ADS)
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return None; // Windows 会静默去除尾部点/空格,导致名字实际所指发生偏移
+    }
+    if contains_bidi_control(name) {
+        return None; // RTLO 等仿冒扩展名攻击
+    }
+    let stem = name.split('.').next().unwrap_or(name);
+    if WINDOWS_RESERVED_STEMS
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+// ---- TCP GETFILEDATA:服务端(供给) ----
+
+/// 处理一条入站 TCP 连接的单次 GETFILEDATA 请求:一次性读入请求报文(足够小,
+/// 单次 read 视为完整请求——与 UDP recv_from 同样的简化,亦是 IPMsg 原始实现的
+/// 行为,规范原文"send the specified data (no format)"意味着协议本身就没有为
+/// 请求/响应设计额外的长度前缀信封)。只应答 `offered` 表里登记过的
+/// (packet_no, file_id),未登记 → 静默关闭连接,不回一个字节(防任意路径读取)。
+pub fn serve_getfiledata_request(
+    stream: &mut (impl Read + Write),
+    offered: &OfferedFiles,
+) -> io::Result<()> {
+    let mut buf = [0u8; 2048];
+    let n = stream.read(&mut buf)?;
+    if n == 0 {
+        return Ok(());
+    }
+    let Some(packet) = proto::decode(&buf[..n]) else {
+        return Ok(());
+    };
+    if Command(packet.command).num() != command::GETFILEDATA {
+        return Ok(());
+    }
+    let Some((target_packet_no, file_id, offset)) = parse_getfiledata_extra(&packet.extra) else {
+        return Ok(());
+    };
+    let path = {
+        // 短临界区:只做一次查表,文件 IO(阻塞)在锁释放之后才发生。
+        let guard = offered.lock().unwrap();
+        guard
+            .get(&target_packet_no)
+            .and_then(|m| m.get(&file_id))
+            .cloned()
+    };
+    let Some(path) = path else {
+        return Ok(()); // 未登记 → 拒绝,静默关闭
+    };
+    let mut file = File::open(&path)?;
+    io::Seek::seek(&mut file, io::SeekFrom::Start(offset))?;
+    io::copy(&mut file, stream)?;
+    Ok(())
+}
+
+/// TCP 监听主循环:accept 一条连接就起一个短生命周期线程处理,非阻塞 accept +
+/// 轮询停止标志(与 discovery.rs 里 UDP recv_loop 的中断式设计一致)。
+pub fn tcp_serve_loop(listener: TcpListener, stop: Arc<AtomicBool>, offered: OfferedFiles) {
+    let _ = listener.set_nonblocking(true);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match listener.accept() {
+            Ok((mut stream, _peer)) => {
+                let offered = Arc::clone(&offered);
+                std::thread::spawn(move || {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                    let _ = serve_getfiledata_request(&mut stream, &offered);
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+// ---- TCP GETFILEDATA:客户端(拉取) ----
+
+/// 已连上对端 2425 的 TCP 流上:发送 GETFILEDATA 请求 + 读回 `size` 字节落盘。
+/// `save_path` 的文件名部分会被 basename 化(拒绝穿越/危险名),最终写入路径为
+/// `save_path 所在目录 / 净化后的文件名`。offset 固定为 0(M5 不做断点续传)。
+#[allow(clippy::too_many_arguments)]
+pub fn request_file_bytes(
+    stream: &mut (impl Read + Write),
+    version: &str,
+    my_packet_no: u32,
+    my_name: &str,
+    my_host: &str,
+    target_packet_no: u32,
+    file_id: u32,
+    size: u64,
+    save_path: &Path,
+) -> Result<PathBuf, IpmsgError> {
+    let final_path = sanitize_save_path(save_path)?;
+
+    let packet = Packet {
+        version: version.to_string(),
+        packet_no: my_packet_no,
+        sender: my_name.to_string(),
+        host: my_host.to_string(),
+        command: command::GETFILEDATA,
+        extra: build_getfiledata_extra(target_packet_no, file_id, 0),
+    };
+    stream.write_all(&proto::encode(&packet))?;
+    stream.flush()?;
+
+    let mut file = File::create(&final_path)?;
+    let mut remaining = size;
+    let mut buf = [0u8; 65536];
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        stream.read_exact(&mut buf[..want])?;
+        file.write_all(&buf[..want])?;
+        remaining -= want as u64;
+    }
+    file.flush()?;
+    Ok(final_path)
+}
+
+/// `save_path` 的文件名部分 basename 化;目录部分按需创建。落盘文件名安全性的
+/// 最后一道防线(不完全信任调用方已经净化过)。
+fn sanitize_save_path(save_path: &Path) -> Result<PathBuf, IpmsgError> {
+    let file_name = save_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(IpmsgError::BadName)?;
+    let safe_name = safe_basename(file_name).ok_or(IpmsgError::BadName)?;
+    let dir = match save_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join(safe_name))
+}
+
+// ---- GETDIRFILES:仅接收方向 ----
+
+/// 解析对端 GETDIRFILES 目录流并落盘,返回目标根目录(设计冻结 §6:文件夹**仅接收**,
+/// 不实现发送/服务端)。流位置必须严格按各条目声明的字节数消费,否则会与对端失步;
+/// 因此即使某个文件名不安全(basename 化失败),也要把它的内容字节读掉再继续下一条,
+/// 只是不写盘、不在磁盘上创建对应目录。
+pub fn receive_dir_stream(reader: &mut impl Read, dest_root: &Path) -> io::Result<PathBuf> {
+    fs::create_dir_all(dest_root)?;
+    let mut stack: Vec<PathBuf> = vec![dest_root.to_path_buf()];
+
+    loop {
+        let Some((header_size, consumed)) = read_header_size(reader)? else {
+            break; // 干净的流结束(下一条目起点恰好 EOF)
+        };
+        if header_size < consumed {
+            break; // 畸形 header-size,停止解析(不 panic)
+        }
+        let remaining = (header_size - consumed) as usize;
+        let mut header_buf = vec![0u8; remaining];
+        reader.read_exact(&mut header_buf)?;
+        // 目录流头部与其余 IPMsg 报文一样走 GBK,支持中文文件/目录名。
+        let header_str = proto::gbk_decode(&header_buf);
+        let fields = split_escaped_fields(&header_str);
+        if fields.len() < 3 {
+            break; // 畸形,停止(不 panic)
+        }
+        let name = fields[0].clone();
+        let Ok(file_size) = u64::from_str_radix(&fields[1], 16) else {
+            break;
+        };
+        let Ok(fileattr) = u32::from_str_radix(&fields[2], 16) else {
+            break;
+        };
+        let low = fileattr & 0xff;
+
+        if low == FILE_RETPARENT {
+            if stack.len() > 1 {
+                stack.pop();
+            }
+            continue;
+        }
+
+        if low == FILE_DIR {
+            let current = stack.last().unwrap().clone();
+            match safe_basename(&name) {
+                Some(safe_name) => {
+                    let sub = current.join(safe_name);
+                    fs::create_dir_all(&sub)?;
+                    stack.push(sub);
+                }
+                None => {
+                    // 非法目录名:仍压栈占位以维持 RETPARENT 出栈配平,但不在磁盘上创建。
+                    stack.push(current);
+                }
+            }
+            continue;
+        }
+
+        // 普通文件条目:必须精确消费 file_size 字节维持流同步,无论文件名是否安全。
+        let current = stack.last().unwrap().clone();
+        match safe_basename(&name) {
+            Some(safe_name) => {
+                let mut out = File::create(current.join(safe_name))?;
+                copy_exact(reader, &mut out, file_size)?;
+            }
+            None => {
+                copy_exact(reader, &mut io::sink(), file_size)?;
+            }
+        }
+    }
+    Ok(dest_root.to_path_buf())
+}
+
+fn copy_exact(reader: &mut impl Read, writer: &mut impl Write, size: u64) -> io::Result<()> {
+    let mut remaining = size;
+    let mut buf = [0u8; 65536];
+    while remaining > 0 {
+        let want = buf.len().min(remaining as usize);
+        reader.read_exact(&mut buf[..want])?;
+        writer.write_all(&buf[..want])?;
+        remaining -= want as u64;
+    }
+    Ok(())
+}
+
+/// 读取 `header-size`(十六进制,直到遇到 `:`)。返回 `(数值, 已消耗字节数含冒号)`;
+/// 流已在干净边界结束(未读到任何字节即 EOF)→ `Ok(None)`。
+fn read_header_size(reader: &mut impl Read) -> io::Result<Option<(u64, u64)>> {
+    let mut digits = String::new();
+    let mut one = [0u8; 1];
+    loop {
+        let n = reader.read(&mut one)?;
+        if n == 0 {
+            return if digits.is_empty() {
+                Ok(None)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "目录流在 header-size 中截断",
+                ))
+            };
+        }
+        let c = one[0] as char;
+        if c == ':' {
+            return match u64::from_str_radix(&digits, 16) {
+                Ok(v) => Ok(Some((v, digits.len() as u64 + 1))),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "header-size 非十六进制",
+                )),
+            };
+        }
+        digits.push(c);
+        if digits.len() > 16 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header-size 字段过长",
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::net::{TcpListener, TcpStream};
+
+    // ---- 文件清单编解码 ----
+
+    #[test]
+    fn parse_file_attach_extra_single_file_chinese_name() {
+        let extra = build_file_offer_extra("你好", 0, "图片.png", 1000, 0, FILE_REGULAR);
+        let (body, files) = parse_file_attach_extra(&extra);
+        assert_eq!(body, "你好");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_id, 0);
+        assert_eq!(files[0].name, "图片.png");
+        assert_eq!(files[0].size, 1000);
+        assert!(!files[0].is_dir);
+    }
+
+    #[test]
+    fn parse_file_attach_extra_multiple_files() {
+        let e1 = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            0u32, "a.txt", 10u64, 0u64, FILE_REGULAR
+        );
+        let e2 = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            1u32, "b.zip", 20u64, 0u64, FILE_REGULAR
+        );
+        let extra = format!("hi\u{0}{e1}\u{7}{e2}");
+        let (body, files) = parse_file_attach_extra(&extra);
+        assert_eq!(body, "hi");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "a.txt");
+        assert_eq!(files[0].size, 10); // 10u64 -> hex "a" -> 十六进制解析回 10
+        assert_eq!(files[1].name, "b.zip");
+        assert_eq!(files[1].size, 20); // 20u64 -> hex "14" -> 十六进制解析回 20
+    }
+
+    #[test]
+    fn parse_file_attach_extra_dir_entry_marks_is_dir() {
+        let extra = build_file_offer_extra("", 2, "照片文件夹", 0, 0, FILE_DIR);
+        let (_, files) = parse_file_attach_extra(&extra);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_dir);
+    }
+
+    #[test]
+    fn parse_file_attach_extra_malformed_hex_entry_is_skipped_not_panic() {
+        let extra = "msg\u{0}zzz:name.txt:notafhex:0:1:";
+        let (body, files) = parse_file_attach_extra(extra);
+        assert_eq!(body, "msg");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_file_attach_extra_no_nul_returns_body_only() {
+        let (body, files) = parse_file_attach_extra("just a normal text message");
+        assert_eq!(body, "just a normal text message");
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_file_attach_extra_second_bad_entry_does_not_drop_first_good_one() {
+        let good = format!(
+            "{:x}:{}:{:x}:{:x}:{:x}:",
+            0u32, "ok.txt", 5u64, 0u64, FILE_REGULAR
+        );
+        let extra = format!("m\u{0}{good}\u{7}bad:entry");
+        let (_, files) = parse_file_attach_extra(&extra);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "ok.txt");
+    }
+
+    #[test]
+    fn colon_in_filename_escapes_and_roundtrips() {
+        let extra = build_file_offer_extra("", 0, "10:30 会议记录.txt", 5, 0, FILE_REGULAR);
+        assert!(extra.contains("10::30")); // 转义成了 "::"
+        let (_, files) = parse_file_attach_extra(&extra);
+        assert_eq!(files[0].name, "10:30 会议记录.txt");
+    }
+
+    // ---- GETFILEDATA extra ----
+
+    #[test]
+    fn getfiledata_extra_roundtrips_hex() {
+        let extra = build_getfiledata_extra(0xABCD, 0x7, 0x1000);
+        assert_eq!(extra, "abcd:7:1000");
+        assert_eq!(parse_getfiledata_extra(&extra), Some((0xABCD, 0x7, 0x1000)));
+    }
+
+    #[test]
+    fn getfiledata_extra_malformed_is_none() {
+        assert_eq!(parse_getfiledata_extra("only:two"), None);
+        assert_eq!(parse_getfiledata_extra("zz:1:2"), None);
+    }
+
+    // ---- safe_basename(与 M3 同等防护,拷贝自 bigpaw-core) ----
+
+    #[test]
+    fn safe_basename_rejects_traversal_and_hazards() {
+        assert_eq!(safe_basename("report.pdf"), Some("report.pdf".to_string()));
+        assert_eq!(safe_basename("图片.png"), Some("图片.png".to_string()));
+        assert_eq!(safe_basename("../etc/passwd"), None);
+        assert_eq!(safe_basename("a/b.txt"), None);
+        assert_eq!(safe_basename("a\\b.txt"), None);
+        assert_eq!(safe_basename("/abs"), None);
+        assert_eq!(safe_basename(".."), None);
+        assert_eq!(safe_basename(""), None);
+        assert_eq!(safe_basename("CON"), None);
+        assert_eq!(safe_basename("con.txt"), None);
+        assert_eq!(safe_basename("a."), None);
+        assert_eq!(safe_basename("x:hidden"), None);
+        assert_eq!(safe_basename("a\u{202E}txt.exe"), None);
+    }
+
+    // ---- TCP GETFILEDATA 请求/响应字节级framing(EPHEMERAL 端口,不占 2425) ----
+
+    #[test]
+    fn getfiledata_request_response_roundtrips_over_ephemeral_tcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("source.bin");
+        let content = b"hello bigpaw ipmsg file transfer payload".to_vec();
+        fs::write(&src_path, &content).unwrap();
+
+        let offered = new_offered_files();
+        offered
+            .lock()
+            .unwrap()
+            .entry(42)
+            .or_default()
+            .insert(7, src_path.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let offered_srv = Arc::clone(&offered);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            serve_getfiledata_request(&mut stream, &offered_srv).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let save_path = dir.path().join("downloaded.bin");
+        let result = request_file_bytes(
+            &mut client,
+            "1",
+            1,
+            "bob",
+            "HOST-B",
+            42,
+            7,
+            content.len() as u64,
+            &save_path,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(result, save_path);
+        assert_eq!(fs::read(&result).unwrap(), content);
+    }
+
+    #[test]
+    fn getfiledata_request_for_unregistered_file_id_is_refused() {
+        let offered = new_offered_files(); // 空表:什么都没登记过
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let offered_srv = Arc::clone(&offered);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            serve_getfiledata_request(&mut stream, &offered_srv).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("should-not-exist.bin");
+        // 服务端会静默关闭连接、不回任何字节;客户端期望 size 字节会得到 UnexpectedEof。
+        let result = request_file_bytes(
+            &mut client,
+            "1",
+            1,
+            "bob",
+            "HOST-B",
+            999,
+            999,
+            10,
+            &save_path,
+        );
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "未登记的 packet_no/file_id 必须被拒绝,而不是读到任意文件"
+        );
+    }
+
+    #[test]
+    fn request_file_bytes_sanitizes_save_path_basename() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // 只需要一个不会被连接成功的地址来触发早期的净化失败路径
+        let dir = tempfile::tempdir().unwrap();
+        let bad_path = dir.path().join("..");
+        // file_name() 对 ".." 返回 None → sanitize 阶段就应该失败,不会真的去 connect。
+        let mut fake = Vec::<u8>::new(); // 不会被用到:sanitize 在网络 IO 之前发生
+        let result = request_file_bytes(
+            &mut Cursor::new(&mut fake),
+            "1",
+            1,
+            "bob",
+            "HOST-B",
+            1,
+            1,
+            0,
+            &bad_path,
+        );
+        assert!(matches!(result, Err(IpmsgError::BadName)));
+        let _ = addr;
+    }
+
+    // ---- GETDIRFILES 接收方向解析 ----
+
+    /// 构造一条目录流条目的字节:header-size 从本条目"数字起点"算起,含终止冒号。
+    fn dir_entry_bytes(name: &str, size_or_zero: u64, fileattr: u32, content: &[u8]) -> Vec<u8> {
+        let name_wire = proto::gbk_encode(&escape_colon(name));
+        // header = "<name>:<size(hex)>:<fileattr(hex)>:" (GBK 编码后的字节)
+        let mut header_tail = Vec::new();
+        header_tail.extend_from_slice(&name_wire);
+        header_tail.extend_from_slice(format!(":{size_or_zero:x}:{fileattr:x}:").as_bytes());
+
+        // header-size = header_tail 的字节数 + header-size 数字本身的字节数 + 1(冒号)。
+        // 需要迭代求解(数字位数会影响自身长度),位数很小几次就能收敛。
+        let mut hs_digits = 1usize;
+        loop {
+            let total = hs_digits + 1 + header_tail.len();
+            let hex_len = format!("{total:x}").len();
+            if hex_len == hs_digits {
+                let mut out = format!("{total:x}:").into_bytes();
+                out.extend_from_slice(&header_tail);
+                out.extend_from_slice(content);
+                return out;
+            }
+            hs_digits = hex_len;
+        }
+    }
+
+    #[test]
+    fn receive_dir_stream_flat_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wire = Vec::new();
+        wire.extend(dir_entry_bytes("a.txt", 5, FILE_REGULAR, b"hello"));
+        wire.extend(dir_entry_bytes(
+            "图片.png",
+            3,
+            FILE_REGULAR,
+            b"\x01\x02\x03",
+        ));
+
+        let mut cursor = Cursor::new(wire);
+        let root = receive_dir_stream(&mut cursor, dir.path()).unwrap();
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(fs::read(root.join("图片.png")).unwrap(), b"\x01\x02\x03");
+    }
+
+    #[test]
+    fn receive_dir_stream_nested_directory_with_retparent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wire = Vec::new();
+        wire.extend(dir_entry_bytes("sub", 0, FILE_DIR, b""));
+        wire.extend(dir_entry_bytes("inner.txt", 5, FILE_REGULAR, b"world"));
+        wire.extend(dir_entry_bytes(".", 0, FILE_RETPARENT, b""));
+        wire.extend(dir_entry_bytes("top.txt", 3, FILE_REGULAR, b"top"));
+
+        let mut cursor = Cursor::new(wire);
+        let root = receive_dir_stream(&mut cursor, dir.path()).unwrap();
+        assert_eq!(
+            fs::read(root.join("sub").join("inner.txt")).unwrap(),
+            b"world"
+        );
+        assert_eq!(fs::read(root.join("top.txt")).unwrap(), b"top");
+    }
+
+    #[test]
+    fn receive_dir_stream_rejects_traversal_but_stays_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wire = Vec::new();
+        wire.extend(dir_entry_bytes("../evil.txt", 4, FILE_REGULAR, b"evil"));
+        wire.extend(dir_entry_bytes("safe.txt", 4, FILE_REGULAR, b"safe"));
+
+        let mut cursor = Cursor::new(wire);
+        let root = receive_dir_stream(&mut cursor, dir.path()).unwrap();
+        assert!(!dir.path().join("../evil.txt").exists());
+        assert!(!root.join("evil.txt").exists());
+        // 第一条被拒但流没有失步:第二条仍正确落盘。
+        assert_eq!(fs::read(root.join("safe.txt")).unwrap(), b"safe");
+    }
+
+    #[test]
+    fn receive_dir_stream_over_tcp_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wire = Vec::new();
+        wire.extend(dir_entry_bytes("a.txt", 5, FILE_REGULAR, b"hello"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(&wire).unwrap();
+            // 主动关闭写方向,让客户端读到 EOF 从而结束目录流解析。
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let root = receive_dir_stream(&mut client, dir.path()).unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"hello");
+    }
+}

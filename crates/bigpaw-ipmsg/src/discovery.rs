@@ -1,19 +1,25 @@
-//! IPMsg 发现层:BR_ENTRY/ANSENTRY/BR_EXIT over UDP 2425(设计文档 §6)。
+//! IPMsg 发现/消息/文件传输服务:BR_ENTRY/ANSENTRY/BR_EXIT + SENDMSG/RECVMSG +
+//! SENDMSG|FILEATTACHOPT over UDP 2425(设计文档 §6),TCP 侧 GETFILEDATA 供给见
+//! `filexfer.rs`。
 //!
 //! 零 Tauri、零异步运行时,仅线程 + std::net + socket2,不依赖 bigpaw-core。
-//! 严格生成:仅发送标准的 BR_ENTRY/ANSENTRY/BR_EXIT 三种报文,其余命令号
-//! (SENDMSG/RECVMSG/GETFILEDATA 等)留给后续任务分派,此处静默忽略。
+//! 严格生成:UDP 只发送标准的 BR_ENTRY/ANSENTRY/BR_EXIT/SENDMSG/RECVMSG 报文,
+//! 其余命令号(如 GETFILEDATA/GETDIRFILES,均为 TCP-only)在 UDP dispatch 里静默忽略。
 
 use crate::command::{self, Command};
+use crate::filexfer::{self, IpmsgFileEntry, OfferedFiles};
 use crate::proto::{self, Packet, BIGPAW_TAG};
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::fs;
+use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use thiserror::Error;
 
 /// 报文里不透明的版本字段;真实飞秋会带更复杂的版本串,我方只需固定一个值。
@@ -47,6 +53,14 @@ pub enum IpmsgEvent {
         from: String,
         body: String,
     },
+    /// 收到一条 SENDMSG|FILEATTACHOPT 文件提供(`packet_no` = 这条 SENDMSG 自身的
+    /// packet_no,后续 request_file/request_dir 的 `packetID` 引用它)。
+    FileOffered {
+        key: String,
+        from: String,
+        packet_no: u32,
+        files: Vec<IpmsgFileEntry>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +70,12 @@ pub enum IpmsgError {
     /// 2425 已被占用(常见于飞秋已在运行);必须明确报错,不能静默失败。
     #[error("port already in use")]
     PortInUse,
+    /// 落盘文件名非法(可能路径穿越/Windows 危险名),或找不到有效文件名部分。
+    #[error("非法文件名(可能路径穿越)")]
+    BadName,
+    /// 文件夹发送未实现(设计文档 §6 冻结:文件夹仅接收)。
+    #[error("不支持发送文件夹(仅支持接收)")]
+    FolderSendUnsupported,
 }
 
 /// extra 尾部附带 BIGPAW_TAG + self_token,供对端识别我方为 BigPaw,
@@ -208,12 +228,23 @@ fn dispatch(
         }),
         command::BR_EXIT => Action::Emit(IpmsgEvent::Offline { key }),
         command::SENDMSG => {
-            let text = IpmsgEvent::TextReceived {
-                key,
-                from: packet.sender.clone(),
-                body: packet.extra.clone(),
+            let cmd = Command(packet.command);
+            let event = if cmd.has_opt(command::FILEATTACHOPT) {
+                let (_msg_body, files) = filexfer::parse_file_attach_extra(&packet.extra);
+                IpmsgEvent::FileOffered {
+                    key,
+                    from: packet.sender.clone(),
+                    packet_no: packet.packet_no,
+                    files,
+                }
+            } else {
+                IpmsgEvent::TextReceived {
+                    key,
+                    from: packet.sender.clone(),
+                    body: packet.extra.clone(),
+                }
             };
-            if Command(packet.command).has_opt(command::SENDCHECKOPT) {
+            if cmd.has_opt(command::SENDCHECKOPT) {
                 let reply = Packet {
                     version: IPMSG_VERSION.to_string(),
                     packet_no: next_packet_no(packet_no),
@@ -223,9 +254,9 @@ fn dispatch(
                     // 回执 extra = 原始消息的 packet_no(十进制串),让发送方知道哪条消息被确认。
                     extra: packet.packet_no.to_string(),
                 };
-                Action::ReplyAndEmit(reply, text)
+                Action::ReplyAndEmit(reply, event)
             } else {
-                Action::Emit(text)
+                Action::Emit(event)
             }
         }
         // RECVMSG 的 extra 就是被确认消息的原始 packet_no;解析失败(畸形报文)静默忽略。
@@ -311,6 +342,39 @@ fn new_self_token() -> String {
     )
 }
 
+/// 构造单文件 `SENDMSG|FILEATTACHOPT|SENDCHECKOPT` offer 报文;纯函数,`send_file`
+/// 用它生成实际发送的 Packet,同时也是单测直接验证"command 位含 FILEATTACHOPT"
+/// 的入口,不需要真的起网络服务。
+#[allow(clippy::too_many_arguments)]
+fn file_offer_packet(
+    nick: &str,
+    host: &str,
+    packet_no: u32,
+    file_id: u32,
+    name: &str,
+    size: u64,
+    mtime: u64,
+) -> Packet {
+    Packet {
+        version: IPMSG_VERSION.to_string(),
+        packet_no,
+        sender: nick.to_string(),
+        host: host.to_string(),
+        command: command::build(
+            command::SENDMSG,
+            &[command::FILEATTACHOPT, command::SENDCHECKOPT],
+        ),
+        extra: filexfer::build_file_offer_extra(
+            "",
+            file_id,
+            name,
+            size,
+            mtime,
+            filexfer::FILE_REGULAR,
+        ),
+    }
+}
+
 /// IPMsg 发现服务:UDP 2425 上的 BR_ENTRY/ANSENTRY/BR_EXIT 收发。
 /// 独立 crate:零 Tauri、零异步运行时,仅 std::net + socket2 线程模型。
 pub struct IpmsgService {
@@ -324,8 +388,14 @@ pub struct IpmsgService {
     /// 已发出、待对端 RECVMSG 回执确认的 packet_no → 发送时刻。
     /// M5 不做重发/超时,Instant 目前只为将来扩展预留,收到 RECVMSG 即移除。
     pending_acks: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// 已通过 send_file 提供、允许对端用 GETFILEDATA 拉取的文件登记表
+    /// (packet_no → file_id → 磁盘路径)。TCP 服务线程只应答这里登记过的文件。
+    offered_files: OfferedFiles,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
+    /// TCP GETFILEDATA 服务线程;若启动时 TCP `port` 绑定失败(None),则文件传输的
+    /// "被拉取"一侧不可用,但不影响 UDP 发现/文本(见 `start` 里的处理)。
+    tcp_handle: Option<JoinHandle<()>>,
 }
 
 impl IpmsgService {
@@ -342,6 +412,24 @@ impl IpmsgService {
         let packet_no = Arc::new(AtomicU32::new(1));
         let self_token = Arc::new(new_self_token());
         let pending_acks: Arc<Mutex<HashMap<u32, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let offered_files: OfferedFiles = filexfer::new_offered_files();
+
+        // TCP 侧 GETFILEDATA 供给:与 UDP 共用同一端口号,但这是完全独立的 TCP
+        // 监听。绑定失败(如已有其它进程占了 TCP `port`)不应让整个服务起不来——
+        // UDP 发现/文本仍应正常工作,只是"被拉取文件"这个方向暂不可用。
+        let tcp_handle = match TcpListener::bind(("0.0.0.0", port)) {
+            Ok(listener) => {
+                let stop = Arc::clone(&stop);
+                let offered = Arc::clone(&offered_files);
+                Some(std::thread::spawn(move || {
+                    filexfer::tcp_serve_loop(listener, stop, offered)
+                }))
+            }
+            Err(e) => {
+                eprintln!("ipmsg: TCP {port} 绑定失败,文件传输(GETFILEDATA 供给)暂不可用: {e}");
+                None
+            }
+        };
 
         let send_handle = {
             let socket = Arc::clone(&socket);
@@ -386,8 +474,10 @@ impl IpmsgService {
             port,
             self_token,
             pending_acks,
+            offered_files,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
+            tcp_handle,
         })
     }
 
@@ -413,6 +503,107 @@ impl IpmsgService {
         Ok(())
     }
 
+    /// 发送 `SENDMSG|FILEATTACHOPT|SENDCHECKOPT` 单文件 offer 到 `addr`,并把这个
+    /// 文件登记进 `offered_files`,供对端稍后用 GETFILEDATA 通过 TCP 拉取
+    /// (要求 TCP 监听已在 `start` 里成功绑定,否则对端连接会被拒绝——见 `start` 注释)。
+    /// 文件夹发送**不支持**(设计文档 §6 冻结:文件夹仅接收),`path` 若是目录会报错。
+    pub fn send_file(&self, addr: SocketAddr, path: &Path) -> Result<(), IpmsgError> {
+        let meta = fs::metadata(path)?;
+        if meta.is_dir() {
+            return Err(IpmsgError::FolderSendUnsupported);
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(IpmsgError::BadName)?;
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // 单文件发送:一次 SENDMSG 只带一个文件条目,固定 file_id=0 即可
+        // (唯一性只需要在这次 packet_no 的登记范围内成立)。
+        const SINGLE_FILE_ID: u32 = 0;
+
+        let packet_no = next_packet_no(&self.packet_no);
+        let packet = file_offer_packet(
+            &self.nick,
+            &self.host,
+            packet_no,
+            SINGLE_FILE_ID,
+            name,
+            size,
+            mtime,
+        );
+        self.socket.send_to(&proto::encode(&packet), addr)?;
+
+        // 登记 + 待回执表:发送(阻塞 IO)已在上一行完成,锁只覆盖两次轻量插入。
+        self.offered_files
+            .lock()
+            .unwrap()
+            .entry(packet_no)
+            .or_default()
+            .insert(SINGLE_FILE_ID, path.to_path_buf());
+        self.pending_acks
+            .lock()
+            .unwrap()
+            .insert(packet_no, Instant::now());
+        Ok(())
+    }
+
+    /// TCP 连 `sender_addr`(对端 IPMsg 端口,通常与 `packet.src` 相同),按
+    /// `packetID:fileID:offset`(全十六进制)请求单个文件,读回 `size` 字节写入
+    /// `save_path`(文件名会被 basename 化)。M5 不做断点续传,offset 固定 0。
+    pub fn request_file(
+        &self,
+        sender_addr: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        size: u64,
+        save_path: &Path,
+    ) -> Result<PathBuf, IpmsgError> {
+        let mut stream = TcpStream::connect(sender_addr)?;
+        let my_packet_no = next_packet_no(&self.packet_no);
+        filexfer::request_file_bytes(
+            &mut stream,
+            IPMSG_VERSION,
+            my_packet_no,
+            &self.nick,
+            &self.host,
+            packet_no,
+            file_id,
+            size,
+            save_path,
+        )
+    }
+
+    /// TCP 连 `sender_addr`,发 `GETDIRFILES`(extra=`packetID:fileID` 全十六进制)
+    /// 请求一个文件夹,解析对端的目录流并落盘到 `save_dir`。仅接收方向
+    /// (设计文档 §6 冻结:文件夹仅接收,本服务不响应对端的 GETDIRFILES 请求)。
+    pub fn request_dir(
+        &self,
+        sender_addr: SocketAddr,
+        packet_no: u32,
+        file_id: u32,
+        save_dir: &Path,
+    ) -> Result<PathBuf, IpmsgError> {
+        let mut stream = TcpStream::connect(sender_addr)?;
+        let packet = Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no: next_packet_no(&self.packet_no),
+            sender: self.nick.clone(),
+            host: self.host.clone(),
+            command: command::GETDIRFILES,
+            extra: format!("{packet_no:x}:{file_id:x}"),
+        };
+        stream.write_all(&proto::encode(&packet))?;
+        stream.flush()?;
+        let path = filexfer::receive_dir_stream(&mut stream, save_dir)?;
+        Ok(path)
+    }
+
     /// 广播 BR_EXIT,停线程,关闭 socket。
     pub fn shutdown(mut self) {
         let packet = Packet {
@@ -432,7 +623,10 @@ impl IpmsgService {
         if let Some(h) = self.recv_handle.take() {
             let _ = h.join();
         }
-        // 两条线程已退出,socket 随 self 一起 drop。
+        if let Some(h) = self.tcp_handle.take() {
+            let _ = h.join();
+        }
+        // 所有线程已退出,socket/listener 随 self 一起 drop。
     }
 }
 
@@ -629,10 +823,102 @@ mod tests {
         }
     }
 
+    /// SENDMSG|FILEATTACHOPT → FileOffered,文件清单解析正确
+    /// (packet_no 就是这条 SENDMSG 自身的 packet_no,供后续 GETFILEDATA 引用)。
+    #[test]
+    fn dispatch_sendmsg_with_fileattachopt_emits_file_offered() {
+        let counter = AtomicU32::new(1);
+        let extra =
+            filexfer::build_file_offer_extra("", 0, "图片.png", 1000, 0, filexfer::FILE_REGULAR);
+        let command = command::build(command::SENDMSG, &[command::FILEATTACHOPT]);
+        let packet = Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no: 99,
+            sender: "alice".to_string(),
+            host: "HOST-A".to_string(),
+            command,
+            extra,
+        };
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::Emit(IpmsgEvent::FileOffered {
+                key,
+                from,
+                packet_no,
+                files,
+            }) => {
+                assert_eq!(key, "192.168.1.42:HOST-A");
+                assert_eq!(from, "alice");
+                assert_eq!(packet_no, 99);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].name, "图片.png");
+                assert_eq!(files[0].size, 1000);
+                assert!(!files[0].is_dir);
+            }
+            _ => panic!("expected Emit(FileOffered)"),
+        }
+    }
+
+    /// FILEATTACHOPT + SENDCHECKOPT 组合:仍然要回 RECVMSG 回执,同时上报 FileOffered
+    /// (文件 offer 本质上还是一条 SENDMSG,回执行为不因为带了文件而改变)。
+    #[test]
+    fn dispatch_sendmsg_fileattachopt_with_checkopt_still_replies_recvmsg() {
+        let counter = AtomicU32::new(1);
+        let extra = filexfer::build_file_offer_extra(
+            "看这个",
+            3,
+            "report.pdf",
+            2048,
+            0,
+            filexfer::FILE_REGULAR,
+        );
+        let command = command::build(
+            command::SENDMSG,
+            &[command::FILEATTACHOPT, command::SENDCHECKOPT],
+        );
+        let packet = Packet {
+            version: IPMSG_VERSION.to_string(),
+            packet_no: 55,
+            sender: "bob".to_string(),
+            host: "HOST-B".to_string(),
+            command,
+            extra,
+        };
+        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+            Action::ReplyAndEmit(
+                reply,
+                IpmsgEvent::FileOffered {
+                    packet_no, files, ..
+                },
+            ) => {
+                assert_eq!(Command(reply.command).num(), command::RECVMSG);
+                assert_eq!(reply.extra, "55");
+                assert_eq!(packet_no, 55);
+                assert_eq!(files[0].name, "report.pdf");
+            }
+            _ => panic!("expected ReplyAndEmit(FileOffered)"),
+        }
+    }
+
+    /// `send_file` 内部构造的 offer 报文:command 位必须含 FILEATTACHOPT,
+    /// 且 extra 能被 parse_file_attach_extra 正确还原(纯函数级验证,不需要起网络服务)。
+    #[test]
+    fn file_offer_packet_has_fileattachopt_and_parses_back() {
+        let p = file_offer_packet("me", "HOST-ME", 9, 0, "图片.png", 1000, 0);
+        assert_eq!(Command(p.command).num(), command::SENDMSG);
+        assert!(Command(p.command).has_opt(command::FILEATTACHOPT));
+        assert!(Command(p.command).has_opt(command::SENDCHECKOPT));
+        let (_body, files) = filexfer::parse_file_attach_extra(&p.extra);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "图片.png");
+        assert_eq!(files[0].size, 1000);
+        assert!(!files[0].is_dir);
+    }
+
     #[test]
     fn dispatch_unknown_command_is_ignored() {
         let counter = AtomicU32::new(1);
-        // GETFILEDATA 等留给后续任务(文件传输),此阶段静默忽略。
+        // GETFILEDATA/GETDIRFILES 是 TCP-only 命令(见 filexfer.rs),不会出现在
+        // UDP dispatch 里;这里仍用它验证"未知于 UDP 分派的命令号"静默忽略的兜底分支。
         let mut packet = br_entry("bob", "HOST-B", "");
         packet.command = command::GETFILEDATA;
         assert!(matches!(
