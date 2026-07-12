@@ -161,6 +161,10 @@ impl TransportManager {
                     }
                 }
                 Ok(Msg::Hello { .. }) => continue,
+                Ok(Msg::FileOffer { .. }) => continue,
+                Ok(Msg::FileAccept { .. }) => continue,
+                Ok(Msg::FileReject { .. }) => continue,
+                Ok(Msg::FileStart { .. }) => continue,
                 Err(_) => return, // 断连/坏帧:退出读循环
             }
         }
