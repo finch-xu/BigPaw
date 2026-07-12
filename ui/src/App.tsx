@@ -93,6 +93,18 @@ export default function App() {
 
   const online = peers.filter((p) => p.state !== "offline");
 
+  const statusDotClass = (state: Peer["state"]) => {
+    switch (state) {
+      case "reachable":
+        return "bg-green-500";
+      case "unreachable":
+        return "bg-red-500";
+      case "discovered":
+      default:
+        return "bg-amber-400";
+    }
+  };
+
   return (
     <main className="flex h-screen bg-[#fefbf5] text-amber-950">
       <aside className="flex w-64 shrink-0 flex-col border-r border-amber-200">
@@ -112,7 +124,14 @@ export default function App() {
                 (selectedFp === p.fingerprint ? "bg-amber-100" : "")
               }
             >
-              <span className="h-2 w-2 shrink-0 rounded-full bg-green-500" />
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${statusDotClass(p.state)}`}
+                title={
+                  p.state === "unreachable"
+                    ? "可见但无法连接,可能是防火墙拦截"
+                    : undefined
+                }
+              />
               <div className="min-w-0">
                 <div className="truncate font-medium">{p.nickname}</div>
                 <div className="truncate text-xs text-amber-700">{p.addrs[0] ?? ""}</div>

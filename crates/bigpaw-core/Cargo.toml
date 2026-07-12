@@ -18,6 +18,8 @@ gethostname = "1"
 zeroize = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 blake3 = "1"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

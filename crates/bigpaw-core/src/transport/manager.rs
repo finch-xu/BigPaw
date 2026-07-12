@@ -480,6 +480,26 @@ impl TransportManager {
         )
     }
 
+    /// 双向注册的回连探测(M4):对一个刚被 `Seen` 的新对端主动拨号,做 TLS
+    /// 握手并写 `Hello`,验证"我方也能连到它"(而不仅仅是收到了它的单向宣告)。
+    /// 复用 `dial` 的建连/重试逻辑;成功即代表握手完成且首帧写入成功。
+    ///
+    /// 这是一条**用完即弃**的探测连接:不写任何消息、不读应答、也**不**塞进
+    /// `outbound` 缓存——否则后续 `send_text` 可能复用一条只做过探测握手、
+    /// 从未被对端当作"消息连接"对待的连接,污染消息/文件传输路径的假设。
+    /// 探测完成后排空对端可能已发来的字节再讲连接丢弃关闭(见
+    /// `drain_before_close` 注释,同样的"避免 RST 丢包"考虑其实对探测连接
+    /// 影响不大,但保持和其他一次性连接一致的收尾方式)。
+    pub fn probe_reachable(&self, peer_fp: &str, addrs: &[IpAddr], port: u16) -> bool {
+        match self.dial(peer_fp, addrs, port) {
+            Ok(mut conn) => {
+                Self::drain_before_close(&mut conn);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// 探测缓存连接是否已死。
     ///
     /// 单次 `write()` 不足以可靠探测"对端已完全关闭"的连接:经验证(见断线
