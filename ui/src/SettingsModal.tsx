@@ -17,20 +17,27 @@ export default function SettingsModal() {
   }, []);
 
   async function save(next: Settings, restartHint: boolean) {
+    const prev = settings;
     setSettings(next);
     try {
       await invoke("set_settings", { value: next });
       if (restartHint) setNeedRestart(true);
       setError("");
     } catch (e) {
+      // 回滚:失败的改动不得被后续保存夹带落盘(set_settings 是整对象覆盖)
+      setSettings(prev);
       setError(String(e));
     }
   }
 
   async function pickDownloadDir() {
     if (!settings) return;
-    const dir = await open({ directory: true, multiple: false });
-    if (typeof dir === "string") void save({ ...settings, downloadDir: dir }, false);
+    try {
+      const dir = await open({ directory: true, multiple: false });
+      if (typeof dir === "string") void save({ ...settings, downloadDir: dir }, false);
+    } catch (e) {
+      setError(String(e));
+    }
   }
 
   async function handleClearAll() {
@@ -46,7 +53,25 @@ export default function SettingsModal() {
     }
   }
 
-  if (!settings) return null;
+  if (!settings) {
+    if (!error) return null;
+    return (
+      <div
+        className="fixed inset-0 z-10 flex items-center justify-center bg-black/30"
+        onClick={() => setShowSettings(false)}
+      >
+        <div className="w-96 rounded-xl bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+          <p className="text-sm text-red-600">读取设置失败: {error}</p>
+          <button
+            onClick={() => setShowSettings(false)}
+            className="mt-4 w-full rounded-lg bg-amber-800 py-2 text-sm text-white hover:bg-amber-700"
+          >
+            关闭
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
