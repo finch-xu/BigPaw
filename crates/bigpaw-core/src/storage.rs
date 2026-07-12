@@ -513,12 +513,14 @@ mod tests {
         s.upsert_peer("fpA", "alice", "native", Some("192.168.1.5"), 1000).unwrap();
         s.upsert_peer("fpA", "alice-renamed", "native", Some("192.168.1.6"), 2000)
             .unwrap();
+        // COALESCE 回归:last_addr 传 None 不得抹掉旧地址,其余字段照常更新
+        s.upsert_peer("fpA", "alice-renamed", "native", None, 3000).unwrap();
         s.upsert_peer("ipmsg:k", "bob-feiq", "ipmsg", None, 1500).unwrap();
         let peers = s.known_peers().unwrap();
         assert_eq!(peers.len(), 2, "同 fingerprint 覆盖不重复");
         let a = peers.iter().find(|p| p.fingerprint == "fpA").unwrap();
         assert_eq!(a.nickname, "alice-renamed");
         assert_eq!(a.last_addr.as_deref(), Some("192.168.1.6"));
-        assert_eq!(a.last_seen_ms, 2000);
+        assert_eq!(a.last_seen_ms, 3000);
     }
 }
