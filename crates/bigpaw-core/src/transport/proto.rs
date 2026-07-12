@@ -10,6 +10,10 @@ pub const PROTO_V: u16 = 1;
 
 const T_HELLO: u8 = 1;
 const T_TEXT: u8 = 2;
+const T_FILE_OFFER: u8 = 3;
+const T_FILE_ACCEPT: u8 = 4;
+const T_FILE_REJECT: u8 = 5;
+const T_FILE_START: u8 = 6;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
@@ -21,6 +25,23 @@ pub enum Msg {
         body: String,
         ts_ms: u64,
     },
+    FileOffer {
+        xfer_id: String,
+        name: String,
+        size: u64,
+        blake3: String,
+    },
+    FileAccept {
+        xfer_id: String,
+        offset: u64,
+    },
+    FileReject {
+        xfer_id: String,
+    },
+    FileStart {
+        xfer_id: String,
+        offset: u64,
+    },
 }
 
 impl Msg {
@@ -28,6 +49,10 @@ impl Msg {
         match self {
             Msg::Hello { .. } => T_HELLO,
             Msg::Text { .. } => T_TEXT,
+            Msg::FileOffer { .. } => T_FILE_OFFER,
+            Msg::FileAccept { .. } => T_FILE_ACCEPT,
+            Msg::FileReject { .. } => T_FILE_REJECT,
+            Msg::FileStart { .. } => T_FILE_START,
         }
     }
 }
@@ -49,6 +74,24 @@ pub fn write_msg(w: &mut impl Write, msg: &Msg) -> io::Result<()> {
         Msg::Hello { v } => serde_json::json!({ "v": v }),
         Msg::Text { id, body, ts_ms } => {
             serde_json::json!({ "id": id, "body": body, "ts_ms": ts_ms })
+        }
+        Msg::FileOffer {
+            xfer_id,
+            name,
+            size,
+            blake3,
+        } => serde_json::json!({
+            "xfer_id": xfer_id,
+            "name": name,
+            "size": size,
+            "blake3": blake3
+        }),
+        Msg::FileAccept { xfer_id, offset } => {
+            serde_json::json!({ "xfer_id": xfer_id, "offset": offset })
+        }
+        Msg::FileReject { xfer_id } => serde_json::json!({ "xfer_id": xfer_id }),
+        Msg::FileStart { xfer_id, offset } => {
+            serde_json::json!({ "xfer_id": xfer_id, "offset": offset })
         }
     };
     let bytes = serde_json::to_vec(&payload)?;
@@ -97,6 +140,47 @@ pub fn read_msg(r: &mut impl Read) -> io::Result<Msg> {
                 .unwrap_or_default()
                 .to_string(),
             ts_ms: val.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        }),
+        T_FILE_OFFER => Ok(Msg::FileOffer {
+            xfer_id: val
+                .get("xfer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            name: val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            size: val.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            blake3: val
+                .get("blake3")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        T_FILE_ACCEPT => Ok(Msg::FileAccept {
+            xfer_id: val
+                .get("xfer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            offset: val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0),
+        }),
+        T_FILE_REJECT => Ok(Msg::FileReject {
+            xfer_id: val
+                .get("xfer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        T_FILE_START => Ok(Msg::FileStart {
+            xfer_id: val
+                .get("xfer_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            offset: val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0),
         }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -148,5 +232,34 @@ mod tests {
         buf.extend_from_slice(b"{}");
         let err = read_msg(&mut Cursor::new(buf)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn file_control_frames_roundtrip() {
+        let msgs = vec![
+            Msg::FileOffer {
+                xfer_id: new_id(),
+                name: "报告.pdf".to_string(),
+                size: 10_485_760,
+                blake3: "a".repeat(64),
+            },
+            Msg::FileAccept {
+                xfer_id: new_id(),
+                offset: 1_048_576,
+            },
+            Msg::FileReject { xfer_id: new_id() },
+            Msg::FileStart {
+                xfer_id: new_id(),
+                offset: 0,
+            },
+        ];
+        let mut buf = Vec::new();
+        for m in &msgs {
+            write_msg(&mut buf, m).unwrap();
+        }
+        let mut r = Cursor::new(buf);
+        for m in &msgs {
+            assert_eq!(&read_msg(&mut r).unwrap(), m);
+        }
     }
 }

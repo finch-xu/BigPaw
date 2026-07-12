@@ -1,11 +1,14 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useAppStore } from "./store";
+import TransferPanel from "./TransferPanel";
 
 export default function ChatPane({ fp }: { fp: string }) {
   const peer = useAppStore((s) => s.peers.find((p) => p.fingerprint === fp));
   const messages = useAppStore((s) => s.messages[fp] ?? []);
   const appendMessage = useAppStore((s) => s.appendMessage);
+  const upsertTransfer = useAppStore((s) => s.upsertTransfer);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
 
@@ -19,6 +22,27 @@ export default function ChatPane({ fp }: { fp: string }) {
       });
       appendMessage({ id: sent.id, peerFp: fp, body, tsMs: sent.tsMs, direction: "out" });
       setDraft("");
+      setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleSendFile() {
+    try {
+      const path = await open({ multiple: false, directory: false });
+      if (!path || Array.isArray(path)) return;
+      const xferId = await invoke<string>("offer_file", { fingerprint: fp, path });
+      const name = path.split(/[\\/]/).pop() ?? path;
+      upsertTransfer({
+        xferId,
+        peerFp: fp,
+        name,
+        size: 0,
+        done: 0,
+        direction: "out",
+        status: "active",
+      });
       setError("");
     } catch (e) {
       setError(String(e));
@@ -45,6 +69,7 @@ export default function ChatPane({ fp }: { fp: string }) {
         ))}
       </ul>
       {error && <p className="px-4 py-1 text-xs text-red-600">发送失败: {error}</p>}
+      <TransferPanel fp={fp} />
       <footer className="flex gap-2 border-t border-amber-200 p-3">
         <input
           value={draft}
@@ -60,6 +85,12 @@ export default function ChatPane({ fp }: { fp: string }) {
           className="rounded-lg bg-amber-800 px-4 py-2 text-sm text-white hover:bg-amber-700"
         >
           发送
+        </button>
+        <button
+          onClick={handleSendFile}
+          className="rounded-lg border border-amber-300 px-4 py-2 text-sm text-amber-800 hover:bg-amber-100"
+        >
+          发送文件
         </button>
       </footer>
     </section>

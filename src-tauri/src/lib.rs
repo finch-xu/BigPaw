@@ -1,7 +1,9 @@
 use bigpaw_core::core::{Core, CoreConfig};
 use bigpaw_core::roster::Peer;
+use bigpaw_core::transport::manager::TransportEvent;
 use serde::Serialize;
-use tauri::{Emitter, Manager, State};
+use std::path::Path;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 struct AppCore(Core);
 
@@ -61,8 +63,73 @@ fn send_text(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn offer_file(
+    core: State<'_, AppCore>,
+    fingerprint: String,
+    path: String,
+) -> Result<String, String> {
+    core.0
+        .offer_file(&fingerprint, Path::new(&path))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn respond_file(
+    core: State<'_, AppCore>,
+    xfer_id: String,
+    accept: bool,
+    download_dir: String,
+) -> Result<(), String> {
+    core.0
+        .respond_file(&xfer_id, accept, Path::new(&download_dir))
+        .map_err(|e| e.to_string())
+}
+
+/// 默认下载目录:优先用系统下载目录,取不到时退回用户主目录。
+#[tauri::command]
+fn default_download_dir(app: AppHandle) -> String {
+    app.path()
+        .download_dir()
+        .or_else(|_| app.path().home_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FileOfferedDto {
+    xfer_id: String,
+    peer_fp: String,
+    name: String,
+    size: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FileProgressDto {
+    xfer_id: String,
+    done: u64,
+    total: u64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FileDoneDto {
+    xfer_id: String,
+    path: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FileFailedDto {
+    xfer_id: String,
+    reason: String,
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let core = Core::start(CoreConfig {
@@ -81,19 +148,68 @@ pub fn run() {
                 }
             });
 
-            if let Some(msg_rx) = core.take_messages() {
+            if let Some(events_rx) = core.take_events() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
-                    while let Ok(ev) = msg_rx.recv() {
-                        let _ = handle.emit(
-                            "message://received",
-                            MessageDto {
-                                peer_fp: ev.peer_fp,
-                                id: ev.id,
-                                body: ev.body,
-                                ts_ms: ev.ts_ms,
-                            },
-                        );
+                    while let Ok(ev) = events_rx.recv() {
+                        match ev {
+                            TransportEvent::Message(ev) => {
+                                let _ = handle.emit(
+                                    "message://received",
+                                    MessageDto {
+                                        peer_fp: ev.peer_fp,
+                                        id: ev.id,
+                                        body: ev.body,
+                                        ts_ms: ev.ts_ms,
+                                    },
+                                );
+                            }
+                            TransportEvent::FileOffered {
+                                xfer_id,
+                                peer_fp,
+                                name,
+                                size,
+                            } => {
+                                let _ = handle.emit(
+                                    "file://offered",
+                                    FileOfferedDto {
+                                        xfer_id,
+                                        peer_fp,
+                                        name,
+                                        size,
+                                    },
+                                );
+                            }
+                            TransportEvent::FileProgress {
+                                xfer_id,
+                                done,
+                                total,
+                            } => {
+                                // 不在壳层节流:bigpaw-core 已按 150ms 做过节流(见
+                                // manager.rs PROGRESS_THROTTLE),这里必须立即转发。
+                                let _ = handle.emit(
+                                    "file://progress",
+                                    FileProgressDto {
+                                        xfer_id,
+                                        done,
+                                        total,
+                                    },
+                                );
+                            }
+                            TransportEvent::FileDone { xfer_id, path } => {
+                                let _ = handle.emit(
+                                    "file://done",
+                                    FileDoneDto {
+                                        xfer_id,
+                                        path: path.to_string_lossy().into_owned(),
+                                    },
+                                );
+                            }
+                            TransportEvent::FileFailed { xfer_id, reason } => {
+                                let _ =
+                                    handle.emit("file://failed", FileFailedDto { xfer_id, reason });
+                            }
+                        }
                     }
                 });
             }
@@ -105,7 +221,10 @@ pub fn run() {
             ping,
             get_self_info,
             get_roster,
-            send_text
+            send_text,
+            offer_file,
+            respond_file,
+            default_download_dir
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

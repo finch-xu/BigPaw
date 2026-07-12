@@ -1,7 +1,7 @@
 //! 双 manager 环回:双向文本 + 断线重连。纯 localhost,无 mDNS,默认运行。
 
 use bigpaw_core::identity::Identity;
-use bigpaw_core::transport::manager::{MessageEvent, TransportManager};
+use bigpaw_core::transport::manager::{MessageEvent, TransportEvent, TransportManager};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -9,9 +9,16 @@ use std::time::Duration;
 
 const LOCAL: [IpAddr; 1] = [IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
-fn recv_text(rx: &Receiver<MessageEvent>, secs: u64) -> MessageEvent {
-    rx.recv_timeout(Duration::from_secs(secs))
+// M3:events channel 从只发 MessageEvent 改为发 TransportEvent(见 manager.rs)。
+// 这两个既有测试只关心文本消息,所以只需在这里解一层 TransportEvent::Message。
+fn recv_text(rx: &Receiver<TransportEvent>, secs: u64) -> MessageEvent {
+    match rx
+        .recv_timeout(Duration::from_secs(secs))
         .expect("应收到消息")
+    {
+        TransportEvent::Message(m) => m,
+        other => panic!("期望 Message 事件,却收到 {other:?}"),
+    }
 }
 
 #[test]

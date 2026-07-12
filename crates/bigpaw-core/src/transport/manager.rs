@@ -1,21 +1,42 @@
 //! 连接管理:监听 accept + 出站连接缓存(每对端一条,失败重拨一次)。
 //! 同步 IO,每连接一个读线程;写路径由调用方线程直接写(Mutex 串行)。
+//!
+//! **文件传输设计注记**(M3):数据连接由**发送方主动拨号**——和消息连接
+//! 同一个方向。控制帧(FileOffer/FileAccept/FileReject)走一条专用的
+//! "offer 控制连接"(发送方 `dial()`,接收方走已有 accept-loop);数据字节
+//! 走另一条**全新**的连接,首帧直接是 `FileStart{xfer_id, offset}`(没有
+//! `Hello`)。接收方的 accept-loop 因此要对每条新连接的**第一帧**做分流:
+//! `Hello` → 走原有的消息 read_loop;`FileStart` → 转入文件接收分支。
+//!
+//! 控制连接的回复(FileAccept/FileReject)必须从接收方"写回"到发送方,但
+//! `respond_file` 是在任意调用方线程上被调用的,而真正持有该连接
+//! `&mut ServerTls` 的是 accept-loop 为它开的读线程。为避免"跨阻塞 IO 持锁"
+//! (见下面 `conn_is_dead` 的教训),两者之间**不共享一把锁**,而是用一条
+//! `mpsc::channel`:`respond_file` 把决定塞进去,读线程原本阻塞在
+//! `read_msg` 上处理完 FileOffer 后,转为阻塞在 `reply_rx.recv()` 上,
+//! 唤醒后由**自己**(唯一持有该连接的线程)执行写回。manager 整体被 drop
+//! 时,`pending_offers` 连带其中的 `reply_tx` 一起被丢弃,`recv()` 会立刻
+//! 收到 `Err` 从而让该线程正常退出,不会永久悬挂。
 
 use crate::identity::Identity;
+use crate::transport::filexfer;
 use crate::transport::proto::{self, Msg};
 use crate::transport::tls;
 use rustls::pki_types::ServerName;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const DEFAULT_PORT: u16 = 24917;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 进度事件节流间隔:两次 FileProgress 之间至少间隔这么久,末尾 done==total 除外。
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -43,6 +64,63 @@ pub struct SentText {
     pub ts_ms: u64,
 }
 
+/// `TransportManager` 对外上报的所有事件:既有的文本消息,也有 M3 新增的
+/// 文件传输生命周期事件。
+#[derive(Debug, Clone)]
+pub enum TransportEvent {
+    Message(MessageEvent),
+    FileOffered {
+        xfer_id: String,
+        peer_fp: String,
+        name: String,
+        size: u64,
+    },
+    FileProgress {
+        xfer_id: String,
+        done: u64,
+        total: u64,
+    },
+    FileDone {
+        xfer_id: String,
+        path: PathBuf,
+    },
+    FileFailed {
+        xfer_id: String,
+        reason: String,
+    },
+}
+
+/// `offer_file` 的返回句柄。目前只携带 xfer_id,单独成类型是为了未来扩展
+/// (比如取消传输)时不必再改调用方签名。
+#[derive(Debug, Clone)]
+pub struct FileHandle {
+    pub xfer_id: String,
+}
+
+/// 接收方收到 `FileOffer` 之后、`respond_file` 决定之前的待决状态。
+struct PendingOffer {
+    peer_fp: String,
+    name: String,
+    size: u64,
+    blake3: String,
+    /// 决定(Accept/Reject)投递给读线程的通道——见模块顶部设计注记。
+    reply_tx: mpsc::Sender<Msg>,
+}
+
+/// `respond_file(accept=true)` 登记的接收状态,供随后到达的 `FileStart`
+/// 数据连接查询(这些字段要喂给 `filexfer::receive_into`)。
+struct IncomingState {
+    peer_fp: String,
+    download_dir: PathBuf,
+    name: String,
+    size: u64,
+    blake3: String,
+    /// respond_file 为断点续传计算并写进 FileAccept 回复的 offset——唯一
+    /// 权威值。随后到达的 FileStart 数据连接自带的 offset 必须与此一致
+    /// (见 `handle_file_receive`),否则说明发送方状态过期/被篡改,不能信。
+    offset: u64,
+}
+
 type ClientTls = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
 type ServerTls = rustls::StreamOwned<rustls::ServerConnection, TcpStream>;
 
@@ -52,18 +130,27 @@ pub struct TransportManager {
     /// 出站连接缓存:peer_fp -> 已握手连接(写侧)。M2 简化:出站连接只写不读,
     /// 对端的回话走它自己的出站连接(见下方 `dial` 注释)。
     outbound: Mutex<HashMap<String, ClientTls>>,
-    events: Sender<MessageEvent>,
+    events: Sender<TransportEvent>,
     /// 已接受入站连接的裸 TCP 克隆,供析构时强制断开(见 `Drop` 实现注释)。
     /// 键为自增连接 id;连接自然结束时由自己的读线程摘除。
     inbound_socks: Mutex<HashMap<u64, TcpStream>>,
     next_conn_id: AtomicU64,
+    /// xfer_id -> 待决报价(本端是接收方时登记)。
+    pending_offers: Mutex<HashMap<String, PendingOffer>>,
+    /// xfer_id -> 已接受、等待 FileStart 数据连接到来的接收状态(本端是接收方)。
+    incoming: Mutex<HashMap<String, IncomingState>>,
+    /// xfer_id -> (源文件路径, 大小)。本端是发送方,等待 FileAccept/FileReject。
+    outgoing: Mutex<HashMap<String, (PathBuf, u64)>>,
+    /// 指向自身的弱引用,供 `offer_file` 生成的后台线程使用,
+    /// 避免要求调用方以 `Arc<Self>` 形式调用(见 `start` 里 `Arc::new_cyclic`)。
+    self_weak: Weak<Self>,
 }
 
 impl TransportManager {
     pub fn start(
         identity: Arc<Identity>,
         preferred_port: u16,
-        events: Sender<MessageEvent>,
+        events: Sender<TransportEvent>,
     ) -> Result<Arc<Self>, TransportError> {
         let listener = match TcpListener::bind(("0.0.0.0", preferred_port)) {
             Ok(l) => l,
@@ -72,13 +159,17 @@ impl TransportManager {
             Err(e) => return Err(e.into()),
         };
         let port = listener.local_addr()?.port();
-        let mgr = Arc::new(Self {
+        let mgr = Arc::new_cyclic(|weak_self| Self {
             identity: identity.clone(),
             port,
             outbound: Mutex::new(HashMap::new()),
             events,
             inbound_socks: Mutex::new(HashMap::new()),
             next_conn_id: AtomicU64::new(0),
+            pending_offers: Mutex::new(HashMap::new()),
+            incoming: Mutex::new(HashMap::new()),
+            outgoing: Mutex::new(HashMap::new()),
+            self_weak: weak_self.clone(),
         });
 
         let server_cfg = tls::server_config(&identity)?;
@@ -116,21 +207,38 @@ impl TransportManager {
                         cleanup();
                         return;
                     };
-                    // 未发 Hello 的连接不能无限占用线程/套接字:握手阶段设读超时。
+                    // 未发首帧的连接不能无限占用线程/套接字:握手阶段设读超时。
                     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-                    // 等待 Hello 完成握手并确认协议
-                    let Ok(Msg::Hello { .. }) = proto::read_msg(&mut tls_stream) else {
-                        cleanup();
-                        return;
-                    };
-                    let Some(peer_fp) = tls::peer_fingerprint(&tls_stream.conn) else {
-                        cleanup();
-                        return;
-                    };
-                    // Hello 已收到,进入长连接读取阶段:取消握手期超时。
-                    let _ = tls_stream.get_ref().set_read_timeout(None);
-                    Self::read_loop(&events, peer_fp, &mut tls_stream);
+                    // 首帧分流:Hello → 消息连接(原逻辑);FileStart → 文件接收
+                    // (M3 新增,见模块顶部设计注记)。其他/坏帧直接放弃连接。
+                    match proto::read_msg(&mut tls_stream) {
+                        Ok(Msg::Hello { .. }) => {
+                            let Some(peer_fp) = tls::peer_fingerprint(&tls_stream.conn) else {
+                                cleanup();
+                                return;
+                            };
+                            // 首帧已收到,进入长连接读取阶段:取消握手期超时。
+                            let _ = tls_stream.get_ref().set_read_timeout(None);
+                            Self::read_loop(&cleanup_mgr, &events, peer_fp, &mut tls_stream);
+                        }
+                        Ok(Msg::FileStart { xfer_id, offset }) => {
+                            let Some(peer_fp) = tls::peer_fingerprint(&tls_stream.conn) else {
+                                cleanup();
+                                return;
+                            };
+                            let _ = tls_stream.get_ref().set_read_timeout(None);
+                            Self::handle_file_receive(
+                                &cleanup_mgr,
+                                &events,
+                                xfer_id,
+                                offset,
+                                peer_fp,
+                                &mut tls_stream,
+                            );
+                        }
+                        _ => {}
+                    }
                     cleanup();
                 });
             }
@@ -145,32 +253,171 @@ impl TransportManager {
     /// 服务端连接的读循环。M2 简化决策:出站连接只写不回读(对端回话走它自己
     /// 的出站连接),所以这里只需要服务端 `StreamOwned` 类型,不必对
     /// Server/Client 两种连接做泛型抽象。不是 `&self` 方法——见调用处注释,
-    /// 读线程不持有 manager 的强引用,只借用事件 Sender(可独立于 manager 存活)。
-    fn read_loop(events: &Sender<MessageEvent>, peer_fp: String, tls_stream: &mut ServerTls) {
+    /// 读线程不持有 manager 的强引用,只借用事件 Sender 与一个 `Weak`
+    /// (用于登记/查询 `pending_offers` 等小 map,绝不跨阻塞 IO 持有强引用)。
+    fn read_loop(
+        mgr: &Weak<Self>,
+        events: &Sender<TransportEvent>,
+        peer_fp: String,
+        tls_stream: &mut ServerTls,
+    ) {
         loop {
             match proto::read_msg(tls_stream) {
                 Ok(Msg::Text { id, body, ts_ms }) => {
-                    let ev = MessageEvent {
+                    let ev = TransportEvent::Message(MessageEvent {
                         peer_fp: peer_fp.clone(),
                         id,
                         body,
                         ts_ms,
-                    };
+                    });
                     if events.send(ev).is_err() {
                         return;
                     }
                 }
-                Ok(Msg::Hello { .. }) => continue,
+                Ok(Msg::Hello { .. }) => continue, // 握手后不应再来 Hello;宽容忽略
+                Ok(Msg::FileOffer {
+                    xfer_id,
+                    name,
+                    size,
+                    blake3,
+                }) => {
+                    // 这条连接从这一刻起专用于本次报价的控制往返:respond_file
+                    // 在别的线程决定 accept/reject,通过下面这条仅本线程消费的
+                    // channel 把决定传回来,再由本线程(唯一持有 &mut ServerTls
+                    // 的线程)亲自写回。写完后这条连接的使命就结束了——对端不会
+                    // 再在它上面发别的东西(它自己在阻塞等我们的回复)。
+                    let (reply_tx, reply_rx) = mpsc::channel::<Msg>();
+                    let Some(m) = mgr.upgrade() else { return };
+                    m.pending_offers.lock().expect("pending lock").insert(
+                        xfer_id.clone(),
+                        PendingOffer {
+                            peer_fp: peer_fp.clone(),
+                            name: name.clone(),
+                            size,
+                            blake3,
+                            reply_tx,
+                        },
+                    );
+                    drop(m); // 不跨"等待应用层决定"持有强引用
+                    if events
+                        .send(TransportEvent::FileOffered {
+                            xfer_id,
+                            peer_fp: peer_fp.clone(),
+                            name,
+                            size,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // 阻塞等 respond_file 的决定。若 manager 整体被 drop,
+                    // pending_offers 连带 reply_tx 一起被丢弃,recv() 会立刻
+                    // 收到 Err,本线程随之正常退出,不会永久悬挂。
+                    if let Ok(reply) = reply_rx.recv() {
+                        let _ = proto::write_msg(tls_stream, &reply);
+                    }
+                    return;
+                }
+                // 下面两种只会出现在发起方"专用 offer 控制连接"的读侧
+                // (`await_offer_reply`),不会到这条服务端读循环里;防御性忽略。
+                Ok(Msg::FileAccept { .. }) => continue,
+                Ok(Msg::FileReject { .. }) => continue,
+                // 数据连接的首帧在 accept-loop 分流阶段已经处理过,不会到这里。
+                Ok(Msg::FileStart { .. }) => continue,
                 Err(_) => return, // 断连/坏帧:退出读循环
             }
         }
     }
 
-    fn dial(
+    /// 数据连接读侧(接收方):首帧 `FileStart` 已经在 accept-loop 里被识别
+    /// 并消费掉,这里只管真正的字节流接收 + 落盘校验。不是 `&self` 方法,
+    /// 理由同 `read_loop`——只借用 `Weak`。
+    fn handle_file_receive(
+        mgr: &Weak<Self>,
+        events: &Sender<TransportEvent>,
+        xfer_id: String,
+        offset: u64,
+        peer_fp: String,
+        tls_stream: &mut ServerTls,
+    ) {
+        let state = {
+            let Some(m) = mgr.upgrade() else { return };
+            let removed = m.incoming.lock().expect("incoming lock").remove(&xfer_id);
+            removed
+        };
+        let Some(state) = state else {
+            let _ = events.send(TransportEvent::FileFailed {
+                xfer_id,
+                reason: "未知或已处理的传输".to_string(),
+            });
+            return;
+        };
+        if state.peer_fp != peer_fp {
+            let _ = events.send(TransportEvent::FileFailed {
+                xfer_id,
+                reason: "数据连接对端指纹与报价方不符".to_string(),
+            });
+            return;
+        }
+        // 校验数据连接自带的 FileStart.offset 与 respond_file 当初算出、写进
+        // FileAccept 回复里的续传点一致——不能信任发送方在数据连接上重新
+        // 声称的 offset(状态可能过期,或被篡改)。不一致就判失败,不写任何
+        // 字节(不调用 receive_into)。
+        if offset != state.offset {
+            let _ = events.send(TransportEvent::FileFailed {
+                xfer_id,
+                reason: "续传位置不一致".to_string(),
+            });
+            return;
+        }
+
+        let total = state.size;
+        let mut last_emit: Option<Instant> = None;
+        let progress_xfer = xfer_id.clone();
+        let progress_events = events.clone();
+        let mut on_progress = move |done: u64| {
+            let now = Instant::now();
+            let due = done == total
+                || last_emit.is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE);
+            if due {
+                last_emit = Some(now);
+                let _ = progress_events.send(TransportEvent::FileProgress {
+                    xfer_id: progress_xfer.clone(),
+                    done,
+                    total,
+                });
+            }
+        };
+
+        match filexfer::receive_into(
+            &state.download_dir,
+            &state.name,
+            state.size,
+            state.offset,
+            &state.blake3,
+            tls_stream,
+            &mut on_progress,
+        ) {
+            Ok(path) => {
+                let _ = events.send(TransportEvent::FileDone { xfer_id, path });
+            }
+            Err(e) => {
+                let _ = events.send(TransportEvent::FileFailed {
+                    xfer_id,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// 建连 + 握手 + 写首帧,地址列表依次重试。首帧参数化,供 `dial`(Hello)
+    /// 与 `dial_data`(FileStart)共用同一套重试逻辑。
+    fn connect_and_send(
         &self,
         peer_fp: &str,
         addrs: &[IpAddr],
         port: u16,
+        first: &Msg,
     ) -> Result<ClientTls, TransportError> {
         let cfg = tls::client_config(&self.identity, peer_fp)?;
         let mut last: Option<io::Error> = None;
@@ -183,16 +430,8 @@ impl TransportManager {
                     match rustls::ClientConnection::new(cfg.clone(), name) {
                         Ok(conn) => {
                             let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
-                            match proto::write_msg(
-                                &mut tls_stream,
-                                &Msg::Hello { v: proto::PROTO_V },
-                            ) {
-                                Ok(()) => {
-                                    // 对称:也从出站连接收消息(对端可能沿此连接回话)
-                                    // 读线程需要独立的流——TcpStream 可 try_clone,TLS 状态不可,
-                                    // 因此 M2 出站连接只写不读;对端回话走它自己的出站连接。
-                                    return Ok(tls_stream);
-                                }
+                            match proto::write_msg(&mut tls_stream, first) {
+                                Ok(()) => return Ok(tls_stream),
                                 Err(e) => last = Some(e),
                             }
                         }
@@ -205,6 +444,40 @@ impl TransportManager {
         Err(last
             .map(TransportError::Io)
             .unwrap_or(TransportError::NoAddress))
+    }
+
+    fn dial(
+        &self,
+        peer_fp: &str,
+        addrs: &[IpAddr],
+        port: u16,
+    ) -> Result<ClientTls, TransportError> {
+        // 对称:也从出站连接收消息(对端可能沿此连接回话)——读线程需要独立的
+        // 流,TcpStream 可 try_clone,TLS 状态不可,因此 M2 出站连接只写不读;
+        // 对端回话走它自己的出站连接。offer/control 连接同理(见 offer_file):
+        // 它额外需要读一条回复,为此单独跑一个专用线程,不影响这里的约定。
+        self.connect_and_send(peer_fp, addrs, port, &Msg::Hello { v: proto::PROTO_V })
+    }
+
+    /// 文件数据连接:没有 `Hello`,首帧直接是 `FileStart`——接收方 accept-loop
+    /// 靠这一点把它和普通消息/offer 控制连接区分开(见模块顶部设计注记)。
+    fn dial_data(
+        &self,
+        peer_fp: &str,
+        addrs: &[IpAddr],
+        port: u16,
+        xfer_id: &str,
+        offset: u64,
+    ) -> Result<ClientTls, TransportError> {
+        self.connect_and_send(
+            peer_fp,
+            addrs,
+            port,
+            &Msg::FileStart {
+                xfer_id: xfer_id.to_string(),
+                offset,
+            },
+        )
     }
 
     /// 探测缓存连接是否已死。
@@ -235,6 +508,25 @@ impl TransportManager {
         };
         let _ = conn.sock.set_nonblocking(false);
         dead
+    }
+
+    /// 纯写连接(比如数据连接的发送侧)在关闭前主动排空对端可能已经发来的
+    /// 字节。TLS 1.3 服务端握手完成后通常会自动下发 NewSessionTicket 记录
+    /// (见 `conn_is_dead` 的注释);这类连接只写不读,若这些字节一直没被
+    /// 读走,操作系统在 socket 关闭时可能因为"接收缓冲区还有未读数据"而发
+    /// RST 而不是正常 FIN/四次挥手,这有可能让对端把我们最后刚写完、还没
+    /// 被应用层读到的那部分数据一起丢弃。用一个短超时循环把这些字节读掉,
+    /// 确保关闭时接收缓冲区是空的,退化为正常挥手。
+    fn drain_before_close(conn: &mut ClientTls) {
+        let _ = conn.sock.set_read_timeout(Some(Duration::from_millis(200)));
+        let mut buf = [0u8; 4096];
+        loop {
+            match io::Read::read(conn, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
     }
 
     pub fn send_text(
@@ -287,6 +579,237 @@ impl TransportManager {
         let mut cache = self.outbound.lock().expect("outbound lock");
         cache.insert(peer_fp.to_string(), fresh);
         Ok(SentText { id, ts_ms })
+    }
+
+    /// 发起一次文件传输报价:算 hash → 生成 xfer_id → 经一条**专用**控制
+    /// 连接(`dial()`,与 send_text 共用同一套建连/首帧重试逻辑,但不进
+    /// `outbound` 缓存——见模块顶部设计注记)发 `FileOffer` → 记录待发送
+    /// 路径 → 后台线程阻塞等待对端的 Accept/Reject。
+    pub fn offer_file(
+        &self,
+        peer_fp: &str,
+        addrs: &[IpAddr],
+        port: u16,
+        path: &Path,
+    ) -> Result<FileHandle, TransportError> {
+        let (size, blake3) = filexfer::hash_file(path)?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let xfer_id = proto::new_id();
+
+        self.outgoing
+            .lock()
+            .expect("outgoing lock")
+            .insert(xfer_id.clone(), (path.to_path_buf(), size));
+
+        let mut ctrl = match self.dial(peer_fp, addrs, port) {
+            Ok(c) => c,
+            Err(e) => {
+                self.outgoing
+                    .lock()
+                    .expect("outgoing lock")
+                    .remove(&xfer_id);
+                return Err(e);
+            }
+        };
+        let offer = Msg::FileOffer {
+            xfer_id: xfer_id.clone(),
+            name,
+            size,
+            blake3,
+        };
+        if let Err(e) = proto::write_msg(&mut ctrl, &offer) {
+            self.outgoing
+                .lock()
+                .expect("outgoing lock")
+                .remove(&xfer_id);
+            return Err(e.into());
+        }
+
+        let weak = self.self_weak.clone();
+        let events = self.events.clone();
+        let peer_fp = peer_fp.to_string();
+        let addrs = addrs.to_vec();
+        let xfer_for_thread = xfer_id.clone();
+        std::thread::spawn(move || {
+            Self::await_offer_reply(weak, events, xfer_for_thread, peer_fp, addrs, port, ctrl);
+        });
+
+        Ok(FileHandle { xfer_id })
+    }
+
+    /// 专用 offer 控制连接的读侧(发起方):阻塞等一条回复,按结果分流。
+    /// 不是 `&self` 方法——理由同 `read_loop`,只借用 `Weak`,且在真正开始
+    /// 推流(可能耗时较长)之前就把强引用释放掉。
+    fn await_offer_reply(
+        mgr: Weak<Self>,
+        events: Sender<TransportEvent>,
+        xfer_id: String,
+        peer_fp: String,
+        addrs: Vec<IpAddr>,
+        port: u16,
+        mut ctrl: ClientTls,
+    ) {
+        // 对端可能迟迟不 accept/reject(等人工确认),但也不能无限占用这条
+        // 阻塞读线程 + 底层 socket——给够时间(120s)但不是永久,超时后
+        // read_msg 返回 Err,走下面既有的清理分支(见该分支注释)。
+        let _ = ctrl
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(120)));
+        let reply = proto::read_msg(&mut ctrl);
+        match reply {
+            Ok(Msg::FileAccept { offset, .. }) => {
+                let entry = match mgr.upgrade() {
+                    Some(m) => m.outgoing.lock().expect("outgoing lock").remove(&xfer_id),
+                    None => None,
+                };
+                let Some((path, size)) = entry else { return };
+
+                let dialed = match mgr.upgrade() {
+                    Some(m) => m.dial_data(&peer_fp, &addrs, port, &xfer_id, offset),
+                    None => return,
+                };
+                // 拨号之后不再需要强引用——推流阶段可能耗时较长,不该拖着
+                // manager 的引用计数(与 read_loop/handle_file_receive 同样的
+                // "不跨阻塞 IO 持有强引用"原则)。
+                let mut data_conn = match dialed {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = events.send(TransportEvent::FileFailed {
+                            xfer_id,
+                            reason: e.to_string(),
+                        });
+                        return;
+                    }
+                };
+
+                let mut last_emit: Option<Instant> = None;
+                let progress_xfer = xfer_id.clone();
+                let progress_events = events.clone();
+                let mut on_progress = move |done: u64| {
+                    let now = Instant::now();
+                    let due = done == size
+                        || last_emit.is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE);
+                    if due {
+                        last_emit = Some(now);
+                        let _ = progress_events.send(TransportEvent::FileProgress {
+                            xfer_id: progress_xfer.clone(),
+                            done,
+                            total: size,
+                        });
+                    }
+                };
+
+                let send_res =
+                    filexfer::send_from(&path, offset, size, &mut data_conn, &mut on_progress);
+                // 见 drain_before_close 的注释:这条数据连接自始至终只写不读,
+                // 关闭前先排空对端可能已经发来的字节,避免触发 RST 丢尾包。
+                Self::drain_before_close(&mut data_conn);
+                match send_res {
+                    Ok(()) => {
+                        let _ = events.send(TransportEvent::FileDone { xfer_id, path });
+                    }
+                    Err(e) => {
+                        let _ = events.send(TransportEvent::FileFailed {
+                            xfer_id,
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Ok(Msg::FileReject { .. }) => {
+                if let Some(m) = mgr.upgrade() {
+                    m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
+                    let _ = events.send(TransportEvent::FileFailed {
+                        xfer_id,
+                        reason: "对端已拒绝".to_string(),
+                    });
+                }
+            }
+            // 读失败:包括上面设的 120s 超时(对端一直未 accept/reject)以及
+            // 其他连接错误——都清理 outgoing 并上报,不留悬挂状态。
+            Err(_) => {
+                if let Some(m) = mgr.upgrade() {
+                    m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
+                }
+                let _ = events.send(TransportEvent::FileFailed {
+                    xfer_id,
+                    reason: "对端无响应".to_string(),
+                });
+            }
+            _ => {
+                if let Some(m) = mgr.upgrade() {
+                    m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
+                }
+                let _ = events.send(TransportEvent::FileFailed {
+                    xfer_id,
+                    reason: "未收到有效的 Accept/Reject 回复".to_string(),
+                });
+            }
+        }
+    }
+
+    /// 接收方对一个待决报价做出决定。
+    /// - `accept`:登记接收状态(供随后到达的 `FileStart` 数据连接查询),
+    ///   算好断点续传 offset,回 `FileAccept`。
+    /// - 拒绝:回 `FileReject`,不留任何接收状态。
+    ///
+    /// 未知/已处理过的 `xfer_id` 静默忽略(respond_file 是幂等的边界操作)。
+    pub fn respond_file(
+        &self,
+        xfer_id: &str,
+        accept: bool,
+        download_dir: &Path,
+    ) -> Result<(), TransportError> {
+        let Some(po) = self
+            .pending_offers
+            .lock()
+            .expect("pending lock")
+            .remove(xfer_id)
+        else {
+            return Ok(());
+        };
+
+        if accept {
+            let safe_name = match filexfer::safe_basename(&po.name) {
+                Some(n) => n,
+                None => {
+                    // 对端文件名非法(可能路径穿越):拒绝并上报
+                    let _ = po.reply_tx.send(Msg::FileReject {
+                        xfer_id: xfer_id.to_string(),
+                    });
+                    let _ = self.events.send(TransportEvent::FileFailed {
+                        xfer_id: xfer_id.to_string(),
+                        reason: "非法文件名".to_string(),
+                    });
+                    return Ok(());
+                }
+            };
+            let offset = filexfer::existing_offset(download_dir, &safe_name);
+            self.incoming.lock().expect("incoming lock").insert(
+                xfer_id.to_string(),
+                IncomingState {
+                    peer_fp: po.peer_fp,
+                    download_dir: download_dir.to_path_buf(),
+                    name: safe_name,
+                    size: po.size,
+                    blake3: po.blake3,
+                    offset,
+                },
+            );
+            let _ = po.reply_tx.send(Msg::FileAccept {
+                xfer_id: xfer_id.to_string(),
+                offset,
+            });
+        } else {
+            let _ = po.reply_tx.send(Msg::FileReject {
+                xfer_id: xfer_id.to_string(),
+            });
+        }
+        Ok(())
     }
 }
 
