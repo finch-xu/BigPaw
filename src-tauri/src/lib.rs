@@ -5,10 +5,23 @@ use bigpaw_core::transport::manager::TransportEvent;
 use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 fn data_dir(app: &AppHandle) -> PathBuf {
     app.path().app_data_dir().expect("app_data_dir 必然可解析")
+}
+
+/// 从托盘/Dock 恢复主窗口:显示、聚焦,并在 macOS 上切回 Regular 让 Dock 图标回来。
+fn show_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
 }
 
 struct AppCore(Core);
@@ -222,6 +235,17 @@ struct FileFailedDto {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                // macOS:关窗即切成 Accessory(菜单栏应用),Dock 图标消失
+                #[cfg(target_os = "macos")]
+                let _ = window
+                    .app_handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                api.prevent_close(); // 阻止真正关闭 → 应用继续后台运行
+            }
+        })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let core = Core::start(CoreConfig {
@@ -308,6 +332,33 @@ pub fn run() {
                 });
             }
 
+            // 系统托盘 / macOS 菜单栏:关窗后应用常驻此处,并提供唯一的"退出"入口
+            let show_i = MenuItem::with_id(app, "show", "显示 BigPaw", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let quit_i = MenuItem::with_id(app, "quit", "退出 BigPaw", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &sep, &quit_i])?;
+
+            TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false) // 左键=显示窗口,右键=弹菜单(桌面 IM 常见范式)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0), // 真正退出:触发 ExitRequested → core.shutdown()
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
             app.manage(AppCore(core));
             Ok(())
         })
@@ -329,12 +380,16 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
                 // 退出前注销 mDNS,让对端立刻看到我们下线
                 if let Some(core) = app_handle.try_state::<AppCore>() {
                     core.0.shutdown();
                 }
             }
+            // macOS:Dock 图标点击 / Cmd+Tab 激活时恢复窗口(并切回 Regular)
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_main_window(app_handle),
+            _ => {}
         });
 }
