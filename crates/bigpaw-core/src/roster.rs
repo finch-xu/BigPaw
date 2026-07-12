@@ -152,6 +152,20 @@ impl Roster {
         }
     }
 
+    /// 启动预热(M6):把持久化的已知 peer 以 Offline 态注入,让 UI 一打开
+    /// 就能看到历史联系人并查其聊天记录。不覆盖已存在的记录(发现层可能
+    /// 已抢先注册),不注入自己。port=0/addrs 可能为空:离线记录本来就
+    /// 不可直连,重新被发现时 Seen 会带来新地址并整体覆盖。
+    pub fn seed_offline(&mut self, peers: Vec<Peer>) {
+        for mut p in peers {
+            if p.fingerprint == self.self_fingerprint {
+                continue;
+            }
+            p.state = PeerState::Offline;
+            self.peers.entry(p.fingerprint.clone()).or_insert(p);
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<Peer> {
         let mut v: Vec<Peer> = self.peers.values().cloned().collect();
         v.sort_by(|a, b| {
@@ -349,5 +363,44 @@ mod tests {
         assert_eq!(r.snapshot()[0].state, PeerState::Offline);
         assert!(r.apply(seen("bbbb", "bob")));
         assert_eq!(r.snapshot()[0].state, PeerState::Discovered);
+    }
+
+    #[test]
+    fn seed_offline_injects_known_peers_as_offline() {
+        let mut r = Roster::new(SELF_FP.to_string());
+        r.apply(seen("bbbb", "bob")); // 已在线的不该被预热覆盖
+        r.seed_offline(vec![
+            Peer {
+                fingerprint: "bbbb".to_string(),
+                nickname: "bob-old".to_string(),
+                addrs: vec![],
+                port: 0,
+                protocol: Protocol::Native,
+                state: PeerState::Discovered, // seed 强制改为 Offline
+            },
+            Peer {
+                fingerprint: "cccc".to_string(),
+                nickname: "carol".to_string(),
+                addrs: vec![ip(7)],
+                port: 0,
+                protocol: Protocol::Native,
+                state: PeerState::Discovered,
+            },
+            Peer {
+                fingerprint: SELF_FP.to_string(),
+                nickname: "me".to_string(),
+                addrs: vec![],
+                port: 0,
+                protocol: Protocol::Native,
+                state: PeerState::Discovered,
+            },
+        ]);
+        let snap = r.snapshot();
+        assert_eq!(snap.len(), 2, "自己不注入");
+        let bob = snap.iter().find(|p| p.fingerprint == "bbbb").unwrap();
+        assert_eq!(bob.state, PeerState::Discovered, "在线记录不被预热覆盖");
+        assert_eq!(bob.nickname, "bob", "昵称保持在线版本");
+        let carol = snap.iter().find(|p| p.fingerprint == "cccc").unwrap();
+        assert_eq!(carol.state, PeerState::Offline);
     }
 }
