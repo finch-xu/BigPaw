@@ -6,7 +6,7 @@ export interface Peer {
   addrs: string[];
   port: number;
   protocol: "native" | "ipmsg";
-  state: "discovered" | "offline";
+  state: "discovered" | "reachable" | "unreachable" | "offline";
 }
 
 export interface SelfInfo {

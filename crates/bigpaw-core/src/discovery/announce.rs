@@ -300,6 +300,8 @@ pub struct AnnounceService {
     stop: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
     joined: Vec<Ipv4Addr>,
+    /// 预编码好的自身宣告报文,`poke` 复用它做定向单播(见下)。
+    announce_buf: Vec<u8>,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -337,6 +339,7 @@ impl AnnounceService {
         let recv_handle = {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
+            let buf = buf.clone();
             std::thread::spawn(move || recv_loop(socket, stop, self_fp, buf, tx))
         };
 
@@ -344,9 +347,21 @@ impl AnnounceService {
             stop,
             socket,
             joined,
+            announce_buf: buf,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
         })
+    }
+
+    /// 对历史已知的单个 IP 发一份定向单播宣告(而非组播/广播),用来"唤醒"
+    /// 一台 mDNS 因故听不到的历史设备——对方收到后走正常的宣告应答/mDNS
+    /// 发现流程重新上线,本端不做端口扫描、不建立连接。
+    ///
+    /// 只发一个包,不在内部做节流:调用方(见 `Core::start` 的历史探测线程)
+    /// 负责串行调用、每次间隔 ≥50ms,避免看起来像扫描而触发 IDS 告警。
+    pub fn poke(&self, ip: IpAddr) {
+        let target = SocketAddr::new(ip, DEFAULT_ANNOUNCE_PORT);
+        let _ = self.socket.send_to(&self.announce_buf, target);
     }
 
     /// 停止两条线程、退出组播组并关闭 socket。

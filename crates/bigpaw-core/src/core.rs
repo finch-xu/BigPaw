@@ -1,7 +1,9 @@
 //! 核心编排:identity + discovery + roster 串联,对壳层(src-tauri)暴露
 //! 同步启动接口与 watch 快照订阅。零 Tauri、零异步运行时依赖。
 
-use crate::discovery::announce::HistoryStore;
+use crate::discovery::announce::{
+    AnnounceError, AnnounceService, HistoryStore, DEFAULT_ANNOUNCE_PORT,
+};
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Roster};
@@ -13,8 +15,13 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
+
+/// 历史 IP 单播"唤醒"宣告的发送间隔:串行、低速,不触发 IDS 扫描告警
+/// (设计文档 §11),远高于 brief 要求的 ≥50ms 下限。
+const HISTORY_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -22,6 +29,8 @@ pub enum CoreError {
     Identity(#[from] IdentityError),
     #[error("mdns: {0}")]
     Mdns(#[from] mdns_sd::Error),
+    #[error("announce: {0}")]
+    Announce(#[from] AnnounceError),
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
     #[error("对端不在线或未知")]
@@ -40,6 +49,10 @@ pub struct Core {
     roster_rx: watch::Receiver<Vec<Peer>>,
     roster_handle: Arc<Mutex<Roster>>,
     discovery: std::sync::Mutex<Option<Discovery>>,
+    /// `Arc` 包裹是因为启动时的历史 IP 唤醒线程也要短暂借用它调用
+    /// `poke`(见 `Core::start`);`shutdown` 时 `.take()` 拿到唯一所有权后
+    /// 按值传给 `AnnounceService::shutdown`,与 `discovery` 字段同样的幂等模式。
+    announce: Arc<Mutex<Option<AnnounceService>>>,
     transport: Arc<TransportManager>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
 }
@@ -57,12 +70,39 @@ impl Core {
         // (Registered/Unreachable)回灌给 roster——两类事件因此天然串行化,
         // 不需要额外同步。
         let (tx, rx) = std::sync::mpsc::channel();
-        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?; // 真实端口进 SRV
+        // 真实端口进 SRV
+        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
+        // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
+        let announce_service = AnnounceService::start(
+            &identity,
+            &nickname,
+            transport.port(),
+            DEFAULT_ANNOUNCE_PORT,
+            tx.clone(),
+        )?;
+        let announce = Arc::new(Mutex::new(Some(announce_service)));
 
         let roster_handle = Arc::new(Mutex::new(Roster::new(identity.fingerprint.clone())));
         let (watch_tx, watch_rx) = watch::channel(Vec::new());
         let roster_for_thread = roster_handle.clone();
         let history = Arc::new(Mutex::new(HistoryStore::load(&cfg.data_dir)));
+
+        // 历史 IP 单播唤醒(M4 简化版双向注册):对已知历史设备逐个发一份
+        // 单播宣告,串行、间隔 ≥50ms,让对方回连/回宣告,走正常发现流程
+        // 重新进入 roster——不做端口扫描、不直接建连接。
+        {
+            let announce_for_wake = announce.clone();
+            let wake_ips = history.lock().expect("history lock").ips();
+            std::thread::spawn(move || {
+                for ip in wake_ips {
+                    if let Some(a) = announce_for_wake.lock().expect("announce lock").as_ref() {
+                        a.poke(ip);
+                    }
+                    std::thread::sleep(HISTORY_WAKE_INTERVAL);
+                }
+            });
+        }
         // 正在探测中的 fingerprint 集合:防止同一对端因为重复的 Seen 宣告
         // (mDNS 周期重宣告、多网卡多次解析)并发起多条探测线程(探测风暴)。
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -113,6 +153,7 @@ impl Core {
             roster_rx: watch_rx,
             roster_handle,
             discovery: std::sync::Mutex::new(Some(discovery)),
+            announce,
             transport,
             events_rx: Mutex::new(Some(msg_rx)),
         })
@@ -179,7 +220,9 @@ impl Core {
         self.transport.port()
     }
 
-    /// 主动下线:注销 mDNS(发 goodbye),对端立刻收到 Lost 而不是等 TTL 过期。幂等。
+    /// 主动下线:注销 mDNS(发 goodbye)+ 停止 UDP 宣告收发,对端立刻收到
+    /// Lost 而不是等 TTL 过期。两路都幂等(`Mutex<Option<_>>::take` 保证
+    /// 重复调用时第二次拿到 `None`,直接跳过)。
     pub fn shutdown(&self) {
         let discovery = self
             .discovery
@@ -188,6 +231,11 @@ impl Core {
             .take();
         if let Some(d) = discovery {
             d.shutdown();
+        }
+
+        let announce = self.announce.lock().expect("announce lock poisoned").take();
+        if let Some(a) = announce {
+            a.shutdown();
         }
     }
 }
