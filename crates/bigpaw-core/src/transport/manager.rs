@@ -738,13 +738,27 @@ impl TransportManager {
         };
 
         if accept {
-            let offset = filexfer::existing_offset(download_dir, &po.name);
+            let safe_name = match filexfer::safe_basename(&po.name) {
+                Some(n) => n,
+                None => {
+                    // 对端文件名非法(可能路径穿越):拒绝并上报
+                    let _ = po.reply_tx.send(Msg::FileReject {
+                        xfer_id: xfer_id.to_string(),
+                    });
+                    let _ = self.events.send(TransportEvent::FileFailed {
+                        xfer_id: xfer_id.to_string(),
+                        reason: "非法文件名".to_string(),
+                    });
+                    return Ok(());
+                }
+            };
+            let offset = filexfer::existing_offset(download_dir, &safe_name);
             self.incoming.lock().expect("incoming lock").insert(
                 xfer_id.to_string(),
                 IncomingState {
                     peer_fp: po.peer_fp,
                     download_dir: download_dir.to_path_buf(),
-                    name: po.name,
+                    name: safe_name,
                     size: po.size,
                     blake3: po.blake3,
                 },
