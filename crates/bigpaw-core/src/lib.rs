@@ -8,6 +8,7 @@ pub mod core;
 pub mod discovery;
 pub mod identity;
 pub mod roster;
+pub mod settings;
 pub mod storage;
 pub mod transport;
 

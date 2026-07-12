@@ -25,6 +25,18 @@ pub struct SearchHit {
     pub kind: String,
 }
 
+/// peers 表一行:启动时预热 roster(Offline 态)用。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KnownPeer {
+    pub fingerprint: String,
+    pub nickname: String,
+    /// "native" | "ipmsg"
+    pub protocol: String,
+    pub last_addr: Option<String>,
+    pub last_seen_ms: i64,
+}
+
 /// 会话时间线里的一条记录:文本消息或文件传输。
 /// serde tag="kind" → 前端按 `item.kind === "text" | "file"` 判别。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -232,6 +244,48 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    pub fn upsert_peer(
+        &self,
+        fingerprint: &str,
+        nickname: &str,
+        protocol: &str,
+        last_addr: Option<&str>,
+        last_seen_ms: i64,
+    ) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        conn.execute(
+            "INSERT INTO peers (fingerprint, nickname, protocol, last_addr, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(fingerprint) DO UPDATE SET
+               nickname = excluded.nickname,
+               protocol = excluded.protocol,
+               last_addr = COALESCE(excluded.last_addr, peers.last_addr),
+               last_seen_ms = excluded.last_seen_ms",
+            params![fingerprint, nickname, protocol, last_addr, last_seen_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn known_peers(&self) -> Result<Vec<KnownPeer>, StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        let mut stmt = conn.prepare(
+            "SELECT fingerprint, nickname, protocol, last_addr, last_seen_ms
+             FROM peers ORDER BY last_seen_ms DESC",
+        )?;
+        let peers = stmt
+            .query_map([], |row| {
+                Ok(KnownPeer {
+                    fingerprint: row.get(0)?,
+                    nickname: row.get(1)?,
+                    protocol: row.get(2)?,
+                    last_addr: row.get(3)?,
+                    last_seen_ms: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(peers)
     }
 }
 
@@ -451,5 +505,20 @@ mod tests {
 
         s.clear_history(None).unwrap();
         assert!(s.history("peerB", None, 50).unwrap().is_empty(), "None = 全部清空");
+    }
+
+    #[test]
+    fn upsert_peer_and_known_peers() {
+        let s = mem();
+        s.upsert_peer("fpA", "alice", "native", Some("192.168.1.5"), 1000).unwrap();
+        s.upsert_peer("fpA", "alice-renamed", "native", Some("192.168.1.6"), 2000)
+            .unwrap();
+        s.upsert_peer("ipmsg:k", "bob-feiq", "ipmsg", None, 1500).unwrap();
+        let peers = s.known_peers().unwrap();
+        assert_eq!(peers.len(), 2, "同 fingerprint 覆盖不重复");
+        let a = peers.iter().find(|p| p.fingerprint == "fpA").unwrap();
+        assert_eq!(a.nickname, "alice-renamed");
+        assert_eq!(a.last_addr.as_deref(), Some("192.168.1.6"));
+        assert_eq!(a.last_seen_ms, 2000);
     }
 }
