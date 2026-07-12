@@ -128,6 +128,7 @@ impl Storage {
 
     /// 状态推进(offered→active→done/failed/rejected)。`path` 仅完成时有值。
     /// 未知 xfer_id 无操作(与 TransportManager::respond_file 的幂等语义一致)。
+    /// 终态(done/failed/rejected)不可被后到的状态覆盖——防 respond_file 调用方线程与传输完成线程的写入竞态。
     pub fn update_transfer(
         &self,
         xfer_id: &str,
@@ -137,7 +138,7 @@ impl Storage {
         let conn = self.conn.lock().expect("storage lock");
         conn.execute(
             "UPDATE transfers SET status = ?2, path = COALESCE(?3, path)
-             WHERE xfer_id = ?1",
+             WHERE xfer_id = ?1 AND status NOT IN ('done', 'failed', 'rejected')",
             params![xfer_id, status, path],
         )?;
         Ok(())
@@ -522,5 +523,22 @@ mod tests {
         assert_eq!(a.nickname, "alice-renamed");
         assert_eq!(a.last_addr.as_deref(), Some("192.168.1.6"));
         assert_eq!(a.last_seen_ms, 3000);
+    }
+
+    #[test]
+    fn update_transfer_never_regresses_terminal_status() {
+        let s = mem();
+        s.insert_transfer("x1", "peerA", "in", "a.zip", 10, false, "offered", 100)
+            .unwrap();
+        s.update_transfer("x1", "done", Some("/tmp/a.zip")).unwrap();
+        // 竞态场景:respond_file 的 "active" 晚于 FileDone 到达,不得覆盖终态
+        s.update_transfer("x1", "active", None).unwrap();
+        match &s.history("peerA", None, 10).unwrap()[0] {
+            HistoryItem::File { status, path, .. } => {
+                assert_eq!(status, "done", "终态不可回退");
+                assert_eq!(path.as_deref(), Some("/tmp/a.zip"));
+            }
+            other => panic!("期望 File,得到 {other:?}"),
+        }
     }
 }
