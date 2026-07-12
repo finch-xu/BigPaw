@@ -146,7 +146,9 @@ name = "bigpaw-ipmsg"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "socket2 0.5.10",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
