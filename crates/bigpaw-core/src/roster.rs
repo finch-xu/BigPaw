@@ -12,11 +12,22 @@ pub enum Protocol {
     Ipmsg,
 }
 
+/// 状态优先级(高→低):`Reachable` > `Discovered` > `Unreachable` > `Offline`。
+/// - `Reachable`:回连探测(TCP+TLS 握手)成功过,视为双向可达。
+/// - `Discovered`:仅收到过发现层宣告(mDNS/UDP),尚未/无需回连验证。
+/// - `Unreachable`:收到过宣告,但回连探测失败(比如对端在防火墙后单向广播)。
+/// - `Offline`:发现层判定对方已离线(mDNS TTL 过期/goodbye)。
+///
+/// 这个优先级只体现在"谁能盖过谁"的转移规则里(见 `Roster::apply`),不是
+/// 一个可比较的 `Ord`:比如 `Unreachable` 不会被 `Offline` 覆盖(`Lost` 只针对
+/// 仍在线的记录打标),`Reachable` 不会被重复的 `Seen` 或单次探测失败打回去。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PeerState {
     Discovered,
     Offline,
+    Reachable,
+    Unreachable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -39,6 +50,14 @@ pub enum DiscoveryEvent {
         port: u16,
     },
     Lost {
+        fingerprint: String,
+    },
+    /// 回连探测(见 `TransportManager::probe_reachable`)成功。
+    Registered {
+        fingerprint: String,
+    },
+    /// 回连探测失败。
+    Unreachable {
         fingerprint: String,
     },
 }
@@ -69,13 +88,25 @@ impl Roster {
                     return false;
                 }
                 addrs.sort();
+                // 状态优先级:Reachable/Unreachable 是回连探测的结论,不该被一条
+                // 单纯的重复宣告(Seen)打回 Discovered——否则 UI 会在"已验证可达"
+                // 和"刚发现"之间抖动。只有 Offline(此前判定离线)在重新收到宣告
+                // 时才应该回到 Discovered:这代表对方重新上线了,旧的可达性结论
+                // 已经过时,需要新一轮探测重新验证。
+                let state = match self.peers.get(&fingerprint) {
+                    Some(existing) => match existing.state {
+                        PeerState::Offline => PeerState::Discovered,
+                        kept => kept,
+                    },
+                    None => PeerState::Discovered,
+                };
                 let peer = Peer {
                     fingerprint: fingerprint.clone(),
                     nickname,
                     addrs,
                     port,
                     protocol: Protocol::Native,
-                    state: PeerState::Discovered,
+                    state,
                 };
                 match self.peers.get(&fingerprint) {
                     Some(existing) if *existing == peer => false,
@@ -92,6 +123,28 @@ impl Roster {
                 }
                 _ => false,
             },
+            DiscoveryEvent::Registered { fingerprint } => {
+                match self.peers.get_mut(&fingerprint) {
+                    Some(p) if p.state != PeerState::Reachable => {
+                        p.state = PeerState::Reachable;
+                        true
+                    }
+                    _ => false, // 未知 fp 或已是 Reachable:忽略
+                }
+            }
+            DiscoveryEvent::Unreachable { fingerprint } => {
+                match self.peers.get_mut(&fingerprint) {
+                    // 单次探测失败不打断已确认可达的连接;Discovered/Offline 才
+                    // 会被标记为 Unreachable(已是 Unreachable 则无变化)。
+                    Some(p)
+                        if p.state != PeerState::Reachable && p.state != PeerState::Unreachable =>
+                    {
+                        p.state = PeerState::Unreachable;
+                        true
+                    }
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -191,5 +244,83 @@ mod tests {
         assert!(json.contains("\"native\""), "{json}");
         assert!(json.contains("\"discovered\""), "{json}");
         assert!(json.contains("192.168.1.5"), "{json}");
+    }
+
+    #[test]
+    fn reachable_and_unreachable_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&PeerState::Reachable).unwrap(),
+            "\"reachable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PeerState::Unreachable).unwrap(),
+            "\"unreachable\""
+        );
+    }
+
+    #[test]
+    fn reachable_upgrades_from_discovered() {
+        let mut r = Roster::new("aaaa".to_string());
+        r.apply(seen("bbbb", "bob"));
+        assert_eq!(r.snapshot()[0].state, PeerState::Discovered);
+        assert!(r.apply(DiscoveryEvent::Registered {
+            fingerprint: "bbbb".to_string()
+        }));
+        assert_eq!(r.snapshot()[0].state, PeerState::Reachable);
+    }
+
+    #[test]
+    fn unreachable_marks_but_keeps_peer() {
+        let mut r = Roster::new("aaaa".to_string());
+        r.apply(seen("bbbb", "bob"));
+        assert!(r.apply(DiscoveryEvent::Unreachable {
+            fingerprint: "bbbb".to_string()
+        }));
+        assert_eq!(r.snapshot()[0].state, PeerState::Unreachable);
+    }
+
+    #[test]
+    fn seen_does_not_downgrade_reachable() {
+        let mut r = Roster::new("aaaa".to_string());
+        r.apply(seen("bbbb", "bob"));
+        r.apply(DiscoveryEvent::Registered {
+            fingerprint: "bbbb".to_string(),
+        });
+        // 再次收到宣告(Seen)不应把 Reachable 打回 Discovered
+        r.apply(seen("bbbb", "bob"));
+        assert_eq!(r.snapshot()[0].state, PeerState::Reachable);
+    }
+
+    #[test]
+    fn registered_for_unknown_peer_is_ignored() {
+        let mut r = Roster::new("aaaa".to_string());
+        assert!(!r.apply(DiscoveryEvent::Registered {
+            fingerprint: "zzzz".to_string()
+        }));
+    }
+
+    #[test]
+    fn unreachable_does_not_demote_reachable() {
+        let mut r = Roster::new("aaaa".to_string());
+        r.apply(seen("bbbb", "bob"));
+        r.apply(DiscoveryEvent::Registered {
+            fingerprint: "bbbb".to_string(),
+        });
+        assert!(!r.apply(DiscoveryEvent::Unreachable {
+            fingerprint: "bbbb".to_string()
+        }));
+        assert_eq!(r.snapshot()[0].state, PeerState::Reachable);
+    }
+
+    #[test]
+    fn offline_peer_seen_again_returns_to_discovered() {
+        let mut r = Roster::new("aaaa".to_string());
+        r.apply(seen("bbbb", "bob"));
+        r.apply(DiscoveryEvent::Lost {
+            fingerprint: "bbbb".to_string(),
+        });
+        assert_eq!(r.snapshot()[0].state, PeerState::Offline);
+        assert!(r.apply(seen("bbbb", "bob")));
+        assert_eq!(r.snapshot()[0].state, PeerState::Discovered);
     }
 }

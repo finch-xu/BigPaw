@@ -1,13 +1,17 @@
 //! 核心编排:identity + discovery + roster 串联,对壳层(src-tauri)暴露
 //! 同步启动接口与 watch 快照订阅。零 Tauri、零异步运行时依赖。
 
+use crate::discovery::announce::HistoryStore;
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
-use crate::roster::{Peer, Roster};
+use crate::roster::{DiscoveryEvent, Peer, PeerState, Roster};
 use crate::transport::manager::{
     SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
+use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -48,17 +52,57 @@ impl Core {
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
 
+        // discovery 事件通道:mDNS 发现线程通过 tx 送 Seen/Lost;下面同一个
+        // 线程里为新对端起的回连探测线程也复用这条通道的克隆,把探测结论
+        // (Registered/Unreachable)回灌给 roster——两类事件因此天然串行化,
+        // 不需要额外同步。
         let (tx, rx) = std::sync::mpsc::channel();
-        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx)?; // 真实端口进 SRV
+        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?; // 真实端口进 SRV
 
         let roster_handle = Arc::new(Mutex::new(Roster::new(identity.fingerprint.clone())));
         let (watch_tx, watch_rx) = watch::channel(Vec::new());
         let roster_for_thread = roster_handle.clone();
+        let history = Arc::new(Mutex::new(HistoryStore::load(&cfg.data_dir)));
+        // 正在探测中的 fingerprint 集合:防止同一对端因为重复的 Seen 宣告
+        // (mDNS 周期重宣告、多网卡多次解析)并发起多条探测线程(探测风暴)。
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let data_dir = cfg.data_dir.clone();
+        let transport_for_thread = transport.clone();
         std::thread::spawn(move || {
+            let transport = transport_for_thread;
             while let Ok(ev) = rx.recv() {
+                // Seen 事件在被 apply 消费掉之前,先取出探测需要的字段。
+                let probe_target = match &ev {
+                    DiscoveryEvent::Seen {
+                        fingerprint,
+                        addrs,
+                        port,
+                        ..
+                    } => Some((fingerprint.clone(), addrs.clone(), *port)),
+                    _ => None,
+                };
+
                 let mut roster = roster_for_thread.lock().expect("roster lock");
-                if roster.apply(ev) && watch_tx.send(roster.snapshot()).is_err() {
+                let changed = roster.apply(ev);
+                let snapshot = roster.snapshot();
+                drop(roster); // 探测线程的起线程动作不需要跨这把锁
+
+                let already_reachable = probe_target.as_ref().is_some_and(|(fp, _, _)| {
+                    snapshot
+                        .iter()
+                        .any(|p| p.fingerprint == *fp && p.state == PeerState::Reachable)
+                });
+
+                if changed && watch_tx.send(snapshot).is_err() {
                     break; // 订阅端全部销毁
+                }
+
+                if let Some((fp, addrs, port)) = probe_target {
+                    if !already_reachable {
+                        spawn_probe(
+                            &transport, &tx, &in_flight, &history, &data_dir, fp, addrs, port,
+                        );
+                    }
                 }
             }
         });
@@ -148,6 +192,66 @@ impl Core {
     }
 }
 
+/// 双向注册(M4):对一个刚被 `Seen`、且当前不是 `Reachable` 的对端,起一条
+/// 独立线程做回连探测(`TransportManager::probe_reachable`),据结果把
+/// `Registered`/`Unreachable` 事件回灌进 discovery 事件通道(见调用处注释,
+/// 与 mDNS 发现共用同一条通道,天然串行化地喂给 roster)。
+///
+/// 锁纪律:`in_flight` 只在起线程前后各持有一次短锁(登记/摘除),`history`
+/// 只在探测成功后短暂持有(record + save),两者都不跨越 `probe_reachable`
+/// 内部的阻塞网络 IO——这把锁如果跨了阻塞拨号,会让同一 fp 的所有后续
+/// Seen 事件在等这次探测期间被迫串行阻塞在锁上,而 `in_flight` 集合本身
+/// 已经足够防止探测风暴,不需要用锁再多做这件事。
+#[allow(clippy::too_many_arguments)]
+fn spawn_probe(
+    transport: &Arc<TransportManager>,
+    discovery_tx: &Sender<DiscoveryEvent>,
+    in_flight: &Arc<Mutex<HashSet<String>>>,
+    history: &Arc<Mutex<HistoryStore>>,
+    data_dir: &Path,
+    fingerprint: String,
+    addrs: Vec<IpAddr>,
+    port: u16,
+) {
+    {
+        let mut set = in_flight.lock().expect("in-flight lock");
+        if !set.insert(fingerprint.clone()) {
+            return; // 同一 fp 已有一条探测在飞,不重复起线程
+        }
+    }
+
+    let transport = transport.clone();
+    let discovery_tx = discovery_tx.clone();
+    let in_flight = in_flight.clone();
+    let history = history.clone();
+    let data_dir = data_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let ok = transport.probe_reachable(&fingerprint, &addrs, port);
+        let result_ev = if ok {
+            // 回连成功:这几个地址里至少一个确实可达,记入历史 IP(供将来
+            // mDNS 不可用时的单播兜底探测使用)。
+            let mut h = history.lock().expect("history lock");
+            for ip in &addrs {
+                h.record(*ip);
+            }
+            h.save(&data_dir);
+            drop(h);
+            DiscoveryEvent::Registered {
+                fingerprint: fingerprint.clone(),
+            }
+        } else {
+            DiscoveryEvent::Unreachable {
+                fingerprint: fingerprint.clone(),
+            }
+        };
+        let _ = discovery_tx.send(result_ev);
+        in_flight
+            .lock()
+            .expect("in-flight lock")
+            .remove(&fingerprint);
+    });
+}
+
 fn default_nickname() -> String {
     let host = gethostname::gethostname().to_string_lossy().into_owned();
     host.trim_end_matches(".local").to_string()
@@ -156,6 +260,118 @@ fn default_nickname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    #[test]
+    fn spawn_probe_reports_registered_and_records_history() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(dir_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(dir_b.path()).unwrap());
+        let (msg_tx_a, _msg_rx_a) = std::sync::mpsc::channel();
+        let (msg_tx_b, _msg_rx_b) = std::sync::mpsc::channel();
+        let transport_a = TransportManager::start(id_a, 0, msg_tx_a).unwrap();
+        let transport_b = TransportManager::start(id_b.clone(), 0, msg_tx_b).unwrap();
+
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let history_dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(Mutex::new(HistoryStore::load(history_dir.path())));
+        let local = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+
+        spawn_probe(
+            &transport_a,
+            &disc_tx,
+            &in_flight,
+            &history,
+            history_dir.path(),
+            id_b.fingerprint.clone(),
+            local.clone(),
+            transport_b.port(),
+        );
+
+        match disc_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            DiscoveryEvent::Registered { fingerprint } => {
+                assert_eq!(fingerprint, id_b.fingerprint)
+            }
+            other => panic!("期望 Registered,却收到 {other:?}"),
+        }
+        assert!(
+            in_flight.lock().unwrap().is_empty(),
+            "探测结束后应从 in-flight 集合摘除"
+        );
+        assert!(
+            HistoryStore::load(history_dir.path())
+                .ips()
+                .contains(&local[0]),
+            "回连成功应记入历史 IP 并落盘"
+        );
+    }
+
+    #[test]
+    fn spawn_probe_reports_unreachable_for_dead_port() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(dir_a.path()).unwrap());
+        let (msg_tx_a, _msg_rx_a) = std::sync::mpsc::channel();
+        let transport_a = TransportManager::start(id_a, 0, msg_tx_a).unwrap();
+
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let history_dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(Mutex::new(HistoryStore::load(history_dir.path())));
+        let dead_fp = "0".repeat(64);
+
+        spawn_probe(
+            &transport_a,
+            &disc_tx,
+            &in_flight,
+            &history,
+            history_dir.path(),
+            dead_fp.clone(),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            1, // 无人监听
+        );
+
+        match disc_rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            DiscoveryEvent::Unreachable { fingerprint } => assert_eq!(fingerprint, dead_fp),
+            other => panic!("期望 Unreachable,却收到 {other:?}"),
+        }
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn spawn_probe_skips_when_already_in_flight() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(dir_a.path()).unwrap());
+        let (msg_tx_a, _msg_rx_a) = std::sync::mpsc::channel();
+        let transport_a = TransportManager::start(id_a, 0, msg_tx_a).unwrap();
+
+        let (disc_tx, disc_rx) = std::sync::mpsc::channel();
+        let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        in_flight.lock().unwrap().insert("bbbb".to_string());
+        let history_dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(Mutex::new(HistoryStore::load(history_dir.path())));
+
+        spawn_probe(
+            &transport_a,
+            &disc_tx,
+            &in_flight,
+            &history,
+            history_dir.path(),
+            "bbbb".to_string(),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            1,
+        );
+
+        // 已在飞:不该起新线程探测,也就不该有事件送回。
+        assert!(disc_rx.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(
+            in_flight.lock().unwrap().len(),
+            1,
+            "已在飞的标记不该被这次跳过的调用误摘除"
+        );
+    }
 
     #[test]
     fn start_creates_identity_and_empty_roster() {

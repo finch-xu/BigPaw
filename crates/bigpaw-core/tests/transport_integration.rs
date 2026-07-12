@@ -71,3 +71,36 @@ fn send_to_dead_port_errors() {
     let err = m.send_text(&"0".repeat(64), &LOCAL, 1, "x"); // 端口 1 无人监听
     assert!(err.is_err());
 }
+
+// M4:双向注册回连探测——probe_reachable 只做"拨号+握手+写 Hello",不应
+// 在对端产生消息事件,也不该污染发送方的 outbound 缓存/后续 send_text。
+#[test]
+fn probe_reachable_succeeds_without_polluting_message_path() {
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let ida = Arc::new(Identity::load_or_create(da.path()).unwrap());
+    let idb = Arc::new(Identity::load_or_create(db.path()).unwrap());
+    let (txa, _rxa) = std::sync::mpsc::channel();
+    let (txb, rxb) = std::sync::mpsc::channel();
+
+    let ma = TransportManager::start(ida.clone(), 0, txa).unwrap();
+    let mb = TransportManager::start(idb.clone(), 0, txb).unwrap();
+
+    assert!(ma.probe_reachable(&idb.fingerprint, &LOCAL, mb.port()));
+    // 探测连接只写 Hello,不应让 B 产生任何 TransportEvent(尤其不是消息事件)。
+    assert!(rxb.recv_timeout(Duration::from_millis(500)).is_err());
+
+    // 探测不应污染 outbound 缓存:后续真实发消息仍必须正常工作(独立重拨)。
+    ma.send_text(&idb.fingerprint, &LOCAL, mb.port(), "探测之后")
+        .unwrap();
+    assert_eq!(recv_text(&rxb, 10).body, "探测之后");
+}
+
+#[test]
+fn probe_reachable_fails_for_dead_port() {
+    let d = tempfile::tempdir().unwrap();
+    let id = Arc::new(Identity::load_or_create(d.path()).unwrap());
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let m = TransportManager::start(id, 0, tx).unwrap();
+    assert!(!m.probe_reachable(&"0".repeat(64), &LOCAL, 1)); // 端口 1 无人监听
+}
