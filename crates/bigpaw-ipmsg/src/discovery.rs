@@ -375,7 +375,9 @@ fn file_offer_packet(
     }
 }
 
-/// IPMsg 发现服务:UDP 2425 上的 BR_ENTRY/ANSENTRY/BR_EXIT 收发。
+/// IPMsg 服务:UDP 2425 上的发现(BR_ENTRY/ANSENTRY/BR_EXIT)+ 文本
+/// (SENDMSG/RECVMSG)+ 文件 offer(SENDMSG|FILEATTACHOPT),以及 TCP 2425 上的
+/// GETFILEDATA 供给/拉取、GETDIRFILES 拉取(仅接收方向)。
 /// 独立 crate:零 Tauri、零异步运行时,仅 std::net + socket2 线程模型。
 pub struct IpmsgService {
     stop: Arc<AtomicBool>,
