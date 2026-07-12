@@ -702,6 +702,10 @@ impl TransportManager {
             Ok(Msg::FileReject { .. }) => {
                 if let Some(m) = mgr.upgrade() {
                     m.outgoing.lock().expect("outgoing lock").remove(&xfer_id);
+                    let _ = events.send(TransportEvent::FileFailed {
+                        xfer_id,
+                        reason: "对端已拒绝".to_string(),
+                    });
                 }
             }
             _ => {
