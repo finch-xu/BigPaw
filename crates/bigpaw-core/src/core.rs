@@ -10,18 +10,44 @@ use crate::roster::{DiscoveryEvent, Peer, PeerState, Roster};
 use crate::transport::manager::{
     SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::watch;
 
 /// 历史 IP 单播"唤醒"宣告的发送间隔:串行、低速,不触发 IDS 扫描告警
 /// (设计文档 §11),远高于 brief 要求的 ≥50ms 下限。
 const HISTORY_WAKE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// roster 消费线程从阻塞 `recv` 换成 `recv_timeout` 后的轮询间隔:既是
+/// `shutdown` 停止信号的最长响应延迟上限,也是过期扫描的采样粒度。
+const ROSTER_TICK: Duration = Duration::from_secs(5);
+
+/// 对端超过这个时长未被任何发现通道(mDNS `Seen` 或 UDP 宣告 `Seen`)刷新,
+/// 判定离线——mDNS/UDP 宣告周期通常 20-30s,60s ≈ 2-3 个漏掉的心跳周期,
+/// 兼顾及时性与抖动容错(设计文档 §4 "心跳超时判离线")。这个阈值补的是
+/// mDNS 被墙时的场景:UDP 宣告辅通道只在 `recv_loop` 里发 `Seen`,从不发
+/// `Lost`,单靠它对端下线永远不会被判离线。
+const PEER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 给定 last-seen 时间戳表、当前时刻、超时阈值,算出已过期(需要判离线)的
+/// fingerprint 列表。抽成纯函数是为了不必真等 60s 就能确定性地单测扫描逻辑。
+fn stale_fingerprints(
+    last_seen: &HashMap<String, Instant>,
+    now: Instant,
+    timeout: Duration,
+) -> Vec<String> {
+    last_seen
+        .iter()
+        .filter(|(_, t)| now.duration_since(**t) > timeout)
+        .map(|(fp, _)| fp.clone())
+        .collect()
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -55,6 +81,13 @@ pub struct Core {
     announce: Arc<Mutex<Option<AnnounceService>>>,
     transport: Arc<TransportManager>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
+    /// roster 消费线程的停止信号:`recv_timeout` 每 `ROSTER_TICK` 醒一次
+    /// 检查它,`shutdown` 靠它让线程可终止,不必等 `rx` 断开(见线程内自
+    /// 持的 `tx` 克隆——那把克隆本身就保证了 `rx.recv()` 永不返回 `Err`)。
+    roster_stop: Arc<AtomicBool>,
+    /// `shutdown` 时 `.take()` 拿到唯一所有权后 `join`,与 `discovery`/
+    /// `announce` 字段一致的幂等模式:重复调用第二次拿到 `None` 直接跳过。
+    roster_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Core {
@@ -108,41 +141,93 @@ impl Core {
         let in_flight: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let data_dir = cfg.data_dir.clone();
         let transport_for_thread = transport.clone();
-        std::thread::spawn(move || {
+        let roster_stop = Arc::new(AtomicBool::new(false));
+        let roster_stop_for_thread = roster_stop.clone();
+        let roster_thread = std::thread::spawn(move || {
             let transport = transport_for_thread;
-            while let Ok(ev) = rx.recv() {
-                // Seen 事件在被 apply 消费掉之前,先取出探测需要的字段。
-                let probe_target = match &ev {
-                    DiscoveryEvent::Seen {
-                        fingerprint,
-                        addrs,
-                        port,
-                        ..
-                    } => Some((fingerprint.clone(), addrs.clone(), *port)),
-                    _ => None,
-                };
+            // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
+            // 通道的 Seen 刷新它;超过 PEER_TIMEOUT 未刷新则判离线(见下)。
+            let mut last_seen: HashMap<String, Instant> = HashMap::new();
+            loop {
+                match rx.recv_timeout(ROSTER_TICK) {
+                    Ok(ev) => {
+                        if let DiscoveryEvent::Seen { fingerprint, .. } = &ev {
+                            last_seen.insert(fingerprint.clone(), Instant::now());
+                        }
+                        // Seen 事件在被 apply 消费掉之前,先取出探测需要的字段。
+                        let probe_target = match &ev {
+                            DiscoveryEvent::Seen {
+                                fingerprint,
+                                addrs,
+                                port,
+                                ..
+                            } => Some((fingerprint.clone(), addrs.clone(), *port)),
+                            _ => None,
+                        };
 
-                let mut roster = roster_for_thread.lock().expect("roster lock");
-                let changed = roster.apply(ev);
-                let snapshot = roster.snapshot();
-                drop(roster); // 探测线程的起线程动作不需要跨这把锁
+                        let mut roster = roster_for_thread.lock().expect("roster lock");
+                        let changed = roster.apply(ev);
+                        let snapshot = roster.snapshot();
+                        drop(roster); // 探测线程的起线程动作不需要跨这把锁
 
-                let already_reachable = probe_target.as_ref().is_some_and(|(fp, _, _)| {
-                    snapshot
-                        .iter()
-                        .any(|p| p.fingerprint == *fp && p.state == PeerState::Reachable)
-                });
+                        let already_reachable = probe_target.as_ref().is_some_and(|(fp, _, _)| {
+                            snapshot
+                                .iter()
+                                .any(|p| p.fingerprint == *fp && p.state == PeerState::Reachable)
+                        });
 
-                if changed && watch_tx.send(snapshot).is_err() {
-                    break; // 订阅端全部销毁
-                }
+                        if changed && watch_tx.send(snapshot).is_err() {
+                            break; // 订阅端全部销毁
+                        }
 
-                if let Some((fp, addrs, port)) = probe_target {
-                    if !already_reachable {
-                        spawn_probe(
-                            &transport, &tx, &in_flight, &history, &data_dir, fp, addrs, port,
-                        );
+                        if let Some((fp, addrs, port)) = probe_target {
+                            if !already_reachable {
+                                spawn_probe(
+                                    &transport, &tx, &in_flight, &history, &data_dir, fp, addrs,
+                                    port,
+                                );
+                            }
+                        }
+
+                        // 停止信号也在这里检查,不只是在 Timeout 分支:如果
+                        // 同进程里还有别的 Core 实例在真实网络上持续
+                        // mDNS/UDP 宣告(测试并发场景下常见),recv_timeout
+                        // 会不断命中 Ok(ev) 而不是 Timeout,单靠 Timeout 分支
+                        // 判断会让 shutdown 被这些不相关的事件流无限期拖住。
+                        if roster_stop_for_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if roster_stop_for_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        // 过期扫描:超过 PEER_TIMEOUT 未再被任何通道 Seen 的
+                        // 对端 → Lost(→Offline)。这是 UDP 宣告通道(mDNS 被
+                        // 墙时唯一存活的通道)从不发 Lost 的唯一兜底。
+                        let now = Instant::now();
+                        let stale = stale_fingerprints(&last_seen, now, PEER_TIMEOUT);
+                        if !stale.is_empty() {
+                            let mut roster = roster_for_thread.lock().expect("roster lock");
+                            let mut any = false;
+                            for fp in &stale {
+                                if roster.apply(DiscoveryEvent::Lost {
+                                    fingerprint: fp.clone(),
+                                }) {
+                                    any = true;
+                                }
+                            }
+                            let snapshot = roster.snapshot();
+                            drop(roster);
+                            for fp in stale {
+                                last_seen.remove(&fp); // 已判离线,别反复触发
+                            }
+                            if any && watch_tx.send(snapshot).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -156,6 +241,8 @@ impl Core {
             announce,
             transport,
             events_rx: Mutex::new(Some(msg_rx)),
+            roster_stop,
+            roster_thread: Mutex::new(Some(roster_thread)),
         })
     }
 
@@ -221,8 +308,13 @@ impl Core {
     }
 
     /// 主动下线:注销 mDNS(发 goodbye)+ 停止 UDP 宣告收发,对端立刻收到
-    /// Lost 而不是等 TTL 过期。两路都幂等(`Mutex<Option<_>>::take` 保证
-    /// 重复调用时第二次拿到 `None`,直接跳过)。
+    /// Lost 而不是等 TTL 过期;随后停掉 roster 消费线程并 join 它,确保
+    /// `shutdown` 返回时线程已经真正退出(不是"发个信号就当作已停")。
+    /// 三路都幂等(`Mutex<Option<_>>::take` 保证重复调用时第二次拿到
+    /// `None`,直接跳过)。
+    ///
+    /// roster 线程最长在一个 `ROSTER_TICK`(5s)内响应停止信号并退出,
+    /// 因此本方法最长阻塞 ~5s,而不会永久挂起。
     pub fn shutdown(&self) {
         let discovery = self
             .discovery
@@ -236,6 +328,16 @@ impl Core {
         let announce = self.announce.lock().expect("announce lock poisoned").take();
         if let Some(a) = announce {
             a.shutdown();
+        }
+
+        self.roster_stop.store(true, Ordering::Relaxed);
+        let roster_thread = self
+            .roster_thread
+            .lock()
+            .expect("roster thread lock poisoned")
+            .take();
+        if let Some(h) = roster_thread {
+            let _ = h.join();
         }
     }
 }
@@ -452,5 +554,65 @@ mod tests {
         .unwrap();
         core.shutdown();
         core.shutdown(); // 第二次调用不得 panic
+    }
+
+    #[test]
+    fn shutdown_joins_roster_thread_without_hanging() {
+        // roster 消费线程从阻塞 recv 换成 recv_timeout(ROSTER_TICK=5s)+
+        // stop 标志后,shutdown 必须真正 join 到它、而不是发个信号就返回。
+        // 用耗时上限断言防止回归成"发信号但不 join"或"join 却永久挂起"。
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        let start = Instant::now();
+        core.shutdown();
+        assert!(
+            start.elapsed() < ROSTER_TICK + Duration::from_secs(2),
+            "shutdown 应在一个 ROSTER_TICK 内 join 到 roster 线程并返回,\
+             实际耗时 {:?}(说明线程没被真正停止/join,或者 join 挂住了)",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn stale_fingerprints_finds_only_expired_entries() {
+        // 纯函数单测:不必真等 PEER_TIMEOUT(60s),用人为构造的时间戳即可
+        // 确定性地验证过期判定逻辑——这也是它被抽出来独立于线程之外的原因。
+        let now = Instant::now();
+        let mut last_seen: HashMap<String, Instant> = HashMap::new();
+        last_seen.insert("fresh".to_string(), now);
+        last_seen.insert(
+            "stale".to_string(),
+            now.checked_sub(Duration::from_secs(120))
+                .expect("测试机器已启动超过 120s"),
+        );
+
+        let stale = stale_fingerprints(&last_seen, now, Duration::from_secs(60));
+        assert_eq!(stale, vec!["stale".to_string()]);
+    }
+
+    #[test]
+    fn stale_fingerprints_empty_when_nothing_expired() {
+        let now = Instant::now();
+        let mut last_seen: HashMap<String, Instant> = HashMap::new();
+        last_seen.insert("fresh".to_string(), now);
+        assert!(stale_fingerprints(&last_seen, now, Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn stale_fingerprints_boundary_is_strictly_greater_than_timeout() {
+        // 恰好等于超时阈值不算过期(用 `>` 而不是 `>=`),避免在超时边界
+        // 上因为调用时机的微小抖动而误判——只有真正超过才判离线。
+        let now = Instant::now();
+        let mut last_seen: HashMap<String, Instant> = HashMap::new();
+        last_seen.insert(
+            "exactly-at-boundary".to_string(),
+            now.checked_sub(Duration::from_secs(60))
+                .expect("测试机器已启动超过 60s"),
+        );
+        assert!(stale_fingerprints(&last_seen, now, Duration::from_secs(60)).is_empty());
     }
 }
