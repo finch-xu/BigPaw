@@ -12,10 +12,15 @@ export default function App() {
   const setPeers = useAppStore((s) => s.setPeers);
   const select = useAppStore((s) => s.select);
   const appendMessage = useAppStore((s) => s.appendMessage);
+  const upsertTransfer = useAppStore((s) => s.upsertTransfer);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let unMsgListen: (() => void) | undefined;
+    let unFileOffered: (() => void) | undefined;
+    let unFileProgress: (() => void) | undefined;
+    let unFileDone: (() => void) | undefined;
+    let unFileFailed: (() => void) | undefined;
     let cancelled = false;
     (async () => {
       try {
@@ -25,13 +30,50 @@ export default function App() {
           "message://received",
           (e) => appendMessage({ ...e.payload, direction: "in" }),
         );
+        const unOffered = await listen<{
+          xferId: string;
+          peerFp: string;
+          name: string;
+          size: number;
+        }>("file://offered", (e) =>
+          upsertTransfer({
+            ...e.payload,
+            done: 0,
+            direction: "in",
+            status: "offered",
+          }),
+        );
+        const unProgress = await listen<{ xferId: string; done: number; total: number }>(
+          "file://progress",
+          (e) =>
+            upsertTransfer({
+              xferId: e.payload.xferId,
+              done: e.payload.done,
+              size: e.payload.total,
+            }),
+        );
+        const unDone = await listen<{ xferId: string; path: string }>("file://done", (e) =>
+          upsertTransfer({ xferId: e.payload.xferId, status: "done", path: e.payload.path }),
+        );
+        const unFailed = await listen<{ xferId: string; reason: string }>(
+          "file://failed",
+          (e) => upsertTransfer({ xferId: e.payload.xferId, status: "failed" }),
+        );
         if (cancelled) {
           un();
           unMsg();
+          unOffered();
+          unProgress();
+          unDone();
+          unFailed();
           return;
         }
         unlisten = un;
         unMsgListen = unMsg;
+        unFileOffered = unOffered;
+        unFileProgress = unProgress;
+        unFileDone = unDone;
+        unFileFailed = unFailed;
         setSelf(await invoke<SelfInfo>("get_self_info"));
         setPeers(await invoke<Peer[]>("get_roster"));
       } catch (e) {
@@ -42,8 +84,12 @@ export default function App() {
       cancelled = true;
       unlisten?.();
       unMsgListen?.();
+      unFileOffered?.();
+      unFileProgress?.();
+      unFileDone?.();
+      unFileFailed?.();
     };
-  }, [setSelf, setPeers, appendMessage]);
+  }, [setSelf, setPeers, appendMessage, upsertTransfer]);
 
   const online = peers.filter((p) => p.state !== "offline");
 
