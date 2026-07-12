@@ -25,7 +25,10 @@ impl Discovery {
     ) -> Result<Self, mdns_sd::Error> {
         let daemon = ServiceDaemon::new()?;
         // 实例名用 fp 前 16 位:稳定、可辨识、避免昵称冲突/非法字符
-        let instance = &identity.fingerprint[..16];
+        let instance = identity
+            .fingerprint
+            .get(..16)
+            .ok_or_else(|| mdns_sd::Error::Msg("fingerprint 短于 16 字符".into()))?;
         let host = format!("{instance}.local.");
         let props = [
             ("v", "1"),
@@ -85,9 +88,10 @@ impl Discovery {
 
     /// 主动注销(发 mDNS goodbye)并停掉守护。
     pub fn shutdown(self) {
-        let _ = self.daemon.unregister(&self.fullname);
-        // 给 goodbye 报文一点发出时间
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Ok(rx) = self.daemon.unregister(&self.fullname) {
+            // 等 goodbye 真正处理完,上限 1s,比盲睡 200ms 更确定
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+        }
         let _ = self.daemon.shutdown();
     }
 }

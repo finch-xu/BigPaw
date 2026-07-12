@@ -30,6 +30,37 @@ fn get_roster(core: State<'_, AppCore>) -> Vec<Peer> {
     core.0.roster_snapshot()
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MessageDto {
+    peer_fp: String,
+    id: String,
+    body: String,
+    ts_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SentDto {
+    id: String,
+    ts_ms: u64,
+}
+
+#[tauri::command]
+fn send_text(
+    core: State<'_, AppCore>,
+    fingerprint: String,
+    body: String,
+) -> Result<SentDto, String> {
+    core.0
+        .send_text(&fingerprint, &body)
+        .map(|s| SentDto {
+            id: s.id,
+            ts_ms: s.ts_ms,
+        })
+        .map_err(|e| e.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -50,10 +81,32 @@ pub fn run() {
                 }
             });
 
+            if let Some(msg_rx) = core.take_messages() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    while let Ok(ev) = msg_rx.recv() {
+                        let _ = handle.emit(
+                            "message://received",
+                            MessageDto {
+                                peer_fp: ev.peer_fp,
+                                id: ev.id,
+                                body: ev.body,
+                                ts_ms: ev.ts_ms,
+                            },
+                        );
+                    }
+                });
+            }
+
             app.manage(AppCore(core));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ping, get_self_info, get_roster])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            get_self_info,
+            get_roster,
+            send_text
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {

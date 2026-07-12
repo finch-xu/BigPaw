@@ -12,6 +12,8 @@ pub enum IdentityError {
     Io(#[from] std::io::Error),
     #[error("证书生成失败: {0}")]
     Rcgen(#[from] rcgen::Error),
+    #[error("身份文件不完整:cert 与 key 只剩其一。为避免静默更换身份,请人工处理 data_dir 后重试")]
+    IncompletePair,
 }
 
 pub struct Identity {
@@ -20,16 +22,30 @@ pub struct Identity {
     pub fingerprint: String,
 }
 
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 绝不打印私钥/证书字节
+        f.debug_struct("Identity")
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Identity {
     /// 从 data_dir 加载身份;不存在则生成并落盘(identity.cert.der / identity.key.der,私钥 0600)。
     pub fn load_or_create(data_dir: &Path) -> Result<Self, IdentityError> {
         let cert_path = data_dir.join("identity.cert.der");
         let key_path = data_dir.join("identity.key.der");
-        if cert_path.exists() && key_path.exists() {
+        let cert_exists = cert_path.exists();
+        let key_exists = key_path.exists();
+        if cert_exists && key_exists {
             return Ok(Self::from_parts(
                 fs::read(&cert_path)?,
                 fs::read(&key_path)?,
             ));
+        }
+        if cert_exists != key_exists {
+            return Err(IdentityError::IncompletePair);
         }
         fs::create_dir_all(data_dir)?;
         let rcgen::CertifiedKey { cert, key_pair } =
@@ -73,6 +89,13 @@ impl Identity {
     }
 }
 
+impl Drop for Identity {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key_der.zeroize();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +133,32 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "私钥必须 0600");
+    }
+
+    #[test]
+    fn half_pair_is_hard_error_not_silent_regeneration() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Identity::load_or_create(dir.path()).unwrap();
+        // 模拟崩溃后只剩证书:删掉私钥
+        std::fs::remove_file(dir.path().join("identity.key.der")).unwrap();
+        let err = Identity::load_or_create(dir.path());
+        assert!(
+            matches!(err, Err(IdentityError::IncompletePair)),
+            "半对文件必须报错而不是静默换身份,got {err:?}"
+        );
+        // 原 fingerprint 不应被覆盖:证书文件仍是旧的
+        let cert = std::fs::read(dir.path().join("identity.cert.der")).unwrap();
+        assert_eq!(a.fingerprint, hex::encode(sha2::Sha256::digest(&cert)));
+    }
+
+    #[test]
+    fn half_pair_missing_cert_is_also_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        Identity::load_or_create(dir.path()).unwrap();
+        std::fs::remove_file(dir.path().join("identity.cert.der")).unwrap();
+        assert!(matches!(
+            Identity::load_or_create(dir.path()),
+            Err(IdentityError::IncompletePair)
+        ));
     }
 }
