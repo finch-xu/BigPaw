@@ -144,29 +144,41 @@ impl Storage {
         Ok(())
     }
 
-    /// 会话时间线一页:messages 与 transfers 合并,`before_ts` 之前(不含)
-    /// 最近 `limit` 条,升序返回。kind 列区分两表来源。
+    /// 会话时间线一页:messages 与 transfers 合并,复合游标 `(ts_ms, id)` 之前
+    /// (不含)最近 `limit` 条,升序返回。kind 列区分两表来源。
+    ///
+    /// 排序与游标比较都用双键 `(ts_ms DESC, id DESC)`:仅按 `ts_ms` 比较在
+    /// 同一毫秒内插入多条记录时会把游标卡在时间戳相同的一簇中间,导致
+    /// `ts_ms < 游标` 漏掉同毫秒的剩余条目——即"永久丢失"。加入 `id` 作为
+    /// 次级键后,游标变成簇内的一个全序位置,不会再丢条目也不会重复。
+    ///
+    /// `before=None` 表示取最新一页,不设上界。为了只维护一条 SQL(不拆成
+    /// 有/无游标两个 prepare),用一对不可能被真实数据超过的"哨兵"值代入
+    /// 同一查询:`ts_ms=i64::MAX`(真实时间戳不可能达到)、
+    /// `id="\u{10FFFF}"`(Unicode 最大码点;真实 id 是 UUID,纯 ASCII 十六进制
+    /// 加连字符,在 SQLite 默认的 BINARY/memcmp 排序下恒小于该哨兵)。
     pub fn history(
         &self,
         peer_fp: &str,
-        before_ts: Option<i64>,
+        before: Option<(i64, &str)>,
         limit: u32,
     ) -> Result<Vec<HistoryItem>, StorageError> {
         let conn = self.conn.lock().expect("storage lock");
-        let before = before_ts.unwrap_or(i64::MAX);
+        let (before_ts, before_id) = before.unwrap_or((i64::MAX, "\u{10FFFF}"));
         let mut stmt = conn.prepare(
             "SELECT * FROM (
                SELECT 'text' AS kind, id AS k1, peer_fp, direction, body AS k2,
                       NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms
-               FROM messages WHERE peer_fp = ?1 AND ts_ms < ?2
+               FROM messages WHERE peer_fp = ?1
                UNION ALL
                SELECT 'file' AS kind, xfer_id AS k1, peer_fp, direction, name AS k2,
                       status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms
-               FROM transfers WHERE peer_fp = ?1 AND ts_ms < ?2
-             ) ORDER BY ts_ms DESC LIMIT ?3",
+               FROM transfers WHERE peer_fp = ?1
+             ) WHERE ts_ms < ?2 OR (ts_ms = ?2 AND k1 < ?3)
+             ORDER BY ts_ms DESC, k1 DESC LIMIT ?4",
         )?;
         let mut items: Vec<HistoryItem> = stmt
-            .query_map(params![peer_fp, before, limit], row_to_item)?
+            .query_map(params![peer_fp, before_ts, before_id, limit], row_to_item)?
             .collect::<Result<_, _>>()?;
         items.reverse();
         Ok(items)
@@ -174,13 +186,18 @@ impl Storage {
 
     /// 搜索定位的上下文窗:目标时间戳前 `half` 条 + 目标及之后 `half` 条,
     /// 升序返回。两个方向各查一次再拼接,不依赖 OFFSET。
+    ///
+    /// 前半段游标用 `(ts_ms, "")`——空串比任何真实 UUID 都小,所以
+    /// `ts_ms = 目标 AND id < ""` 恒假,等价于单纯 `ts_ms < 目标`:目标本身
+    /// 及所有与目标同毫秒的其它条目都不会落入前半段,全部留给后半段
+    /// (`ts_ms >= 目标`,原样未变)。两段因此互斥、拼接后不重复也不丢条目。
     pub fn history_around(
         &self,
         peer_fp: &str,
         ts_ms: i64,
         half: u32,
     ) -> Result<Vec<HistoryItem>, StorageError> {
-        let mut before = self.history(peer_fp, Some(ts_ms), half)?;
+        let mut before = self.history(peer_fp, Some((ts_ms, "")), half)?;
         let conn = self.conn.lock().expect("storage lock");
         let mut stmt = conn.prepare(
             "SELECT * FROM (
@@ -368,6 +385,14 @@ mod tests {
         s
     }
 
+    /// HistoryItem → 复合游标 (ts_ms, id),供分页测试拼下一页的 `before` 参数。
+    fn cursor(it: &HistoryItem) -> (i64, String) {
+        match it {
+            HistoryItem::Text { id, ts_ms, .. } => (*ts_ms, id.clone()),
+            HistoryItem::File { xfer_id, ts_ms, .. } => (*ts_ms, xfer_id.clone()),
+        }
+    }
+
     #[test]
     fn open_creates_db_and_migrates() {
         let dir = tempfile::tempdir().unwrap();
@@ -440,12 +465,44 @@ mod tests {
             vec![600, 700, 800, 900],
             "第一页是最新 4 条"
         );
-        let page2 = s.history("peerA", Some(600), 4).unwrap();
+        let (t, id) = cursor(&page1[0]);
+        let page2 = s.history("peerA", Some((t, &id)), 4).unwrap();
         assert_eq!(
             page2.iter().map(HistoryItem::ts_ms).collect::<Vec<_>>(),
             vec![200, 300, 400, 500],
             "游标之前的一页,不含游标本身"
         );
+    }
+
+    #[test]
+    fn history_cursor_survives_same_timestamp_boundary() {
+        let s = mem();
+        // 5 条同毫秒消息 + 1 条更早的,页大小 3:边界正好落在同毫秒簇中间
+        for i in 0..5 {
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", 1000).unwrap();
+        }
+        s.insert_message("m_old", "peerA", "in", "old", 500).unwrap();
+        let page1 = s.history("peerA", None, 3).unwrap();
+        assert_eq!(page1.len(), 3);
+        let cursor = |items: &[HistoryItem]| match &items[0] {
+            HistoryItem::Text { id, ts_ms, .. } => (*ts_ms, id.clone()),
+            HistoryItem::File { xfer_id, ts_ms, .. } => (*ts_ms, xfer_id.clone()),
+        };
+        let (t1, i1) = cursor(&page1);
+        let page2 = s.history("peerA", Some((t1, &i1)), 3).unwrap();
+        let (t2, i2) = cursor(&page2);
+        let page3 = s.history("peerA", Some((t2, &i2)), 3).unwrap();
+        let mut all: Vec<String> = [page1, page2, page3]
+            .concat()
+            .iter()
+            .map(|it| match it {
+                HistoryItem::Text { id, .. } => id.clone(),
+                HistoryItem::File { xfer_id, .. } => xfer_id.clone(),
+            })
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 6, "同毫秒簇跨页边界不得丢条目也不得重复");
     }
 
     #[test]

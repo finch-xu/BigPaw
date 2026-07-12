@@ -65,6 +65,9 @@ const PAGE = 50;
 
 const emptyConv = (): Conversation => ({ items: [], hasMore: true, loaded: false });
 
+/** 分页游标用的条目 id:文本用消息 id,文件用 xferId。与后端复合游标 (ts_ms, id) 对齐。 */
+const idOf = (it: TimelineItem): string => (it.kind === "text" ? it.id : it.xferId);
+
 interface AppState {
   self: SelfInfo | null;
   peers: Peer[];
@@ -132,6 +135,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const older = await invoke<TimelineItem[]>("get_history", {
       fingerprint: fp,
       beforeTsMs: conv.items[0].tsMs,
+      beforeId: idOf(conv.items[0]),
       limit: PAGE,
     });
     set((s) => ({

@@ -127,11 +127,19 @@ fn get_history(
     core: State<'_, AppCore>,
     fingerprint: String,
     before_ts_ms: Option<i64>,
+    before_id: Option<String>,
     limit: Option<u32>,
 ) -> Result<Vec<bigpaw_core::storage::HistoryItem>, String> {
+    // before_id 单独 Some 而 before_ts_ms 为 None 时忽略(游标要么整体缺席取
+    // 最新页,要么两段都给);组装成 storage::history 要的复合游标。
+    let before = before_ts_ms.map(|t| (t, before_id.unwrap_or_default()));
     core.0
         .storage()
-        .history(&fingerprint, before_ts_ms, limit.unwrap_or(50))
+        .history(
+            &fingerprint,
+            before.as_ref().map(|(t, id)| (*t, id.as_str())),
+            limit.unwrap_or(50),
+        )
         .map_err(|e| e.to_string())
 }
 
