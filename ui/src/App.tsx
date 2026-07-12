@@ -212,7 +212,7 @@ export default function App() {
         </button>
       </aside>
       {selectedFp ? (
-        <ChatPane fp={selectedFp} />
+        <ChatPane key={selectedFp} fp={selectedFp} />
       ) : (
         <section className="flex flex-1 items-center justify-center text-amber-400">
           大脚猫在等对面上线
