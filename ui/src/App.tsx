@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useAppStore, type Peer, type SelfInfo } from "./store";
+import { IS_TAURI, installMocks } from "./mock";
 import ChatPane from "./ChatPane";
 import SettingsModal from "./SettingsModal";
 
@@ -61,6 +62,10 @@ export default function App() {
   const showSettings = useAppStore((s) => s.showSettings);
 
   useEffect(() => {
+    if (!IS_TAURI) {
+      installMocks();
+      return;
+    }
     // 事件处理里统一走 getState():回调生命周期长于渲染周期,不闭包旧状态
     const st = () => useAppStore.getState();
     let cancelled = false;
