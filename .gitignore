@@ -36,3 +36,6 @@ src-tauri/gen/schemas/
 *.der
 *.pem
 *.key
+
+# 本地开发工具配置
+.claude/
