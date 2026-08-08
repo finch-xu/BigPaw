@@ -1,1 +1,127 @@
 @import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-sans:
+    system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans SC",
+    sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --color-background: var(--background);
+  --color-panel: var(--panel);
+  --color-sidebar: var(--sidebar);
+  --color-foreground: var(--foreground);
+  --color-fg2: var(--fg2);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-border2: var(--border2);
+  --color-hover: var(--hover);
+  --color-active: var(--active);
+  --color-primary: var(--primary);
+  --color-primary-strong: var(--primary-strong);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-bubble-in: var(--bubble-in);
+  --color-bubble-in-border: var(--bubble-in-border);
+  --color-bubble-out: var(--bubble-out);
+  --color-bubble-out-fg: var(--bubble-out-fg);
+  --color-success: var(--success);
+  --color-destructive: var(--destructive);
+  --color-warning: var(--warning);
+  --color-warning-fg: var(--warning-fg);
+  --color-warning-bg: var(--warning-bg);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+}
+
+:root {
+  --background: #fbfdfe;
+  --panel: #f6fafc;
+  --sidebar: #eef4f9;
+  --foreground: #25313a;
+  --fg2: #54626e;
+  --muted-foreground: #8a98a5;
+  --border: #dde7ee;
+  --border2: #e9f0f5;
+  --hover: #e4eef6;
+  --active: #dcebf7;
+  --primary: #4592c6;
+  --primary-strong: #3679a8;
+  --primary-foreground: #ffffff;
+  --bubble-in: #ffffff;
+  --bubble-in-border: #dbe7f0;
+  --bubble-out: #4592c6;
+  --bubble-out-fg: #ffffff;
+  --success: #43ab92;
+  --destructive: #d0604f;
+  --warning: #d9a03f;
+  --warning-fg: #8a6414;
+  --warning-bg: #fdf6e8;
+  --radius: 0.75rem;
+  --avatar-1-bg: #d7e9f7; --avatar-1-fg: #2e6da4;
+  --avatar-2-bg: #d3eff0; --avatar-2-fg: #1f7e84;
+  --avatar-3-bg: #e4e2f7; --avatar-3-fg: #5b53b8;
+  --avatar-4-bg: #d9f0e1; --avatar-4-fg: #2e8b5f;
+  --avatar-5-bg: #fbe8d7; --avatar-5-fg: #b06a2a;
+  --avatar-6-bg: #f9e0e7; --avatar-6-fg: #b0506e;
+}
+
+.dark {
+  --background: #16191c;
+  --panel: #1b1f23;
+  --sidebar: #14171a;
+  --foreground: #eef1f4;
+  --fg2: #c3cad1;
+  --muted-foreground: #8b959e;
+  --border: #2a3037;
+  --border2: #23282e;
+  --hover: #22272c;
+  --active: rgba(111, 168, 212, 0.16);
+  --primary: #6fa8d4;
+  --primary-strong: #8ec0e4;
+  --primary-foreground: #10161b;
+  --bubble-in: #22272c;
+  --bubble-in-border: #2a3037;
+  --bubble-out: #35678f;
+  --bubble-out-fg: #eef1f4;
+  --success: #4bb39a;
+  --destructive: #d76a5a;
+  --warning: #d7a042;
+  --warning-fg: #d7a042;
+  --warning-bg: #2a2416;
+  --avatar-1-bg: #24455e; --avatar-1-fg: #9ec9ea;
+  --avatar-2-bg: #1e4a4d; --avatar-2-fg: #8ed4d8;
+  --avatar-3-bg: #3a3763; --avatar-3-fg: #b9b3ea;
+  --avatar-4-bg: #23503a; --avatar-4-fg: #93d4b0;
+  --avatar-5-bg: #54402a; --avatar-5-fg: #e5b285;
+  --avatar-6-bg: #543039; --avatar-6-fg: #e8a4b8;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--primary) 25%, transparent);
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 9px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
