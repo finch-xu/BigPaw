@@ -27,9 +27,15 @@ use tokio::sync::watch;
 /// (设计文档 §11),远高于 brief 要求的 ≥50ms 下限。
 const HISTORY_WAKE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// roster 消费线程从阻塞 `recv` 换成 `recv_timeout` 后的轮询间隔:既是
-/// `shutdown` 停止信号的最长响应延迟上限,也是过期扫描的采样粒度。
+/// roster 线程的过期扫描节奏(last-seen 超时判离线的采样粒度)。
+/// 注意它不再是停止信号的响应延迟——那由 `ROSTER_POLL` 决定:早期两者
+/// 共用一个值,导致无事件流入时(界面"正在搜索局域网设备…")退出 app
+/// 要死等满 5s 才能 join 到该线程。
 const ROSTER_TICK: Duration = Duration::from_secs(5);
+
+/// roster 线程 `recv_timeout` 的轮询粒度 = `shutdown` 停止信号的最长响应
+/// 延迟。与其余组件的中断步长同量级(announce/ipmsg 的 SLEEP_STEP=200ms)。
+const ROSTER_POLL: Duration = Duration::from_millis(200);
 
 /// 对端超过这个时长未被任何发现通道(mDNS `Seen` 或 UDP 宣告 `Seen`)刷新,
 /// 判定离线——mDNS/UDP 宣告周期通常 20-30s,60s ≈ 2-3 个漏掉的心跳周期,
@@ -261,8 +267,11 @@ impl Core {
             // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
             // 通道的 Seen 刷新它;超过 PEER_TIMEOUT 未刷新则判离线(见下)。
             let mut last_seen: HashMap<String, Instant> = HashMap::new();
+            // 过期扫描按 ROSTER_TICK 节奏;recv 轮询按 ROSTER_POLL 粒度。
+            // 两者解耦:停止信号 200ms 内可见,扫描频率不因此提高 25 倍。
+            let mut last_scan = Instant::now();
             loop {
-                match rx.recv_timeout(ROSTER_TICK) {
+                match rx.recv_timeout(ROSTER_POLL) {
                     Ok(ev) => {
                         if let DiscoveryEvent::Seen {
                             fingerprint,
@@ -340,6 +349,12 @@ impl Core {
                         if roster_stop_for_thread.load(Ordering::Relaxed) {
                             break;
                         }
+                        // 未到扫描节奏就继续轮询:这个分支现在每 ROSTER_POLL
+                        // (200ms)就会命中一次,扫描本身仍按 ROSTER_TICK 执行。
+                        if last_scan.elapsed() < ROSTER_TICK {
+                            continue;
+                        }
+                        last_scan = Instant::now();
                         // 过期扫描:超过 PEER_TIMEOUT 未再被任何通道 Seen 的
                         // 对端 → Lost(→Offline)。这是 UDP 宣告通道(mDNS 被
                         // 墙时唯一存活的通道)从不发 Lost 的唯一兜底。
@@ -625,8 +640,10 @@ impl Core {
     /// 三路都幂等(`Mutex<Option<_>>::take` 保证重复调用时第二次拿到
     /// `None`,直接跳过)。
     ///
-    /// roster 线程最长在一个 `ROSTER_TICK`(5s)内响应停止信号并退出,
-    /// 因此本方法最长阻塞 ~5s,而不会永久挂起。
+    /// roster 线程最长在一个 `ROSTER_POLL`(200ms)内响应停止信号并退出;
+    /// 加上 mDNS goodbye(≤1s)与 announce/ipmsg 的 join(各 ≤~0.7s),
+    /// 本方法整体亚秒~2s 量级返回,不会永久挂起,也不再出现"无联系人时
+    /// 退出 app 卡 5s"(旧行为:停止信号要等满一个 ROSTER_TICK 才被看到)。
     pub fn shutdown(&self) {
         let discovery = self
             .discovery
@@ -1027,10 +1044,14 @@ mod tests {
         .unwrap();
         let start = Instant::now();
         core.shutdown();
+        // 3s = 各组件优雅关闭上界之和(mDNS goodbye ≤1s + announce join ≤0.7s
+        // + ipmsg join ≤0.7s)留出余量;关键是它显著小于 ROSTER_TICK(5s),
+        // 若 roster 线程回归成"死等满一个 tick 才看停止标志",此断言必失败。
+        // 用户可感知的现象即"无联系人(无事件流)时退出 app 卡 ~5s"。
         assert!(
-            start.elapsed() < ROSTER_TICK + Duration::from_secs(2),
-            "shutdown 应在一个 ROSTER_TICK 内 join 到 roster 线程并返回,\
-             实际耗时 {:?}(说明线程没被真正停止/join,或者 join 挂住了)",
+            start.elapsed() < Duration::from_secs(3),
+            "shutdown 应亚秒级响应停止信号(轮询粒度与过期扫描节奏解耦),\
+             实际耗时 {:?}(说明 roster 线程在死等 recv_timeout 满 ROSTER_TICK)",
             start.elapsed()
         );
     }
