@@ -17,10 +17,35 @@ fn data_dir(app: &AppHandle) -> PathBuf {
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         #[cfg(target_os = "macos")]
-        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            reapply_dock_icon();
+        }
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+/// dev 裸二进制(`cargo tauri dev`)没有 .app bundle 图标:Tauri 只在启动
+/// Ready 时运行时设置一次 Dock 图标,而 Accessory→Regular 重新入 Dock 后
+/// 该图标丢失,macOS 回退为通用可执行文件("控制台")图标。切回 Regular 后
+/// 重设一次即可;打包后的 .app 图标来自 bundle,重设的是同一张图,无害。
+#[cfg(target_os = "macos")]
+fn reapply_dock_icon() {
+    use objc2::{AllocAnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    // 256px(128@2x)恰好是 Dock 的最大显示规格,再大只是浪费内存。
+    const ICON_PNG: &[u8] = include_bytes!("../icons/128x128@2x.png");
+    let Some(mtm) = MainThreadMarker::new() else {
+        return; // AppKit 只能主线程碰;调用点都在主线程事件回调里,这是保险
+    };
+    let ns_app = NSApplication::sharedApplication(mtm);
+    let data = NSData::with_bytes(ICON_PNG);
+    if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &data) {
+        unsafe { ns_app.setApplicationIconImage(Some(&icon)) };
     }
 }
 

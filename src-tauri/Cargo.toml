@@ -18,3 +18,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bigpaw-core = { path = "../crates/bigpaw-core" }
 tokio = { version = "1", features = ["time"] }
+
+# 重设 Dock 图标用(见 lib.rs reapply_dock_icon):特性与 tauri 自身声明的
+# 重合,不引入新的编译单元。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSImage"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
