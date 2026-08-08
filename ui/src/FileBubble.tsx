@@ -49,39 +49,42 @@ export default function FileBubble({ item }: { item: FileItem }) {
   }
 
   return (
-    <div className="inline-block max-w-[70%] rounded-lg border border-amber-200 bg-white px-3 py-2 text-left text-sm">
+    <div className="inline-block max-w-full rounded-2xl border border-bubble-in-border bg-bubble-in px-3.5 py-2.5 text-left text-sm">
       <div className="flex items-center gap-2">
         <span className="truncate font-medium" title={item.name}>
           {item.isDir ? "📁" : "📎"} {item.name}
         </span>
         {!(item.isDir && item.size === 0) && (
-          <span className="shrink-0 text-xs text-amber-600">{formatSize(item.size)}</span>
+          <span className="shrink-0 text-xs text-muted-foreground">{formatSize(item.size)}</span>
         )}
       </div>
       {item.status === "active" && (
-        <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-amber-100">
-          <div className="h-full bg-amber-700 transition-[width]" style={{ width: `${pct}%` }} />
+        <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-border2">
+          <div className="h-full rounded-full bg-primary transition-[width]" style={{ width: `${pct}%` }} />
         </div>
       )}
-      <div className="mt-1 flex items-center gap-2 text-xs text-amber-700">
-        <span>
+      <div className="mt-1.5 flex items-center gap-2 text-xs text-fg2">
+        <span className={item.status === "failed" ? "text-destructive" : undefined}>
           {item.direction === "in" ? "接收" : "发送"} · {STATUS_LABEL[item.status]}
         </span>
         {item.direction === "in" && item.status === "offered" && (
           <>
             <button
               onClick={accept}
-              className="rounded bg-amber-800 px-2 py-0.5 text-white hover:bg-amber-700"
+              className="rounded-full bg-primary px-3 py-0.5 text-primary-foreground hover:bg-primary-strong"
             >
               接受
             </button>
-            <button onClick={reject} className="rounded border border-amber-300 px-2 py-0.5 hover:bg-amber-100">
+            <button
+              onClick={reject}
+              className="rounded-full border border-border px-3 py-0.5 hover:bg-hover"
+            >
               拒绝
             </button>
           </>
         )}
         {item.status === "done" && item.path && (
-          <span className="truncate text-amber-600" title={item.path}>
+          <span className="truncate text-muted-foreground" title={item.path}>
             已保存: {item.path}
           </span>
         )}
