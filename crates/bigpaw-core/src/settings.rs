@@ -8,6 +8,8 @@ use std::path::Path;
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     pub nickname: Option<String>,
+    /// 自我归属分组(M7a):单层组名,None=未设置。广播给全网对端(含飞秋)。
+    pub group: Option<String>,
     pub download_dir: Option<String>,
     pub ipmsg_enabled: bool,
     pub excluded_interfaces: Vec<String>,
@@ -17,6 +19,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             nickname: None,
+            group: None,
             download_dir: None,
             ipmsg_enabled: true, // 与 M5 现状一致:默认尝试启用兼容层
             excluded_interfaces: Vec::new(),
@@ -54,6 +57,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Settings {
             nickname: Some("大脚猫".to_string()),
+            group: None,
             download_dir: Some("/tmp/dl".to_string()),
             ipmsg_enabled: false,
             excluded_interfaces: Vec::new(),
@@ -74,12 +78,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Settings {
             nickname: Some("大脚猫".to_string()),
+            group: None,
             download_dir: Some("/tmp/dl".to_string()),
             ipmsg_enabled: false,
             excluded_interfaces: vec!["eth0".to_string(), "wlan0".to_string()],
         };
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()), s);
+    }
+
+    #[test]
+    fn group_roundtrip_and_old_json_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings {
+            group: Some("研发部".to_string()),
+            ..Settings::default()
+        };
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).group, Some("研发部".to_string()));
+        // 旧配置无 group 字段 → None
+        let old: Settings = serde_json::from_str(r#"{"nickname":"旧"}"#).unwrap();
+        assert_eq!(old.group, None);
     }
 
     #[test]

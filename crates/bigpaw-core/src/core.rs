@@ -2187,6 +2187,7 @@ mod tests {
             dir.path(),
             &crate::settings::Settings {
                 nickname: Some("设置里的名字".to_string()),
+                group: None,
                 download_dir: None,
                 ipmsg_enabled: true,
                 excluded_interfaces: Vec::new(),
@@ -2209,6 +2210,7 @@ mod tests {
             dir.path(),
             &crate::settings::Settings {
                 nickname: None,
+                group: None,
                 download_dir: None,
                 ipmsg_enabled: false,
                 excluded_interfaces: Vec::new(),
