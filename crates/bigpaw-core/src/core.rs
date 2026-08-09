@@ -914,6 +914,11 @@ impl Core {
             }
         };
         if changed {
+            // 本方法依赖调用方(壳层 set_settings)串行调用:diff-and-set 在
+            // `nickname` 锁内原子完成,但下面三路通知用的是锁外局部变量
+            // `new_nick`,并发调用间无互斥——若未来把 set_settings 改成 async
+            // 并允许并发调用,两次改名可能在这里乱序执行,导致 mdns/announce/
+            // ipmsg 三路里注册的值和内存里的 `self.nickname` 不一致,且不会自愈。
             {
                 let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
                 if let Some(d) = discovery.as_mut() {

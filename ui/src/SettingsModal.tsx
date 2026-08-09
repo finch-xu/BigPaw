@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import { useAppStore, type NetIface, type Settings } from "./store";
+import { useAppStore, type NetIface, type SelfInfo, type Settings } from "./store";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 import { IS_TAURI } from "./mock";
 
@@ -59,12 +59,23 @@ export default function SettingsModal() {
   }, []);
 
   async function save(next: Settings, restartHint: boolean) {
+    const prevNickname = settings?.nickname ?? null;
     setSettings(next);
     if (!IS_TAURI) return;
     try {
       await invoke("set_settings", { value: next });
       if (restartHint) setNeedRestart(true);
       setError("");
+      // 昵称热生效后对端立即看到新名字、这里设置页也已显示新值,但本机侧栏
+      // 头部(App.tsx 的 self.nickname)只在挂载时拉过一次,不会跟着变——
+      // 设置页又刚去掉"重启后生效"提示,不补拉会让用户以为改名没生效。
+      if (next.nickname !== prevNickname) {
+        try {
+          useAppStore.getState().setSelf(await invoke<SelfInfo>("get_self_info"));
+        } catch {
+          // 拉 self 失败不影响本次保存已经成功;不额外报错,避免掩盖已成功的保存结果
+        }
+      }
     } catch (e) {
       // 回滚:不能恢复"本次调用开始时"的快照——多个 save 连续触发时(如网络接口区
       // 连点几个 checkbox),陈旧快照会把后一次已成功落盘的改动从 UI 上抹掉。
