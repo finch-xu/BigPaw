@@ -38,7 +38,7 @@ pub struct Discovery {
     // 发现/浏览逻辑本身不需要它们。
     /// 本机身份指纹,写进 TXT 的 "fp" 字段。
     fingerprint: String,
-    /// 当前昵称,写进 TXT 的 "nick" 字段(本步骤内不支持运行时改名)。
+    /// 当前昵称,写进 TXT 的 "nick" 字段。
     nickname: String,
     /// 注册用的服务端口(真实监听端口,非 mDNS 自身端口)。
     port: u16,
@@ -193,6 +193,14 @@ impl Discovery {
         self.re_register()
     }
 
+    /// 运行时改名(昵称热生效):更新自持昵称后走既有 `re_register`
+    /// (unregister + 以新 TXT 重新 register,fire-and-forget,见其文档注释)。
+    /// BigPaw 对端通过 TXT 变更即时看到新名字。
+    pub fn set_nickname(&mut self, nickname: &str) -> Result<(), mdns_sd::Error> {
+        self.nickname = nickname.to_string();
+        self.re_register()
+    }
+
     /// unregister 旧实例、register 一份新构建的 ServiceInfo,重建
     /// `enable_addr_auto` 的地址集合(只在 `apply_exclusions` 确认清单真变化
     /// 后调用,见其文档注释与文件头坑位说明)。instance/host 不变,
@@ -279,5 +287,18 @@ mod tests {
         let (newly_excluded, re_enabled) = exclusion_diff(&prev, &[]);
         assert!(newly_excluded.is_empty());
         assert_eq!(re_enabled, vec!["eth0".to_string(), "wlan0".to_string()]);
+    }
+
+    #[test]
+    fn build_service_info_embeds_nickname_in_txt() {
+        let info = build_service_info(
+            "abcdef0123456789",
+            "abcdef0123456789.local.",
+            &"a".repeat(64),
+            "新昵称",
+            4600,
+        )
+        .unwrap();
+        assert_eq!(info.get_property_val_str("nick"), Some("新昵称"));
     }
 }
