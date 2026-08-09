@@ -6,6 +6,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 pub mod core;
 pub mod discovery;
+pub mod groups;
 pub mod identity;
 pub mod net_ifaces;
 pub mod roster;

@@ -1,9 +1,10 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useAppStore, type Peer, type SelfInfo } from "./store";
+import { useAppStore, type Group, type Peer, type SelfInfo } from "./store";
 import ChatPane from "./ChatPane";
 import SettingsModal from "./SettingsModal";
+import CreateGroupModal from "./CreateGroupModal";
 import Sidebar from "./Sidebar";
 import EmptyState from "./EmptyState";
 import { IS_TAURI, installMocks } from "./mock";
@@ -11,6 +12,7 @@ import { IS_TAURI, installMocks } from "./mock";
 export default function App() {
   const selectedFp = useAppStore((s) => s.selectedFp);
   const showSettings = useAppStore((s) => s.showSettings);
+  const showCreateGroup = useAppStore((s) => s.showCreateGroup);
 
   useEffect(() => {
     if (!IS_TAURI) {
@@ -26,10 +28,12 @@ export default function App() {
         // 先订阅再拉快照:快照是全量状态,晚到的快照覆盖早到的事件也不会丢数据
         const subs = await Promise.all([
           listen<Peer[]>("roster://updated", (e) => st().setPeers(e.payload)),
-          listen<{ peerFp: string; id: string; body: string; tsMs: number }>(
+          listen<{ peerFp: string; id: string; body: string; tsMs: number; senderFp: string | null }>(
             "message://received",
             (e) => st().appendText({ kind: "text", direction: "in", ...e.payload }),
           ),
+          // 群列表变化(M7c):被拉群/成员变更/被移出都走全量替换
+          listen<Group[]>("group://updated", (e) => st().setGroups(e.payload)),
           listen<{ xferId: string; peerFp: string; name: string; size: number; isDir: boolean }>(
             "file://offered",
             (e) =>
@@ -59,6 +63,7 @@ export default function App() {
         st().setPeers(await invoke<Peer[]>("get_roster"));
         st().setIpmsg(await invoke<{ available: boolean; enabled: boolean }>("ipmsg_status"));
         await st().loadConversations(); // 消息视图数据源(M7b)
+        await st().loadGroups(); // 已加入的群(M7c)
       } catch (e) {
         console.error("初始化失败:", e);
       }
@@ -74,6 +79,7 @@ export default function App() {
       <Sidebar />
       {selectedFp ? <ChatPane key={selectedFp} fp={selectedFp} /> : <EmptyState />}
       {showSettings && <SettingsModal />}
+      {showCreateGroup && <CreateGroupModal />}
     </main>
   );
 }

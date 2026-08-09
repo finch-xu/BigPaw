@@ -13,14 +13,23 @@ function relTime(ts: number): string {
   return d.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
-/** 消息视图(M7b):有会话往来的对象按最后一条消息时间倒序,带未读角标。 */
+/** 消息视图(M7b/M7c):有会话往来的对象 + 已加入的群,按最后消息时间倒序。
+ * 尚无消息的群也显示(tsMs=0 沉底),否则新建的群没有入口。 */
 export default function ConversationList() {
   const peers = useAppStore((s) => s.peers);
+  const groups = useAppStore((s) => s.groups);
   const convSummaries = useAppStore((s) => s.convSummaries);
   const unread = useAppStore((s) => s.unread);
   const selectedFp = useAppStore((s) => s.selectedFp);
 
-  const rows = Object.entries(convSummaries).sort((a, b) => b[1].tsMs - a[1].tsMs);
+  const rows: Array<[string, { tsMs: number; snippet: string; kind: "text" | "file" }]> =
+    Object.entries(convSummaries);
+  for (const g of groups) {
+    if (!convSummaries[g.groupId]) {
+      rows.push([g.groupId, { tsMs: 0, snippet: "群已创建,来说点什么吧", kind: "text" }]);
+    }
+  }
+  rows.sort((a, b) => b[1].tsMs - a[1].tsMs);
 
   if (rows.length === 0) {
     return (
@@ -33,8 +42,9 @@ export default function ConversationList() {
   return (
     <ul className="space-y-0.5">
       {rows.map(([fp, sum]) => {
+        const group = groups.find((g) => g.groupId === fp);
         const peer = peers.find((p) => p.fingerprint === fp);
-        const name = peer?.nickname ?? fp.slice(0, 8);
+        const name = group ? group.name : (peer?.nickname ?? fp.slice(0, 8));
         const n = unread[fp] ?? 0;
         return (
           <li
@@ -55,9 +65,16 @@ export default function ConversationList() {
             </div>
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline justify-between gap-2">
-                <span className="truncate text-sm font-medium">{name}</span>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate text-sm font-medium">{name}</span>
+                  {group && (
+                    <span className="shrink-0 rounded-md bg-border2 px-1.5 py-0.5 text-[10px] font-medium text-fg2">
+                      群
+                    </span>
+                  )}
+                </span>
                 <span className="shrink-0 text-[10px] text-muted-foreground">
-                  {relTime(sum.tsMs)}
+                  {sum.tsMs > 0 ? relTime(sum.tsMs) : ""}
                 </span>
               </div>
               <div className="truncate text-xs text-muted-foreground">

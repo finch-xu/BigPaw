@@ -5,6 +5,7 @@ use crate::discovery::announce::{
     AnnounceError, AnnounceService, HistoryStore, DEFAULT_ANNOUNCE_PORT,
 };
 use crate::discovery::Discovery;
+use crate::groups::{fan_out_targets, Group, GroupMember, GroupsState, InfoOutcome};
 use crate::identity::{Identity, IdentityError};
 use crate::net_ifaces::{self, IfaceEntry, IfaceSnapshot, IfaceView, InterfaceRegistry};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
@@ -12,6 +13,7 @@ use crate::storage::Storage;
 use crate::transport::manager::{
     MessageEvent, SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
+use crate::transport::proto::Msg;
 use bigpaw_ipmsg::discovery::{BroadcastTargets, IpmsgError, IpmsgEvent, IpmsgService};
 use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
@@ -207,6 +209,12 @@ pub enum CoreError {
     UnknownPeer,
     #[error("storage: {0}")]
     Storage(#[from] crate::storage::StorageError),
+    #[error("群不存在")]
+    UnknownGroup,
+    #[error("仅建群者可修改群")]
+    NotGroupCreator,
+    #[error("群成员必须是原生协议对端(飞秋/IPMsg 用户无法入群)")]
+    InvalidGroupMember,
 }
 
 pub struct CoreConfig {
@@ -273,6 +281,9 @@ pub struct Core {
     /// SQLite 持久化(M6):持久化泵线程、send_text/offer_file 落库、壳层
     /// 历史查询命令共用。`Arc` 是因为泵线程与查询命令并发使用。
     storage: Arc<Storage>,
+    /// 群状态机(M7c):泵线程(入站群帧解释)与命令层(建群/发言)共享。
+    /// 锁纪律同其余字段:临界区只覆盖内存操作,网络扇出全部在 spawn 线程里。
+    groups: Arc<Mutex<GroupsState>>,
 }
 
 /// 一条待决的 ipmsg 文件报价(见 `Core::ipmsg_offers` 字段注释)。
@@ -637,15 +648,47 @@ impl Core {
             }
         });
 
+        // 群状态(M7c):启动从 storage 加载;泵线程与命令层共享。
+        let groups: Arc<Mutex<GroupsState>> = Arc::new(Mutex::new(GroupsState::new(
+            storage.load_groups().unwrap_or_else(|e| {
+                eprintln!("storage: 读取群列表失败(以空表启动): {e}");
+                Vec::new()
+            }),
+        )));
+
         // 持久化泵(M6):transport/ipmsg 的事件先写库、再转发给壳层。
         // take_events() 对外签名不变——壳层拿到的是泵的出口端。
+        // M7c:群帧(TransportEvent::Group)在这里拦截解释(成员校验/LWW/
+        // 落库),转化为 Message/GroupsChanged 后再入泵出口;网络扇出
+        // (GroupLeave 触发的建群者回播)在 handle_group_wire 内 spawn 线程,
+        // 不阻塞泵。
         let (pump_tx, pump_rx) = std::sync::mpsc::channel();
         let storage_for_pump = storage.clone();
+        let groups_for_pump = groups.clone();
+        let roster_for_pump = roster_handle.clone();
+        let transport_for_pump = transport.clone();
+        let self_fp_for_pump = identity.fingerprint.clone();
         std::thread::spawn(move || {
             while let Ok(ev) = msg_rx.recv() {
-                persist_event(&storage_for_pump, &ev);
-                if pump_tx.send(ev).is_err() {
-                    break; // 消费端已销毁
+                let forwarded = match ev {
+                    TransportEvent::Group { from_fp, msg } => handle_group_wire(
+                        from_fp,
+                        msg,
+                        &groups_for_pump,
+                        &storage_for_pump,
+                        &self_fp_for_pump,
+                        &transport_for_pump,
+                        &roster_for_pump,
+                    ),
+                    other => {
+                        persist_event(&storage_for_pump, &other);
+                        Some(other)
+                    }
+                };
+                if let Some(ev) = forwarded {
+                    if pump_tx.send(ev).is_err() {
+                        break; // 消费端已销毁
+                    }
                 }
             }
         });
@@ -669,6 +712,7 @@ impl Core {
             ipmsg_bcast,
             ipmsg_offers,
             storage,
+            groups,
         })
     }
 
@@ -711,7 +755,7 @@ impl Core {
         };
         if let Err(e) =
             self.storage
-                .insert_message(&sent.id, peer_fp, "out", body, sent.ts_ms as i64)
+                .insert_message(&sent.id, peer_fp, "out", body, sent.ts_ms as i64, None)
         {
             eprintln!("storage: 出站消息落库失败: {e}");
         }
@@ -866,6 +910,169 @@ impl Core {
             }
         });
         Ok(())
+    }
+
+    /// 当前已知群列表(M7c),按群名排序。
+    pub fn list_groups(&self) -> Vec<Group> {
+        self.groups.lock().expect("groups lock").list()
+    }
+
+    /// 建群(M7c):成员必须全部是 roster 里的 native 协议对端;成员表自动
+    /// 含自己;version=1。落库后后台扇出 GroupInfo 邀请。
+    pub fn create_group(
+        &self,
+        name: &str,
+        member_fps: &[String],
+    ) -> Result<Group, CoreError> {
+        let members = self.resolve_members(member_fps)?;
+        let group = Group {
+            group_id: crate::transport::proto::new_id(),
+            name: name.trim().to_string(),
+            creator_fp: self.identity.fingerprint.clone(),
+            version: 1,
+            members,
+        };
+        self.groups
+            .lock()
+            .expect("groups lock")
+            .upsert_local(group.clone());
+        self.storage
+            .upsert_group(&group, crate::transport::proto::now_ms() as i64)?;
+        spawn_group_fanout(
+            self.transport.clone(),
+            self.roster_handle.clone(),
+            fan_out_targets(&group, &self.identity.fingerprint),
+            group_info_msg(&group),
+        );
+        Ok(group)
+    }
+
+    /// 变更成员表(M7c,仅建群者):version+1,扇出到新旧成员并集(被移出者
+    /// 也收到新表,据此删除本地群)。
+    pub fn update_group_members(
+        &self,
+        group_id: &str,
+        member_fps: &[String],
+    ) -> Result<Group, CoreError> {
+        let old = self
+            .groups
+            .lock()
+            .expect("groups lock")
+            .get(group_id)
+            .cloned()
+            .ok_or(CoreError::UnknownGroup)?;
+        if old.creator_fp != self.identity.fingerprint {
+            return Err(CoreError::NotGroupCreator);
+        }
+        let members = self.resolve_members(member_fps)?;
+        let updated = Group {
+            version: old.version + 1,
+            members,
+            ..old.clone()
+        };
+        self.groups
+            .lock()
+            .expect("groups lock")
+            .upsert_local(updated.clone());
+        self.storage
+            .upsert_group(&updated, crate::transport::proto::now_ms() as i64)?;
+        // 并集:新成员收到新表,被移出的旧成员也要收到(触发其本地删除)。
+        let mut targets = fan_out_targets(&updated, &self.identity.fingerprint);
+        for m in &old.members {
+            if m.fp != self.identity.fingerprint && !targets.contains(&m.fp) {
+                targets.push(m.fp.clone());
+            }
+        }
+        spawn_group_fanout(
+            self.transport.clone(),
+            self.roster_handle.clone(),
+            targets,
+            group_info_msg(&updated),
+        );
+        Ok(updated)
+    }
+
+    /// 退群(M7c):非建群者 → 通知建群者(尽力)并本地删除;建群者 → 仅本地
+    /// 删除(成员表冻结,不通知,spec 冻结:无群主转让)。群历史保留在库里。
+    pub fn leave_group(&self, group_id: &str) -> Result<(), CoreError> {
+        let group = self
+            .groups
+            .lock()
+            .expect("groups lock")
+            .remove(group_id)
+            .ok_or(CoreError::UnknownGroup)?;
+        self.storage.delete_group(group_id)?;
+        if group.creator_fp != self.identity.fingerprint {
+            spawn_group_fanout(
+                self.transport.clone(),
+                self.roster_handle.clone(),
+                vec![group.creator_fp.clone()],
+                Msg::GroupLeave {
+                    group_id: group_id.to_string(),
+                    member_fp: self.identity.fingerprint.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// 群发言(M7c):落库(direction=out)后后台扇出 GroupText 到全体成员
+    /// (除自己)。离线成员收不到(spec 冻结:无补发);扇出失败静默。
+    pub fn send_group_text(&self, group_id: &str, body: &str) -> Result<SentText, CoreError> {
+        let group = self
+            .groups
+            .lock()
+            .expect("groups lock")
+            .get(group_id)
+            .cloned()
+            .ok_or(CoreError::UnknownGroup)?;
+        let id = crate::transport::proto::new_id();
+        let ts_ms = crate::transport::proto::now_ms();
+        if let Err(e) =
+            self.storage
+                .insert_message(&id, group_id, "out", body, ts_ms as i64, None)
+        {
+            eprintln!("storage: 出站群消息落库失败: {e}");
+        }
+        spawn_group_fanout(
+            self.transport.clone(),
+            self.roster_handle.clone(),
+            fan_out_targets(&group, &self.identity.fingerprint),
+            Msg::GroupText {
+                group_id: group_id.to_string(),
+                id: id.clone(),
+                body: body.to_string(),
+                ts_ms,
+            },
+        );
+        Ok(SentText { id, ts_ms })
+    }
+
+    /// 把成员指纹列表解析成成员表:每个 fp 必须是 roster 里的 native 对端
+    /// (nick 取 roster 当前昵称);自动附加自己(nick=当前昵称)。
+    fn resolve_members(&self, member_fps: &[String]) -> Result<Vec<GroupMember>, CoreError> {
+        let snapshot = self.roster_handle.lock().expect("roster lock").snapshot();
+        let mut members = vec![GroupMember {
+            fp: self.identity.fingerprint.clone(),
+            nick: self.nickname(),
+        }];
+        for fp in member_fps {
+            if *fp == self.identity.fingerprint {
+                continue; // 自己已在表内
+            }
+            let peer = snapshot
+                .iter()
+                .find(|p| p.fingerprint == *fp)
+                .ok_or(CoreError::UnknownPeer)?;
+            if peer.protocol != Protocol::Native {
+                return Err(CoreError::InvalidGroupMember);
+            }
+            members.push(GroupMember {
+                fp: fp.clone(),
+                nick: peer.nickname.clone(),
+            });
+        }
+        Ok(members)
     }
 
     /// 取走事件接收端(只能取一次,由壳层的事件循环消费)。
@@ -1052,7 +1259,7 @@ impl Core {
 fn persist_event(storage: &Storage, ev: &TransportEvent) {
     let result = match ev {
         TransportEvent::Message(m) => {
-            storage.insert_message(&m.id, &m.peer_fp, "in", &m.body, m.ts_ms as i64)
+            storage.insert_message(&m.id, &m.peer_fp, "in", &m.body, m.ts_ms as i64, None)
         }
         TransportEvent::FileOffered {
             xfer_id,
@@ -1077,10 +1284,187 @@ fn persist_event(storage: &Storage, ev: &TransportEvent) {
             storage.update_transfer(xfer_id, "failed", None)
         }
         TransportEvent::FileProgress { .. } => Ok(()),
+        // 群帧在泵线程被 handle_group_wire 拦截,不会走到这里;GroupsChanged
+        // 是它的产物、只供壳层转发。两者都无需在此落库(防御性 no-op)。
+        TransportEvent::Group { .. } | TransportEvent::GroupsChanged(_) => Ok(()),
     };
     if let Err(e) = result {
         eprintln!("storage: 事件落库失败(不阻断消息流): {e}");
     }
+}
+
+/// 入站群帧的解释与处理(M7c,泵线程内调用):
+/// - `GroupText`:群已知且发送者在成员表 → 落库(sender_fp=来源指纹)并转成
+///   `Message` 事件(peer_fp=group_id)转发壳层;否则静默丢弃。
+/// - `GroupInfo`:LWW 合并(见 `GroupsState::apply_info`),按结论落库/删库,
+///   有实际变化时转发 `GroupsChanged`。
+/// - `GroupLeave`:仅当自己是该群建群者且退群者自报身份与 TLS 指纹一致时
+///   生效——摘成员、版本+1、落库,并 spawn 线程向余下成员(含退群者)回播
+///   新版本 GroupInfo(网络 IO 不阻塞泵线程)。
+///
+/// 返回 `Some(ev)` = 要送进泵出口给壳层的事件;`None` = 静默吞掉。
+fn handle_group_wire(
+    from_fp: String,
+    msg: Msg,
+    groups: &Arc<Mutex<GroupsState>>,
+    storage: &Arc<Storage>,
+    self_fp: &str,
+    transport: &Arc<TransportManager>,
+    roster: &Arc<Mutex<Roster>>,
+) -> Option<TransportEvent> {
+    match msg {
+        Msg::GroupText {
+            group_id,
+            id,
+            body,
+            ts_ms,
+        } => {
+            {
+                let g = groups.lock().expect("groups lock");
+                let group = g.get(&group_id)?;
+                if !group.has_member(&from_fp) {
+                    return None; // 被移出的旧成员仍在发:丢弃
+                }
+            }
+            if let Err(e) = storage.insert_message(
+                &id,
+                &group_id,
+                "in",
+                &body,
+                ts_ms as i64,
+                Some(&from_fp),
+            ) {
+                eprintln!("storage: 群消息落库失败(不阻断消息流): {e}");
+            }
+            Some(TransportEvent::Message(MessageEvent {
+                peer_fp: group_id,
+                id,
+                body,
+                ts_ms,
+                sender_fp: Some(from_fp),
+            }))
+        }
+        Msg::GroupInfo {
+            group_id,
+            name,
+            creator_fp,
+            version,
+            members,
+        } => {
+            // 只信 TLS 指纹 = 声称的建群者本人发来的成员表(防伪造/防越权)。
+            if from_fp != creator_fp {
+                return None;
+            }
+            let incoming = Group {
+                group_id: group_id.clone(),
+                name,
+                creator_fp,
+                version,
+                members: members
+                    .into_iter()
+                    .map(|(fp, nick)| GroupMember { fp, nick })
+                    .collect(),
+            };
+            let (outcome, list) = {
+                let mut g = groups.lock().expect("groups lock");
+                let outcome = g.apply_info(incoming.clone(), self_fp);
+                (outcome, g.list())
+            };
+            match outcome {
+                InfoOutcome::Joined | InfoOutcome::Updated => {
+                    if let Err(e) =
+                        storage.upsert_group(&incoming, crate::transport::proto::now_ms() as i64)
+                    {
+                        eprintln!("storage: 群落库失败: {e}");
+                    }
+                    Some(TransportEvent::GroupsChanged(list))
+                }
+                InfoOutcome::Removed => {
+                    if let Err(e) = storage.delete_group(&group_id) {
+                        eprintln!("storage: 群删除失败: {e}");
+                    }
+                    Some(TransportEvent::GroupsChanged(list))
+                }
+                InfoOutcome::Ignored => None,
+            }
+        }
+        Msg::GroupLeave {
+            group_id,
+            member_fp,
+        } => {
+            if from_fp != member_fp {
+                return None; // 只能替自己退群
+            }
+            let updated = {
+                let mut g = groups.lock().expect("groups lock");
+                let group = g.get(&group_id)?;
+                if group.creator_fp != self_fp || !group.has_member(&member_fp) {
+                    return None; // 非建群者收到退群通知/重复退群:忽略
+                }
+                let mut next = group.clone();
+                next.members.retain(|m| m.fp != member_fp);
+                next.version += 1;
+                g.upsert_local(next.clone());
+                next
+            };
+            if let Err(e) =
+                storage.upsert_group(&updated, crate::transport::proto::now_ms() as i64)
+            {
+                eprintln!("storage: 群落库失败: {e}");
+            }
+            // 回播新成员表:余下成员 + 退群者本人(让它确认自己已被摘除)。
+            let mut targets = fan_out_targets(&updated, self_fp);
+            targets.push(member_fp);
+            spawn_group_fanout(transport.clone(), roster.clone(), targets, group_info_msg(&updated));
+            let list = groups.lock().expect("groups lock").list();
+            Some(TransportEvent::GroupsChanged(list))
+        }
+        _ => None, // 非群帧不会被路由到这里(泵按 TransportEvent::Group 分流)
+    }
+}
+
+/// Group → 线上 GroupInfo 帧。
+fn group_info_msg(g: &Group) -> Msg {
+    Msg::GroupInfo {
+        group_id: g.group_id.clone(),
+        name: g.name.clone(),
+        creator_fp: g.creator_fp.clone(),
+        version: g.version,
+        members: g
+            .members
+            .iter()
+            .map(|m| (m.fp.clone(), m.nick.clone()))
+            .collect(),
+    }
+}
+
+/// 群扇出(M7c):后台线程逐成员单播 `msg`。地址从 roster 快照反查,
+/// 离线/无地址/发送失败一律静默跳过(spec 冻结:无补发、无回执)。
+/// 只对 `Protocol::Native` 对端发送——群本来就只允许 native 成员,这里再守一道。
+fn spawn_group_fanout(
+    transport: Arc<TransportManager>,
+    roster: Arc<Mutex<Roster>>,
+    targets: Vec<String>,
+    msg: Msg,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let snapshot = roster.lock().expect("roster lock").snapshot();
+        for fp in targets {
+            let Some(peer) = snapshot
+                .iter()
+                .find(|p| p.fingerprint == fp && p.protocol == Protocol::Native)
+            else {
+                continue;
+            };
+            if peer.addrs.is_empty() {
+                continue;
+            }
+            let _ = transport.send_msg(&fp, &peer.addrs, peer.port, &msg);
+        }
+    });
 }
 
 /// 双向注册(M4):对一个刚被 `Seen`、且当前不是 `Reachable` 的对端,起一条
@@ -1238,6 +1622,7 @@ fn forward_ipmsg_event(
                 id: crate::transport::proto::new_id(),
                 body,
                 ts_ms: crate::transport::proto::now_ms(),
+                sender_fp: None,
             }));
         }
         IpmsgEvent::FileOffered {
@@ -1277,6 +1662,226 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;
+
+    // ---- handle_group_wire(M7c):入站群帧的解释逻辑 ----
+
+    /// 组装 handle_group_wire 需要的全部依赖(真 TransportManager 绑 0 端口,
+    /// 不产生真实网络流量——所有用例都不触发扇出或扇出目标为空)。
+    fn group_wire_fixture(
+        initial: Vec<Group>,
+    ) -> (
+        Arc<Mutex<GroupsState>>,
+        Arc<Storage>,
+        Arc<TransportManager>,
+        Arc<Mutex<Roster>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(Storage::open(dir.path()).unwrap());
+        let groups = Arc::new(Mutex::new(GroupsState::new(initial)));
+        let identity = Arc::new(Identity::load_or_create(dir.path()).unwrap());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let transport = TransportManager::start(identity, 0, tx).unwrap();
+        let roster = Arc::new(Mutex::new(Roster::new("self-fp".to_string())));
+        (groups, storage, transport, roster, dir)
+    }
+
+    fn test_group(id: &str, creator: &str, version: u64, member_fps: &[&str]) -> Group {
+        Group {
+            group_id: id.to_string(),
+            name: "测试群".to_string(),
+            creator_fp: creator.to_string(),
+            version,
+            members: member_fps
+                .iter()
+                .map(|f| GroupMember {
+                    fp: f.to_string(),
+                    nick: format!("nick-{f}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn group_text_from_member_is_persisted_and_forwarded() {
+        let g = test_group("g1", "creator", 1, &["self-fp", "alice"]);
+        let (groups, storage, transport, roster, _dir) = group_wire_fixture(vec![g]);
+        let out = handle_group_wire(
+            "alice".to_string(),
+            Msg::GroupText {
+                group_id: "g1".to_string(),
+                id: "mid-1".to_string(),
+                body: "大家好".to_string(),
+                ts_ms: 1000,
+            },
+            &groups,
+            &storage,
+            "self-fp",
+            &transport,
+            &roster,
+        );
+        match out {
+            Some(TransportEvent::Message(m)) => {
+                assert_eq!(m.peer_fp, "g1", "会话 id = group_id");
+                assert_eq!(m.sender_fp.as_deref(), Some("alice"));
+                assert_eq!(m.body, "大家好");
+            }
+            other => panic!("期望 Message,得到 {other:?}"),
+        }
+        // 已落库,sender_fp 记录发送者
+        match &storage.history("g1", None, 10).unwrap()[0] {
+            crate::storage::HistoryItem::Text { sender_fp, .. } => {
+                assert_eq!(sender_fp.as_deref(), Some("alice"));
+            }
+            other => panic!("期望 Text,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_text_unknown_group_or_non_member_is_dropped() {
+        let g = test_group("g1", "creator", 1, &["self-fp", "alice"]);
+        let (groups, storage, transport, roster, _dir) = group_wire_fixture(vec![g]);
+        let text = |gid: &str, from: &str| {
+            handle_group_wire(
+                from.to_string(),
+                Msg::GroupText {
+                    group_id: gid.to_string(),
+                    id: crate::transport::proto::new_id(),
+                    body: "x".to_string(),
+                    ts_ms: 1,
+                },
+                &groups,
+                &storage,
+                "self-fp",
+                &transport,
+                &roster,
+            )
+        };
+        assert!(text("g-unknown", "alice").is_none(), "未知群丢弃");
+        assert!(text("g1", "mallory").is_none(), "非成员丢弃");
+        assert!(storage.history("g1", None, 10).unwrap().is_empty(), "丢弃不落库");
+    }
+
+    #[test]
+    fn group_info_only_trusted_from_claimed_creator() {
+        let (groups, storage, transport, roster, _dir) = group_wire_fixture(vec![]);
+        let incoming = Msg::GroupInfo {
+            group_id: "g2".to_string(),
+            name: "新群".to_string(),
+            creator_fp: "creator".to_string(),
+            version: 1,
+            members: vec![
+                ("creator".to_string(), "建群者".to_string()),
+                ("self-fp".to_string(), "我".to_string()),
+            ],
+        };
+        // TLS 指纹 ≠ 声称的建群者:拒收(防伪造)
+        assert!(handle_group_wire(
+            "mallory".to_string(),
+            incoming.clone(),
+            &groups,
+            &storage,
+            "self-fp",
+            &transport,
+            &roster,
+        )
+        .is_none());
+        assert!(groups.lock().unwrap().get("g2").is_none());
+
+        // 建群者本人发来:加入 + 落库 + GroupsChanged
+        match handle_group_wire(
+            "creator".to_string(),
+            incoming,
+            &groups,
+            &storage,
+            "self-fp",
+            &transport,
+            &roster,
+        ) {
+            Some(TransportEvent::GroupsChanged(list)) => assert_eq!(list.len(), 1),
+            other => panic!("期望 GroupsChanged,得到 {other:?}"),
+        }
+        assert_eq!(storage.load_groups().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn group_leave_only_creator_processes_and_bumps_version() {
+        // 自己是建群者:alice 退群 → 摘除 + 版本+1 + 落库
+        let g = test_group("g1", "self-fp", 3, &["self-fp", "alice", "bob"]);
+        let (groups, storage, transport, roster, _dir) = group_wire_fixture(vec![g]);
+        let leave = Msg::GroupLeave {
+            group_id: "g1".to_string(),
+            member_fp: "alice".to_string(),
+        };
+        // 替别人退群(TLS 指纹 ≠ member_fp):拒绝
+        assert!(handle_group_wire(
+            "bob".to_string(),
+            leave.clone(),
+            &groups,
+            &storage,
+            "self-fp",
+            &transport,
+            &roster,
+        )
+        .is_none());
+        // alice 本人退群:生效
+        match handle_group_wire(
+            "alice".to_string(),
+            leave,
+            &groups,
+            &storage,
+            "self-fp",
+            &transport,
+            &roster,
+        ) {
+            Some(TransportEvent::GroupsChanged(_)) => {}
+            other => panic!("期望 GroupsChanged,得到 {other:?}"),
+        }
+        let g = groups.lock().unwrap().get("g1").unwrap().clone();
+        assert_eq!(g.version, 4);
+        assert!(!g.has_member("alice"));
+        assert_eq!(storage.load_groups().unwrap()[0].version, 4);
+    }
+
+    /// M7c 关键回归:群帧经真实 TLS 单播通道送达,接收端上报
+    /// `TransportEvent::Group`,`from_fp` 是 TLS 层验证过的发送方指纹
+    /// (同时也证明群消息路径完全不触碰 IPMsg/UDP 2425 栈)。
+    #[test]
+    fn group_text_travels_over_native_tls() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = Arc::new(Identity::load_or_create(dir_a.path()).unwrap());
+        let id_b = Arc::new(Identity::load_or_create(dir_b.path()).unwrap());
+        let (tx_a, _rx_a) = std::sync::mpsc::channel();
+        let (tx_b, rx_b) = std::sync::mpsc::channel();
+        let ta = TransportManager::start(id_a.clone(), 0, tx_a).unwrap();
+        let tb = TransportManager::start(id_b.clone(), 0, tx_b).unwrap();
+
+        ta.send_msg(
+            &id_b.fingerprint,
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            tb.port(),
+            &Msg::GroupText {
+                group_id: "g1".to_string(),
+                id: "mid".to_string(),
+                body: "群消息".to_string(),
+                ts_ms: 42,
+            },
+        )
+        .unwrap();
+
+        match rx_b.recv_timeout(Duration::from_secs(5)).unwrap() {
+            TransportEvent::Group {
+                from_fp,
+                msg: Msg::GroupText { group_id, body, .. },
+            } => {
+                assert_eq!(from_fp, id_a.fingerprint, "from_fp 必须是 TLS 验证的指纹");
+                assert_eq!(group_id, "g1");
+                assert_eq!(body, "群消息");
+            }
+            other => panic!("期望 Group(GroupText),得到 {other:?}"),
+        }
+    }
 
     #[test]
     fn spawn_probe_reports_registered_and_records_history() {
@@ -2127,6 +2732,7 @@ mod tests {
                 id: "id1".to_string(),
                 body: "你好".to_string(),
                 ts_ms: 1234,
+                sender_fp: None,
             }))
             .unwrap();
         // 事件到达消费端时,数据库必须已经写入(先写库、再转发)
