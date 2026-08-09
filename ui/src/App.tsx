@@ -124,6 +124,22 @@ export default function App() {
 
   const online = peers.filter((p) => p.state !== "offline");
   const offline = peers.filter((p) => p.state === "offline");
+  // 在线区按组名分节(M7a):有组名的按组名排序在前,未分组("")最后;
+  // 全部无组名时只有一个 "" 节,渲染时不显示节标题,保持既有观感。
+  const groupsOf = (list: Peer[]): Array<[string, Peer[]]> => {
+    const m = new Map<string, Peer[]>();
+    for (const p of list) {
+      const key = p.group ?? "";
+      const bucket = m.get(key);
+      if (bucket) bucket.push(p);
+      else m.set(key, [p]);
+    }
+    return [...m.entries()].sort((a, b) =>
+      a[0] === "" ? 1 : b[0] === "" ? -1 : a[0].localeCompare(b[0], "zh-CN"),
+    );
+  };
+  const onlineGroups = groupsOf(online);
+  const showGroupHeaders = onlineGroups.some(([g]) => g !== "");
   const searching = searchQuery.trim().length > 0;
   const nickOf = (fp: string) =>
     peers.find((p) => p.fingerprint === fp)?.nickname ?? fp.slice(0, 8);
@@ -176,19 +192,30 @@ export default function App() {
             </ul>
           ) : (
             <>
-              <ul className="space-y-0.5">
-                {online.map((p) => (
-                  <PeerRow
-                    key={p.fingerprint}
-                    p={p}
-                    selected={selectedFp === p.fingerprint}
-                    onClick={() => void useAppStore.getState().openConversation(p.fingerprint)}
-                  />
-                ))}
-                {online.length === 0 && (
+              {onlineGroups.map(([group, members]) => (
+                <div key={group || "__ungrouped__"}>
+                  {showGroupHeaders && (
+                    <div className="px-4 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                      {group || "未分组"}
+                    </div>
+                  )}
+                  <ul className="space-y-0.5">
+                    {members.map((p) => (
+                      <PeerRow
+                        key={p.fingerprint}
+                        p={p}
+                        selected={selectedFp === p.fingerprint}
+                        onClick={() => void useAppStore.getState().openConversation(p.fingerprint)}
+                      />
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              {online.length === 0 && (
+                <ul>
                   <li className="px-4 py-6 text-sm text-muted-foreground">正在搜索局域网设备…</li>
-                )}
-              </ul>
+                </ul>
+              )}
               {offline.length > 0 && (
                 <>
                   <div className="px-4 pb-1 pt-3 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">

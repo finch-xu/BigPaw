@@ -57,9 +57,13 @@ pub struct Announcement {
     pub nick: String,
     pub tport: u16,
     pub caps: String,
+    /// 自我声明的工作组名(M7a)。`serde(default)`:旧版对端的报文无此字段
+    /// → None,新旧版本互通不受影响。
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
-/// 昵称按 UTF-8 字节边界截断到 <= MAX_NICK_BYTES。
+/// 昵称/组名按 UTF-8 字节边界截断到 <= MAX_NICK_BYTES。
 fn truncate_nick(nick: &str) -> String {
     if nick.len() <= MAX_NICK_BYTES {
         return nick.to_string();
@@ -74,6 +78,7 @@ fn truncate_nick(nick: &str) -> String {
 pub fn encode(a: &Announcement) -> Vec<u8> {
     let safe = Announcement {
         nick: truncate_nick(&a.nick),
+        group: a.group.as_deref().map(truncate_nick),
         ..a.clone()
     };
     let buf = serde_json::to_vec(&safe).unwrap_or_default();
@@ -441,6 +446,7 @@ fn recv_loop(
             addrs: vec![src_ip],
             port: ann.tport,
             protocol: Protocol::Native,
+            group: ann.group,
         };
         if tx.send(ev).is_err() {
             return; // 接收端已销毁,退出线程
@@ -474,9 +480,13 @@ pub struct AnnounceService {
     /// 预编码好的自身宣告报文,发送/接收/poke 三方共享;`set_nick` 原地覆写,
     /// 各读点在锁内克隆、锁外发送(锁纪律见 core.rs)。
     announce_buf: Arc<Mutex<Vec<u8>>>,
-    /// 重建宣告报文所需的自身参数(`set_nick` 用)。
+    /// 重建宣告报文所需的自身参数(`set_nick`/`set_group` 用)。
     fp: String,
     tport: u16,
+    /// 当前昵称/组名:`set_nick`/`set_group` 各改一半、共用重建逻辑,
+    /// 互不覆盖对方的值(M7a)。
+    nick: Mutex<String>,
+    group: Mutex<Option<String>>,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -489,6 +499,7 @@ impl AnnounceService {
     pub fn start(
         identity: &Identity,
         nick: &str,
+        group: Option<&str>,
         tport: u16,
         port: u16,
         tx: Sender<DiscoveryEvent>,
@@ -505,6 +516,7 @@ impl AnnounceService {
             nick: nick.to_string(),
             tport,
             caps: "native".to_string(),
+            group: group.map(str::to_string),
         };
         let buf = Arc::new(Mutex::new(encode(&announcement)));
         let self_fp = identity.fingerprint.clone();
@@ -538,9 +550,25 @@ impl AnnounceService {
             announce_buf: buf,
             fp: identity.fingerprint.clone(),
             tport,
+            nick: Mutex::new(nick.to_string()),
+            group: Mutex::new(group.map(str::to_string)),
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
         })
+    }
+
+    /// 以当前自持的 nick/group 重编码宣告报文并原地覆写共享 buf。
+    /// **不主动发送**(铁律:报文速率不高于现状),传播等下一个周期。
+    fn rebuild_announce_buf(&self) {
+        let announcement = Announcement {
+            v: 1,
+            fp: self.fp.clone(),
+            nick: self.nick.lock().expect("nick lock").clone(),
+            tport: self.tport,
+            caps: "native".to_string(),
+            group: self.group.lock().expect("group lock").clone(),
+        };
+        *self.announce_buf.lock().expect("announce_buf lock") = encode(&announcement);
     }
 
     /// 对历史已知的单个 IP 发一份定向单播宣告(而非组播/广播),用来"唤醒"
@@ -555,18 +583,19 @@ impl AnnounceService {
         let _ = self.socket.send_to(&buf, target);
     }
 
-    /// 昵称热生效:重编码宣告报文并原地覆写共享 buf。**不主动发送**——该通道
-    /// 是 mDNS 的兜底,传播等下一个周期(≤ PERIODIC_INTERVAL)即可,主动加发
-    /// 会突破"报文速率不高于现状"铁律;mDNS 侧已即时传播。
+    /// 昵称热生效:更新自持昵称并重建共享 buf(组名保持当前值不被覆盖)。
+    /// **不主动发送**——该通道是 mDNS 的兜底,传播等下一个周期
+    /// (≤ PERIODIC_INTERVAL)即可,主动加发会突破"报文速率不高于现状"铁律;
+    /// mDNS 侧已即时传播。
     pub fn set_nick(&self, nick: &str) {
-        let announcement = Announcement {
-            v: 1,
-            fp: self.fp.clone(),
-            nick: nick.to_string(),
-            tport: self.tport,
-            caps: "native".to_string(),
-        };
-        *self.announce_buf.lock().expect("announce_buf lock") = encode(&announcement);
+        *self.nick.lock().expect("nick lock") = nick.to_string();
+        self.rebuild_announce_buf();
+    }
+
+    /// 组名热生效(M7a):模式同 `set_nick`,昵称保持当前值不被覆盖。
+    pub fn set_group(&self, group: Option<&str>) {
+        *self.group.lock().expect("group lock") = group.map(str::to_string);
+        self.rebuild_announce_buf();
     }
 
     /// 停止两条线程、退出组播组并关闭 socket。
@@ -601,6 +630,7 @@ mod tests {
             nick: "alice".to_string(),
             tport: 24917,
             caps: "native".to_string(),
+            group: None,
         }
     }
 
@@ -627,6 +657,32 @@ mod tests {
         assert!(buf.len() <= 1400);
         let back = decode(&buf).unwrap();
         assert!(back.nick.len() <= 64);
+    }
+
+    /// M7a:组名编解码往返;旧版对端报文(无 group 字段)解析为 None。
+    #[test]
+    fn announcement_group_roundtrips_and_old_payload_compat() {
+        let mut a = ann();
+        a.group = Some("研发部".to_string());
+        let buf = encode(&a);
+        assert_eq!(decode(&buf).unwrap().group, Some("研发部".to_string()));
+
+        let legacy = serde_json::json!({
+            "v": 1, "fp": "a".repeat(64), "nick": "old", "tport": 1, "caps": "native"
+        });
+        let parsed = decode(serde_json::to_vec(&legacy).unwrap().as_slice()).unwrap();
+        assert_eq!(parsed.group, None, "旧版报文无 group 字段 → None");
+    }
+
+    /// 组名与昵称同规则截断,保证报文 ≤ 1 MTU。
+    #[test]
+    fn long_group_is_truncated_like_nick() {
+        let mut a = ann();
+        a.group = Some("组".repeat(500));
+        let buf = encode(&a);
+        assert!(buf.len() <= 1400);
+        let back = decode(&buf).unwrap();
+        assert!(back.group.unwrap().len() <= 64);
     }
 
     #[test]
@@ -787,6 +843,7 @@ mod tests {
             nick: "self".to_string(),
             tport: 1,
             caps: "native".to_string(),
+            group: None,
         })));
         let handle = {
             let socket = socket.clone();
@@ -970,7 +1027,7 @@ mod tests {
         let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
         let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::default()); // entries 空 = 不发包
         let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
-        let svc = AnnounceService::start(&identity, "旧名", 4600, 0, ev_tx, ifaces_rx).unwrap();
+        let svc = AnnounceService::start(&identity, "旧名", None, 4600, 0, ev_tx, ifaces_rx).unwrap();
 
         svc.set_nick("新名");
 
@@ -988,7 +1045,7 @@ mod tests {
         let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
         let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::default());
         let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
-        let svc = AnnounceService::start(&identity, "旧名", 4600, 0, ev_tx, ifaces_rx).unwrap();
+        let svc = AnnounceService::start(&identity, "旧名", None, 4600, 0, ev_tx, ifaces_rx).unwrap();
 
         svc.set_nick(&"长".repeat(500));
 

@@ -7,6 +7,7 @@ import { IS_TAURI } from "./mock";
 
 const MOCK_SETTINGS: Settings = {
   nickname: null,
+  group: null,
   downloadDir: null,
   ipmsgEnabled: true,
   excludedInterfaces: [],
@@ -191,19 +192,39 @@ export default function SettingsModal() {
           </h3>
 
           {activeTab === "personal" && (
-            <label className="block text-sm">
-              <span className="text-fg2">昵称</span>
-              <input
-                defaultValue={settings.nickname ?? ""}
-                onBlur={(e) => {
-                  const v = e.target.value.trim();
-                  if (v !== (settings.nickname ?? ""))
-                    void save({ ...settings, nickname: v || null }, false);
-                }}
-                placeholder="留空使用主机名"
-                className="mt-1 w-full rounded-lg border border-border bg-panel px-3 py-1.5 outline-none focus:border-primary"
-              />
-            </label>
+            <>
+              <label className="block text-sm">
+                <span className="text-fg2">昵称</span>
+                <input
+                  defaultValue={settings.nickname ?? ""}
+                  onBlur={(e) => {
+                    const v = e.target.value.trim();
+                    if (v !== (settings.nickname ?? ""))
+                      void save({ ...settings, nickname: v || null }, false);
+                  }}
+                  placeholder="留空使用主机名"
+                  className="mt-1 w-full rounded-lg border border-border bg-panel px-3 py-1.5 outline-none focus:border-primary"
+                />
+              </label>
+              <label className="mt-4 block text-sm">
+                <span className="text-fg2">分组</span>
+                <input
+                  defaultValue={settings.group ?? ""}
+                  maxLength={32}
+                  onBlur={(e) => {
+                    // \0 是 IPMsg 报文的字段分隔符,混入会破坏线上格式
+                    const v = e.target.value.replace(/\0/g, "").trim();
+                    if (v !== (settings.group ?? ""))
+                      void save({ ...settings, group: v || null }, false);
+                  }}
+                  placeholder="留空则不设分组"
+                  className="mt-1 w-full rounded-lg border border-border bg-panel px-3 py-1.5 outline-none focus:border-primary"
+                />
+                <span className="mt-1 block text-xs text-muted-foreground">
+                  广播给局域网内所有人(含飞秋),对方会把你归到该组显示。
+                </span>
+              </label>
+            </>
           )}
 
           {activeTab === "appearance" && (

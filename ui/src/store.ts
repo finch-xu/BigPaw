@@ -8,6 +8,8 @@ export interface Peer {
   port: number;
   protocol: "native" | "ipmsg";
   state: "discovered" | "reachable" | "unreachable" | "offline";
+  /** 对端声明的工作组名(M7a),null = 未分组 */
+  group: string | null;
 }
 
 export interface SelfInfo {
@@ -57,6 +59,8 @@ export interface SearchHit {
 
 export interface Settings {
   nickname: string | null;
+  /** 我的分组(M7a),null = 未设置 */
+  group: string | null;
   downloadDir: string | null;
   ipmsgEnabled: boolean;
   excludedInterfaces: string[];

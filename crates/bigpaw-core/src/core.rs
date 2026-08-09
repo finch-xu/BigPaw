@@ -219,6 +219,8 @@ pub struct Core {
     identity: Arc<Identity>,
     /// 当前生效昵称。Mutex 因 apply_settings 热改名(昵称热生效)与读取并发。
     nickname: Mutex<String>,
+    /// 当前生效组名(M7a,归一化后)。Mutex 语义同 nickname。
+    group: Mutex<Option<String>>,
     roster_rx: watch::Receiver<Vec<Peer>>,
     roster_handle: Arc<Mutex<Roster>>,
     discovery: std::sync::Mutex<Option<Discovery>>,
@@ -334,9 +336,11 @@ impl Core {
             ipmsg_bcast_targets.clone(),
             init_snapshot.generation,
         ));
+        let group = effective_group(&settings);
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
             match IpmsgService::start(
                 &nickname,
+                group.as_deref(),
                 &ipmsg_host,
                 IPMSG_PORT,
                 ipmsg_evt_tx,
@@ -360,7 +364,13 @@ impl Core {
         // 不需要额外同步。
         let (tx, rx) = std::sync::mpsc::channel();
         // 真实端口进 SRV
-        let mut discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        let mut discovery = Discovery::start(
+            &identity,
+            &nickname,
+            group.as_deref(),
+            transport.port(),
+            tx.clone(),
+        )?;
         // 网卡排除清单初始提交(Step 5):prev=[] 表示"还没提交过任何清单",
         // 清单非空时才会真正 disable + unregister/re-register;为空时是
         // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)走
@@ -372,6 +382,7 @@ impl Core {
         let announce_service = AnnounceService::start(
             &identity,
             &nickname,
+            group.as_deref(),
             transport.port(),
             DEFAULT_ANNOUNCE_PORT,
             tx.clone(),
@@ -413,6 +424,7 @@ impl Core {
                             Protocol::Native
                         },
                         state: PeerState::Offline,
+                        group: k.group,
                     })
                     .collect(),
             ),
@@ -483,6 +495,7 @@ impl Core {
                             nickname,
                             addrs,
                             protocol,
+                            group,
                             ..
                         } = &ev
                         {
@@ -497,6 +510,7 @@ impl Core {
                                 nickname,
                                 proto,
                                 addr.as_deref(),
+                                group.as_deref(),
                                 crate::transport::proto::now_ms() as i64,
                             ) {
                                 eprintln!("storage: peer 回写失败: {e}");
@@ -639,6 +653,7 @@ impl Core {
         Ok(Self {
             identity,
             nickname: Mutex::new(nickname),
+            group: Mutex::new(group),
             roster_rx: watch_rx,
             roster_handle,
             discovery: std::sync::Mutex::new(Some(discovery)),
@@ -939,6 +954,39 @@ impl Core {
                 svc.set_nick(&new_nick);
             }
         }
+
+        // 组名热生效(M7a):diff 归一化后的新旧值,三路通知模式与昵称一致。
+        let new_group = effective_group(s);
+        let group_changed = {
+            let mut cur = self.group.lock().expect("group lock");
+            if *cur != new_group {
+                *cur = new_group.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if group_changed {
+            {
+                let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
+                if let Some(d) = discovery.as_mut() {
+                    if let Err(e) = d.set_group(new_group.as_deref()) {
+                        eprintln!("mdns: 组名热生效失败: {e}");
+                    }
+                }
+            }
+            {
+                let announce = self.announce.lock().expect("announce lock poisoned");
+                if let Some(a) = announce.as_ref() {
+                    a.set_group(new_group.as_deref()); // 纯内存换 buf,持锁无 IO
+                }
+            }
+            // ipmsg 锁只用于克隆 Arc,set_group 的 BR_ENTRY 补发在锁外(锁纪律)。
+            let ipmsg = self.ipmsg.lock().expect("ipmsg lock poisoned").clone();
+            if let Some(svc) = ipmsg {
+                svc.set_group(new_group.as_deref());
+            }
+        }
     }
 
     /// 列出全部网卡(不滤排除项),标注 excluded 状态,供壳层设置页展示。
@@ -1114,6 +1162,17 @@ fn default_nickname() -> String {
     hostname_no_local()
 }
 
+/// 设置里的组名归一化(M7a):剥 `\0`(IPMsg extra 的字段分隔符,混入会破坏
+/// 线上格式)+ trim + 空串→None。与 `effective_nickname` 平行的统一语义,
+/// 三条发现通道(mdns/announce/ipmsg)共用这一份归一化结果。
+fn effective_group(s: &crate::settings::Settings) -> Option<String> {
+    s.group
+        .as_deref()
+        .map(|g| g.replace('\u{0}', ""))
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+}
+
 /// 设置里的昵称归一化:None/空白 → 主机名默认值(与 UI 侧 trim+空值回退
 /// 的语义对齐)。壳层 CoreConfig::nickname 恒为 None,热生效路径只看 settings。
 fn effective_nickname(s: &crate::settings::Settings) -> String {
@@ -1153,6 +1212,7 @@ fn forward_ipmsg_event(
             nick,
             addr,
             is_bigpaw,
+            group,
             ..
         } => {
             if is_bigpaw {
@@ -1164,6 +1224,7 @@ fn forward_ipmsg_event(
                 addrs: vec![addr.ip()],
                 port: addr.port(),
                 protocol: Protocol::Ipmsg,
+                group,
             });
         }
         IpmsgEvent::Offline { key } => {
@@ -1757,6 +1818,7 @@ mod tests {
             host: "HOST-B".to_string(),
             addr: "192.168.1.9:2425".parse().unwrap(),
             is_bigpaw,
+            group: None,
         }
     }
 
@@ -2010,6 +2072,7 @@ mod tests {
                 addrs: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
                 port: fake_peer_addr.port(),
                 protocol: Protocol::Ipmsg,
+                group: None,
             });
         let xfer_id = "test-xfer-dir".to_string();
         core.ipmsg_offers.lock().unwrap().insert(
@@ -2121,7 +2184,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = Storage::open(dir.path()).unwrap();
-            s.upsert_peer("fpZ", "zoe", "native", Some("192.168.1.7"), 123)
+            s.upsert_peer("fpZ", "zoe", "native", Some("192.168.1.7"), None, 123)
                 .unwrap();
         }
         let core = Core::start(CoreConfig {
@@ -2138,6 +2201,19 @@ mod tests {
         assert_eq!(zoe.nickname, "zoe");
         assert_eq!(zoe.addrs, vec!["192.168.1.7".parse::<IpAddr>().unwrap()]);
         core.shutdown();
+    }
+
+    #[test]
+    fn effective_group_normalizes() {
+        let mut s = crate::settings::Settings {
+            group: Some("  研发部\u{0} ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective_group(&s), Some("研发部".to_string()));
+        s.group = Some("   ".to_string());
+        assert_eq!(effective_group(&s), None, "纯空白视为未设置");
+        s.group = None;
+        assert_eq!(effective_group(&s), None);
     }
 
     #[test]
@@ -2187,6 +2263,7 @@ mod tests {
             dir.path(),
             &crate::settings::Settings {
                 nickname: Some("设置里的名字".to_string()),
+                group: None,
                 download_dir: None,
                 ipmsg_enabled: true,
                 excluded_interfaces: Vec::new(),
@@ -2209,6 +2286,7 @@ mod tests {
             dir.path(),
             &crate::settings::Settings {
                 nickname: None,
+                group: None,
                 download_dir: None,
                 ipmsg_enabled: false,
                 excluded_interfaces: Vec::new(),

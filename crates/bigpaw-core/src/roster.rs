@@ -38,6 +38,8 @@ pub struct Peer {
     pub port: u16,
     pub protocol: Protocol,
     pub state: PeerState,
+    /// 对端自我声明的工作组名(M7a 自我归属模型),None=未分组。
+    pub group: Option<String>,
 }
 
 /// 发现层喂给 roster 的事件。
@@ -51,6 +53,8 @@ pub enum DiscoveryEvent {
         /// 发现来源:mDNS/UDP 宣告(原生栈)恒为 `Native`;IPMsg 兼容层(M5)
         /// 喂入的 Seen 恒为 `Ipmsg`,让 roster 记录下这个对端走哪条协议栈。
         protocol: Protocol,
+        /// 对端声明的工作组名(M7a),三条发现通道都可携带。
+        group: Option<String>,
     },
     Lost {
         fingerprint: String,
@@ -87,6 +91,7 @@ impl Roster {
                 mut addrs,
                 port,
                 protocol,
+                group,
             } => {
                 if fingerprint == self.self_fingerprint {
                     return false;
@@ -111,6 +116,7 @@ impl Roster {
                     port,
                     protocol,
                     state,
+                    group,
                 };
                 match self.peers.get(&fingerprint) {
                     Some(existing) if *existing == peer => false,
@@ -166,11 +172,16 @@ impl Roster {
         }
     }
 
+    /// 快照排序(M7a):有组名在前(组名字节序聚簇)→ 无组名最后;
+    /// 组内按昵称,最后按 fingerprint 保证全序稳定。
     pub fn snapshot(&self) -> Vec<Peer> {
         let mut v: Vec<Peer> = self.peers.values().cloned().collect();
         v.sort_by(|a, b| {
-            a.nickname
-                .cmp(&b.nickname)
+            a.group
+                .is_none()
+                .cmp(&b.group.is_none())
+                .then_with(|| a.group.cmp(&b.group))
+                .then_with(|| a.nickname.cmp(&b.nickname))
                 .then_with(|| a.fingerprint.cmp(&b.fingerprint))
         });
         v
@@ -193,6 +204,7 @@ mod tests {
             addrs: vec![ip(5)],
             port: 0,
             protocol: Protocol::Native,
+            group: None,
         }
     }
 
@@ -203,7 +215,52 @@ mod tests {
             addrs: vec![ip(9)],
             port: 2425,
             protocol: Protocol::Ipmsg,
+            group: None,
         }
+    }
+
+    fn seen_with_group(fp: &str, nick: &str, group: Option<&str>) -> DiscoveryEvent {
+        DiscoveryEvent::Seen {
+            fingerprint: fp.to_string(),
+            nickname: nick.to_string(),
+            addrs: vec![ip(5)],
+            port: 0,
+            protocol: Protocol::Native,
+            group: group.map(str::to_string),
+        }
+    }
+
+    /// M7a:Seen 携带组名进快照;排序 = 有组名在前(按组名),无组名最后。
+    #[test]
+    fn seen_records_group_and_snapshot_sorts_by_group_then_nick() {
+        let mut r = Roster::new(SELF_FP.to_string());
+        r.apply(seen_with_group("bbbb", "bob", Some("市场部")));
+        r.apply(seen_with_group("cccc", "amy", Some("研发部")));
+        r.apply(seen_with_group("dddd", "zed", None));
+        r.apply(seen_with_group("eeee", "cat", Some("市场部")));
+        let snap = r.snapshot();
+        assert_eq!(snap.last().unwrap().nickname, "zed", "无组名排最后");
+        // 同组内按昵称;组与组之间按组名字节序聚在一起
+        let groups: Vec<Option<&str>> = snap.iter().map(|p| p.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("市场部"), Some("市场部"), Some("研发部"), None],
+            "市场部(E5B8...) < 研发部(E7A0...) 按 UTF-8 字节序"
+        );
+        assert_eq!(snap[0].nickname, "bob");
+        assert_eq!(snap[1].nickname, "cat", "同组内按昵称排序");
+    }
+
+    /// 组名变化必须算变化(触发快照推送),否则 UI 看不到对端改组。
+    #[test]
+    fn group_change_counts_as_change() {
+        let mut r = Roster::new(SELF_FP.to_string());
+        assert!(r.apply(seen_with_group("bbbb", "bob", None)));
+        assert!(
+            r.apply(seen_with_group("bbbb", "bob", Some("研发部"))),
+            "组名变化要触发快照推送"
+        );
+        assert!(!r.apply(seen_with_group("bbbb", "bob", Some("研发部"))), "重复不算变化");
     }
 
     #[test]
@@ -376,7 +433,8 @@ mod tests {
                 addrs: vec![],
                 port: 0,
                 protocol: Protocol::Native,
-                state: PeerState::Discovered, // seed 强制改为 Offline
+                state: PeerState::Discovered,
+                group: None, // seed 强制改为 Offline
             },
             Peer {
                 fingerprint: "cccc".to_string(),
@@ -385,6 +443,7 @@ mod tests {
                 port: 0,
                 protocol: Protocol::Native,
                 state: PeerState::Discovered,
+                group: None,
             },
             Peer {
                 fingerprint: SELF_FP.to_string(),
@@ -393,6 +452,7 @@ mod tests {
                 port: 0,
                 protocol: Protocol::Native,
                 state: PeerState::Discovered,
+                group: None,
             },
         ]);
         let snap = r.snapshot();

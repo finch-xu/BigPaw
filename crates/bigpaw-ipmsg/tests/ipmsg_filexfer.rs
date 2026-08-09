@@ -47,8 +47,8 @@ fn wait_file_offered(
 fn two_ipmsg_instances_transfer_single_file() {
     let (txa, rxa) = std::sync::mpsc::channel();
     let (txb, rxb) = std::sync::mpsc::channel();
-    let a = IpmsgService::start("alice", "HOST-A", 2425, txa, default_broadcast_targets()).unwrap();
-    let b = IpmsgService::start("bob", "HOST-B", 2425, txb, default_broadcast_targets());
+    let a = IpmsgService::start("alice", None, "HOST-A", 2425, txa, default_broadcast_targets()).unwrap();
+    let b = IpmsgService::start("bob", None, "HOST-B", 2425, txb, default_broadcast_targets());
     if b.is_err() {
         eprintln!("2425 单机双绑不支持,跳过(真实场景是两台机器)");
         return;

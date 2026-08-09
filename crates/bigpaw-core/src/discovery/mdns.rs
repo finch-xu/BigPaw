@@ -40,6 +40,8 @@ pub struct Discovery {
     fingerprint: String,
     /// 当前昵称,写进 TXT 的 "nick" 字段。
     nickname: String,
+    /// 当前工作组名(M7a),写进 TXT 的 "group" 字段(无值写空串)。
+    group: Option<String>,
     /// 注册用的服务端口(真实监听端口,非 mDNS 自身端口)。
     port: u16,
     /// 实例名(fp 前 16 位),ServiceInfo 的 instance 参数。
@@ -56,12 +58,15 @@ fn build_service_info(
     host: &str,
     fingerprint: &str,
     nickname: &str,
+    group: Option<&str>,
     port: u16,
 ) -> Result<ServiceInfo, mdns_sd::Error> {
+    // group 无值时写空串占位:TXT 字段固定存在,解析侧空串→None(M7a)。
     let props = [
         ("v", "1"),
         ("fp", fingerprint),
         ("nick", nickname),
+        ("group", group.unwrap_or("")),
         ("caps", "native"),
     ];
     Ok(ServiceInfo::new(SERVICE_TYPE, instance, host, "", port, &props[..])?.enable_addr_auto())
@@ -89,6 +94,7 @@ impl Discovery {
     pub fn start(
         identity: &Identity,
         nickname: &str,
+        group: Option<&str>,
         port: u16,
         tx: Sender<DiscoveryEvent>,
     ) -> Result<Self, mdns_sd::Error> {
@@ -102,7 +108,15 @@ impl Discovery {
         let host = format!("{instance}.local.");
         let fingerprint = identity.fingerprint.clone();
         let nickname_owned = nickname.to_string();
-        let info = build_service_info(&instance, &host, &fingerprint, &nickname_owned, port)?;
+        let group_owned = group.map(str::to_string);
+        let info = build_service_info(
+            &instance,
+            &host,
+            &fingerprint,
+            &nickname_owned,
+            group_owned.as_deref(),
+            port,
+        )?;
         let fullname = info.get_fullname().to_string();
         daemon.register(info)?;
 
@@ -123,6 +137,11 @@ impl Discovery {
                         }
                         known.insert(info.get_fullname().to_string(), fp.clone());
                         let nickname = info.get_property_val_str("nick").unwrap_or("?").to_string();
+                        // TXT "group" 空串占位 → None(M7a,与 build_service_info 对称)
+                        let group = info
+                            .get_property_val_str("group")
+                            .filter(|g| !g.is_empty())
+                            .map(str::to_string);
                         let addrs = info.get_addresses().iter().copied().collect();
                         if tx
                             .send(DiscoveryEvent::Seen {
@@ -131,6 +150,7 @@ impl Discovery {
                                 addrs,
                                 port: info.get_port(),
                                 protocol: Protocol::Native,
+                                group,
                             })
                             .is_err()
                         {
@@ -154,6 +174,7 @@ impl Discovery {
             fullname,
             fingerprint,
             nickname: nickname_owned,
+            group: group_owned,
             port,
             instance,
             host,
@@ -201,6 +222,13 @@ impl Discovery {
         self.re_register()
     }
 
+    /// 运行时改组名(M7a 热生效):更新自持组名后走既有 `re_register`,
+    /// 对端通过 TXT "group" 变更即时看到新分组。模式同 `set_nickname`。
+    pub fn set_group(&mut self, group: Option<&str>) -> Result<(), mdns_sd::Error> {
+        self.group = group.map(str::to_string);
+        self.re_register()
+    }
+
     /// unregister 旧实例、register 一份新构建的 ServiceInfo,重建
     /// `enable_addr_auto` 的地址集合(只在 `apply_exclusions` 确认清单真变化
     /// 后调用,见其文档注释与文件头坑位说明)。instance/host 不变,
@@ -224,6 +252,7 @@ impl Discovery {
             &self.host,
             &self.fingerprint,
             &self.nickname,
+            self.group.as_deref(),
             self.port,
         )?;
         self.fullname = info.get_fullname().to_string();
@@ -296,9 +325,35 @@ mod tests {
             "abcdef0123456789.local.",
             &"a".repeat(64),
             "新昵称",
+            None,
             4600,
         )
         .unwrap();
         assert_eq!(info.get_property_val_str("nick"), Some("新昵称"));
+    }
+
+    /// M7a:TXT 携带 group 字段;无组名写空串占位(解析侧空串→None)。
+    #[test]
+    fn build_service_info_embeds_group_in_txt() {
+        let info = build_service_info(
+            "abcdef0123456789",
+            "abcdef0123456789.local.",
+            &"a".repeat(64),
+            "昵称",
+            Some("研发部"),
+            4600,
+        )
+        .unwrap();
+        assert_eq!(info.get_property_val_str("group"), Some("研发部"));
+        let info2 = build_service_info(
+            "abcdef0123456789",
+            "abcdef0123456789.local.",
+            &"a".repeat(64),
+            "昵称",
+            None,
+            4600,
+        )
+        .unwrap();
+        assert_eq!(info2.get_property_val_str("group"), Some(""), "无组名写空串占位");
     }
 }

@@ -16,12 +16,12 @@ const fp5 = "d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3";
 const fp6 = "e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
 
 const peers: Peer[] = [
-  { fingerprint: fp1, nickname: "工位小王", addrs: ["192.168.1.23"], port: 24917, protocol: "native", state: "reachable" },
-  { fingerprint: fp2, nickname: "测试机-Win11", addrs: ["192.168.1.45"], port: 24917, protocol: "native", state: "unreachable" },
-  { fingerprint: fp3, nickname: "Aria", addrs: ["192.168.1.60"], port: 24917, protocol: "native", state: "discovered" },
-  { fingerprint: fp4, nickname: "飞秋-前台", addrs: ["192.168.1.77"], port: 2425, protocol: "ipmsg", state: "reachable" },
-  { fingerprint: fp5, nickname: "老李的Mac", addrs: ["192.168.1.88"], port: 24917, protocol: "native", state: "offline" },
-  { fingerprint: fp6, nickname: "会议室NUC", addrs: ["192.168.1.99"], port: 24917, protocol: "native", state: "offline" },
+  { fingerprint: fp1, nickname: "工位小王", addrs: ["192.168.1.23"], port: 24917, protocol: "native", state: "reachable", group: "研发部" },
+  { fingerprint: fp2, nickname: "测试机-Win11", addrs: ["192.168.1.45"], port: 24917, protocol: "native", state: "unreachable", group: "研发部" },
+  { fingerprint: fp3, nickname: "Aria", addrs: ["192.168.1.60"], port: 24917, protocol: "native", state: "discovered", group: null },
+  { fingerprint: fp4, nickname: "飞秋-前台", addrs: ["192.168.1.77"], port: 2425, protocol: "ipmsg", state: "reachable", group: "行政部" },
+  { fingerprint: fp5, nickname: "老李的Mac", addrs: ["192.168.1.88"], port: 24917, protocol: "native", state: "offline", group: null },
+  { fingerprint: fp6, nickname: "会议室NUC", addrs: ["192.168.1.99"], port: 24917, protocol: "native", state: "offline", group: null },
 ];
 
 const conv = (items: TimelineItem[]): Conversation => ({ items, hasMore: false, loaded: true });
