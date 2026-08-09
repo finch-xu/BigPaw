@@ -1397,9 +1397,7 @@ fn handle_group_wire(
             }
             let updated = {
                 let mut g = groups.lock().expect("groups lock");
-                let Some(group) = g.get(&group_id) else {
-                    return None;
-                };
+                let group = g.get(&group_id)?;
                 if group.creator_fp != self_fp || !group.has_member(&member_fp) {
                     return None; // 非建群者收到退群通知/重复退群:忽略
                 }
