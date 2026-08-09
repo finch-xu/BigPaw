@@ -66,7 +66,7 @@ fn ping() -> String {
 #[tauri::command]
 fn get_self_info(core: State<'_, AppCore>) -> SelfInfo {
     SelfInfo {
-        nickname: core.0.nickname().to_string(),
+        nickname: core.0.nickname(),
         fingerprint: core.0.fingerprint().to_string(),
     }
 }

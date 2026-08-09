@@ -217,7 +217,8 @@ pub struct CoreConfig {
 
 pub struct Core {
     identity: Arc<Identity>,
-    nickname: String,
+    /// 当前生效昵称。Mutex 因 apply_settings 热改名(昵称热生效)与读取并发。
+    nickname: Mutex<String>,
     roster_rx: watch::Receiver<Vec<Peer>>,
     roster_handle: Arc<Mutex<Roster>>,
     discovery: std::sync::Mutex<Option<Discovery>>,
@@ -637,7 +638,7 @@ impl Core {
 
         Ok(Self {
             identity,
-            nickname,
+            nickname: Mutex::new(nickname),
             roster_rx: watch_rx,
             roster_handle,
             discovery: std::sync::Mutex::new(Some(discovery)),
@@ -660,8 +661,8 @@ impl Core {
         &self.identity.fingerprint
     }
 
-    pub fn nickname(&self) -> &str {
-        &self.nickname
+    pub fn nickname(&self) -> String {
+        self.nickname.lock().expect("nickname lock").clone()
     }
 
     pub fn roster_snapshot(&self) -> Vec<Peer> {
@@ -900,6 +901,39 @@ impl Core {
                 }
             },
         );
+
+        // 昵称热生效:diff 归一化后的新旧值,变了才逐路通知(幂等,未变零成本)。
+        let new_nick = effective_nickname(s);
+        let changed = {
+            let mut cur = self.nickname.lock().expect("nickname lock");
+            if *cur != new_nick {
+                *cur = new_nick.clone();
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            {
+                let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
+                if let Some(d) = discovery.as_mut() {
+                    if let Err(e) = d.set_nickname(&new_nick) {
+                        eprintln!("mdns: 昵称热生效失败: {e}");
+                    }
+                }
+            }
+            {
+                let announce = self.announce.lock().expect("announce lock poisoned");
+                if let Some(a) = announce.as_ref() {
+                    a.set_nick(&new_nick); // 纯内存换 buf,持锁无 IO
+                }
+            }
+            // ipmsg 锁只用于克隆 Arc,set_nick 的 BR_ENTRY 补发在锁外(锁纪律)。
+            let ipmsg = self.ipmsg.lock().expect("ipmsg lock poisoned").clone();
+            if let Some(svc) = ipmsg {
+                svc.set_nick(&new_nick);
+            }
+        }
     }
 
     /// 列出全部网卡(不滤排除项),标注 excluded 状态,供壳层设置页展示。
@@ -1073,6 +1107,17 @@ fn hostname_no_local() -> String {
 
 fn default_nickname() -> String {
     hostname_no_local()
+}
+
+/// 设置里的昵称归一化:None/空白 → 主机名默认值(与 UI 侧 trim+空值回退
+/// 的语义对齐)。壳层 CoreConfig::nickname 恒为 None,热生效路径只看 settings。
+fn effective_nickname(s: &crate::settings::Settings) -> String {
+    s.nickname
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(default_nickname)
 }
 
 /// IPMsg 事件 → roster/transport 事件的映射(M5,设计文档 §6):
@@ -2087,6 +2132,46 @@ mod tests {
         assert_eq!(zoe.state, PeerState::Offline);
         assert_eq!(zoe.nickname, "zoe");
         assert_eq!(zoe.addrs, vec!["192.168.1.7".parse::<IpAddr>().unwrap()]);
+        core.shutdown();
+    }
+
+    #[test]
+    fn effective_nickname_falls_back_to_hostname_when_unset_or_blank() {
+        let unset = crate::settings::Settings::default();
+        assert_eq!(effective_nickname(&unset), default_nickname());
+
+        let blank = crate::settings::Settings {
+            nickname: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective_nickname(&blank), default_nickname());
+
+        let set = crate::settings::Settings {
+            nickname: Some("大脚猫".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(effective_nickname(&set), "大脚猫");
+    }
+
+    #[test]
+    fn apply_settings_hot_renames_nickname() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("旧名".to_string()),
+        })
+        .unwrap();
+        assert_eq!(core.nickname(), "旧名");
+
+        core.apply_settings(&crate::settings::Settings {
+            nickname: Some("新名".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(core.nickname(), "新名", "改名应即时反映在 nickname() 上");
+
+        // 清空昵称 = 回退主机名默认值
+        core.apply_settings(&crate::settings::Settings::default());
+        assert_eq!(core.nickname(), default_nickname());
         core.shutdown();
     }
 
