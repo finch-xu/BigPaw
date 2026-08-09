@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.bigpaw.app",
   "build": {
-    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeDevCommand": "pnpm -C ../ui dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm --prefix ../ui run build",
+    "beforeBuildCommand": "pnpm -C ../ui build",
     "frontendDist": "../ui/dist"
   },
   "app": {

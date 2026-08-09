@@ -2,7 +2,7 @@
 // 把版本号同步写进所有存放它的文件，发版第一步。
 //
 // 用法: node scripts/set-version.mjs 0.2.0
-//   或: npm --prefix ui run version:set -- 0.2.0
+//   或: pnpm -C ui version:set 0.2.0
 //
 // 为什么需要这个脚本: 版本号在 Cargo.toml（workspace.package，三个成员 crate 都继
 // 承它）/ tauri.conf.json / ui/package.json 里各存一份，没有任何构建期注入把它们
