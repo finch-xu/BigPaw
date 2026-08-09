@@ -2205,8 +2205,10 @@ mod tests {
 
     #[test]
     fn effective_group_normalizes() {
-        let mut s = crate::settings::Settings::default();
-        s.group = Some("  研发部\u{0} ".to_string());
+        let mut s = crate::settings::Settings {
+            group: Some("  研发部\u{0} ".to_string()),
+            ..Default::default()
+        };
         assert_eq!(effective_group(&s), Some("研发部".to_string()));
         s.group = Some("   ".to_string());
         assert_eq!(effective_group(&s), None, "纯空白视为未设置");
