@@ -164,7 +164,17 @@ impl Core {
         let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
         let ipmsg_host = hostname_no_local();
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
-            match IpmsgService::start(&nickname, &ipmsg_host, IPMSG_PORT, ipmsg_evt_tx) {
+            // 最小传参:临时用 default_broadcast_targets()(=255.255.255.255,保持
+            // 改造前的全网段广播行为)。真正接入 net_ifaces 快照(排除清单生效)
+            // 是 Step 7 的事,这里先只保证编译通过与既有行为不变。
+            let ipmsg_targets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+            match IpmsgService::start(
+                &nickname,
+                &ipmsg_host,
+                IPMSG_PORT,
+                ipmsg_evt_tx,
+                ipmsg_targets,
+            ) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
                     eprintln!("ipmsg: {IPMSG_PORT} 端口不可用({e}),兼容层已禁用(原生栈不受影响)");
