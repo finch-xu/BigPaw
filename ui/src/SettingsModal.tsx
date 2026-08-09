@@ -59,7 +59,6 @@ export default function SettingsModal() {
   }, []);
 
   async function save(next: Settings, restartHint: boolean) {
-    const prev = settings;
     setSettings(next);
     if (!IS_TAURI) return;
     try {
@@ -67,8 +66,14 @@ export default function SettingsModal() {
       if (restartHint) setNeedRestart(true);
       setError("");
     } catch (e) {
-      // 回滚:失败的改动不得被后续保存夹带落盘(set_settings 是整对象覆盖)
-      setSettings(prev);
+      // 回滚:不能恢复"本次调用开始时"的快照——多个 save 连续触发时(如网络接口区
+      // 连点几个 checkbox),陈旧快照会把后一次已成功落盘的改动从 UI 上抹掉。
+      // 后端(settings.json,由 set_settings 落盘)才是唯一真源,失败后应以它为准。
+      try {
+        setSettings(await invoke<Settings>("get_settings"));
+      } catch {
+        // 拉真值也失败:保底保留当前乐观值,不再引入二次状态跳变
+      }
       setError(String(e));
     }
   }
@@ -88,8 +93,9 @@ export default function SettingsModal() {
     const next = enabled
       ? settings.excludedInterfaces.filter((n) => n !== name)
       : [...settings.excludedInterfaces, name];
+    // checkbox 展示只读 settings.excludedInterfaces,ifaces.excluded 目前无渲染路径读取,
+    // 不再维护这份影子状态,避免它与 settings 不同步却无人察觉。
     void save({ ...settings, excludedInterfaces: next }, false);
-    setIfaces((list) => list.map((f) => (f.name === name ? { ...f, excluded: !enabled } : f)));
   }
 
   async function handleClearAll() {
