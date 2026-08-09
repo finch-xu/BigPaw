@@ -238,7 +238,7 @@ fn sleep_and_watch_ifaces(
     ifaces_rx: &mut watch::Receiver<IfaceSnapshot>,
     joined: &Mutex<Vec<Ipv4Addr>>,
     socket: &UdpSocket,
-    buf: &[u8],
+    buf: &Mutex<Vec<u8>>,
     port: u16,
     last_send: &mut Instant,
     dur: Duration,
@@ -258,7 +258,8 @@ fn sleep_and_watch_ifaces(
                 sync_multicast(socket, &mut joined_guard, &snapshot.entries);
             }
             if send_allowed(*last_send, Instant::now()) {
-                send_dual(socket, buf, port, &snapshot.entries);
+                let b = buf.lock().expect("announce_buf lock").clone();
+                send_dual(socket, &b, port, &snapshot.entries);
                 *last_send = Instant::now();
                 pending_send = false;
             } else {
@@ -269,7 +270,8 @@ fn sleep_and_watch_ifaces(
             // 用当前快照(不必是触发变化那一刻的快照,`ifaces_rx.borrow()`
             // 读最新值不消费变更标记,行为等价于"发最新状态",更准确)。
             let entries = ifaces_rx.borrow().entries.clone();
-            send_dual(socket, buf, port, &entries);
+            let b = buf.lock().expect("announce_buf lock").clone();
+            send_dual(socket, &b, port, &entries);
             *last_send = Instant::now();
             pending_send = false;
         }
@@ -287,7 +289,7 @@ fn sleep_and_watch_ifaces(
 /// 循环与周期循环各自调用一次,逻辑完全相同,抽出来避免两处漂移。
 fn resync_and_maybe_send(
     socket: &UdpSocket,
-    buf: &[u8],
+    buf: &Mutex<Vec<u8>>,
     port: u16,
     ifaces_rx: &watch::Receiver<IfaceSnapshot>,
     joined: &Mutex<Vec<Ipv4Addr>>,
@@ -299,7 +301,8 @@ fn resync_and_maybe_send(
         sync_multicast(socket, &mut joined_guard, &entries);
     }
     if send_allowed(*last_send, Instant::now()) {
-        send_dual(socket, buf, port, &entries);
+        let b = buf.lock().expect("announce_buf lock").clone();
+        send_dual(socket, &b, port, &entries);
         *last_send = Instant::now();
     }
 }
@@ -320,7 +323,7 @@ fn resync_and_maybe_send(
 fn send_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
-    buf: Vec<u8>,
+    buf: Arc<Mutex<Vec<u8>>>,
     port: u16,
     mut ifaces_rx: watch::Receiver<IfaceSnapshot>,
     joined: Arc<Mutex<Vec<Ipv4Addr>>>,
@@ -397,7 +400,7 @@ fn recv_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
     self_fp: String,
-    reply_buf: Vec<u8>,
+    reply_buf: Arc<Mutex<Vec<u8>>>,
     tx: Sender<DiscoveryEvent>,
     ifaces_rx: watch::Receiver<IfaceSnapshot>,
 ) {
@@ -453,7 +456,8 @@ fn recv_loop(
         if should_reply && !ifaces_rx.borrow().entries.is_empty() {
             last_reply.insert(src_ip, now);
             // 应答只单播回对端的宣告 socket(收发同一 socket,src 即其宣告端口),防 N² 广播风暴。
-            let _ = socket.send_to(&reply_buf, src);
+            let reply = reply_buf.lock().expect("announce_buf lock").clone();
+            let _ = socket.send_to(&reply, src);
         }
     }
 }
@@ -467,8 +471,12 @@ pub struct AnnounceService {
     /// (`send_loop`/`sleep_and_watch_ifaces`)会在网卡快照变化时并发读写它,
     /// `shutdown` 时再借这把锁读出最终集合做对称 leave。
     joined: Arc<Mutex<Vec<Ipv4Addr>>>,
-    /// 预编码好的自身宣告报文,`poke` 复用它做定向单播(见下)。
-    announce_buf: Vec<u8>,
+    /// 预编码好的自身宣告报文,发送/接收/poke 三方共享;`set_nick` 原地覆写,
+    /// 各读点在锁内克隆、锁外发送(锁纪律见 core.rs)。
+    announce_buf: Arc<Mutex<Vec<u8>>>,
+    /// 重建宣告报文所需的自身参数(`set_nick` 用)。
+    fp: String,
+    tport: u16,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -498,7 +506,7 @@ impl AnnounceService {
             tport,
             caps: "native".to_string(),
         };
-        let buf = encode(&announcement);
+        let buf = Arc::new(Mutex::new(encode(&announcement)));
         let self_fp = identity.fingerprint.clone();
         // recv_loop 也要看当前网卡快照(Important 2b),独立克隆一份
         // `watch::Receiver`——两份各自维护自己的"已读"游标,recv_loop 这边
@@ -509,7 +517,7 @@ impl AnnounceService {
         let send_handle = {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
-            let buf = buf.clone();
+            let buf = Arc::clone(&buf);
             let joined = Arc::clone(&joined);
             std::thread::spawn(move || send_loop(socket, stop, buf, port, ifaces_rx, joined))
         };
@@ -517,7 +525,7 @@ impl AnnounceService {
         let recv_handle = {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
-            let buf = buf.clone();
+            let buf = Arc::clone(&buf);
             std::thread::spawn(move || {
                 recv_loop(socket, stop, self_fp, buf, tx, ifaces_rx_for_recv)
             })
@@ -528,6 +536,8 @@ impl AnnounceService {
             socket,
             joined,
             announce_buf: buf,
+            fp: identity.fingerprint.clone(),
+            tport,
             send_handle: Some(send_handle),
             recv_handle: Some(recv_handle),
         })
@@ -541,7 +551,22 @@ impl AnnounceService {
     /// 负责串行调用、每次间隔 ≥50ms,避免看起来像扫描而触发 IDS 告警。
     pub fn poke(&self, ip: IpAddr) {
         let target = SocketAddr::new(ip, DEFAULT_ANNOUNCE_PORT);
-        let _ = self.socket.send_to(&self.announce_buf, target);
+        let buf = self.announce_buf.lock().expect("announce_buf lock").clone();
+        let _ = self.socket.send_to(&buf, target);
+    }
+
+    /// 昵称热生效:重编码宣告报文并原地覆写共享 buf。**不主动发送**——该通道
+    /// 是 mDNS 的兜底,传播等下一个周期(≤ PERIODIC_INTERVAL)即可,主动加发
+    /// 会突破"报文速率不高于现状"铁律;mDNS 侧已即时传播。
+    pub fn set_nick(&self, nick: &str) {
+        let announcement = Announcement {
+            v: 1,
+            fp: self.fp.clone(),
+            nick: nick.to_string(),
+            tport: self.tport,
+            caps: "native".to_string(),
+        };
+        *self.announce_buf.lock().expect("announce_buf lock") = encode(&announcement);
     }
 
     /// 停止两条线程、退出组播组并关闭 socket。
@@ -756,13 +781,13 @@ mod tests {
         let socket = Arc::new(socket);
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
-        let reply_buf = encode(&Announcement {
+        let reply_buf = Arc::new(Mutex::new(encode(&Announcement {
             v: 1,
             fp: "b".repeat(64),
             nick: "self".to_string(),
             tport: 1,
             caps: "native".to_string(),
-        });
+        })));
         let handle = {
             let socket = socket.clone();
             let stop = stop.clone();
@@ -856,7 +881,7 @@ mod tests {
         let (tx, mut rx) = watch::channel(IfaceSnapshot::default());
         let joined = Mutex::new(Vec::new());
         let stop = AtomicBool::new(false);
-        let buf = b"hello".to_vec();
+        let buf = Mutex::new(b"hello".to_vec());
 
         // 让 last_send 刚发生在 300ms 前:紧接着的网卡变化必然撞上 1s 限速
         // 窗口,制造"补发被跳过"的场景。
@@ -926,13 +951,52 @@ mod tests {
         // last_send 设在很久以前,保证 send_allowed 恒真,不干扰本测试关注
         // 的 sync_multicast 部分。
         let mut last_send = Instant::now() - Duration::from_secs(10);
+        let buf = Mutex::new(b"hello".to_vec());
 
-        resync_and_maybe_send(&socket, b"hello", 0, &rx, &joined, &mut last_send);
+        resync_and_maybe_send(&socket, &buf, 0, &rx, &joined, &mut last_send);
 
         assert!(
             joined.lock().unwrap().is_empty(),
             "即使 watch 从未变化,resync_and_maybe_send 也该无条件跑一次 \
              sync_multicast(leave 掉快照里已经不存在的陈旧 IP)"
         );
+    }
+
+    // ---------- set_nick:昵称热生效(Task 2) ----------
+
+    #[test]
+    fn set_nick_swaps_the_shared_announce_buf() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::default()); // entries 空 = 不发包
+        let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
+        let svc = AnnounceService::start(&identity, "旧名", 4600, 0, ev_tx, ifaces_rx).unwrap();
+
+        svc.set_nick("新名");
+
+        let buf = svc.announce_buf.lock().unwrap().clone();
+        let ann = decode(&buf).expect("覆写后的 buf 必须仍可解码");
+        assert_eq!(ann.nick, "新名");
+        assert_eq!(ann.fp, identity.fingerprint, "fp/tport 等其余字段不得漂移");
+        assert_eq!(ann.tport, 4600);
+        svc.shutdown();
+    }
+
+    #[test]
+    fn set_nick_still_truncates_oversized_nick() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::default());
+        let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
+        let svc = AnnounceService::start(&identity, "旧名", 4600, 0, ev_tx, ifaces_rx).unwrap();
+
+        svc.set_nick(&"长".repeat(500));
+
+        let ann = decode(&svc.announce_buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            ann.nick.len() <= 64,
+            "encode 内的 truncate_nick 必须仍然生效"
+        );
+        svc.shutdown();
     }
 }
