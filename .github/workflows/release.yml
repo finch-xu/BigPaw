@@ -30,19 +30,21 @@ jobs:
           set -euo pipefail
           want="${GITHUB_REF_NAME#v}"
           conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          pkg=$(node -p "require('./ui/package.json').version")
           # 根 Cargo.toml 的 [workspace.package] version 是全 workspace 唯一的版本源。
           cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
-          echo "tag=$want  tauri.conf.json=$conf  Cargo.toml=$cargo"
+          echo "tag=$want  tauri.conf.json=$conf  ui/package.json=$pkg  Cargo.toml=$cargo"
 
           fail=0
           [ "$conf"  = "$want" ] || { echo "::error::tauri.conf.json 是 $conf，tag 是 $want"; fail=1; }
+          [ "$pkg"   = "$want" ] || { echo "::error::ui/package.json 是 $pkg，tag 是 $want"; fail=1; }
           [ "$cargo" = "$want" ] || { echo "::error::Cargo.toml 是 $cargo，tag 是 $want"; fail=1; }
           if [ "$fail" -eq 1 ]; then
-            echo "::error::改完两处版本号并提交后，重新打 tag。"
+            echo "::error::跑 node scripts/set-version.mjs $want，提交后重新打 tag。"
             exit 1
           fi
-          echo "版本号两处一致: $want"
+          echo "版本号三处一致: $want"
 
   build-windows-x64:
     name: Build Windows x64
