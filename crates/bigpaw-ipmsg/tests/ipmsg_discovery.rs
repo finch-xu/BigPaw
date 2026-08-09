@@ -1,6 +1,6 @@
 //! 双 IpmsgService 互发现。#[ignore](需广播网络);端口 2425 固定。
 
-use bigpaw_ipmsg::discovery::{IpmsgEvent, IpmsgService};
+use bigpaw_ipmsg::discovery::{default_broadcast_targets, IpmsgEvent, IpmsgService};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -21,9 +21,9 @@ fn wait_online(rx: &Receiver<IpmsgEvent>, want_host: &str, secs: u64) -> bool {
 fn two_ipmsg_instances_discover() {
     let (txa, rxa) = std::sync::mpsc::channel();
     let (txb, rxb) = std::sync::mpsc::channel();
-    let a = IpmsgService::start("alice", "HOST-A", 2425, txa).unwrap();
+    let a = IpmsgService::start("alice", "HOST-A", 2425, txa, default_broadcast_targets()).unwrap();
     // 同机两实例共用 2425 需 SO_REUSEPORT/REUSEADDR;若不行本测试跳过
-    let b = IpmsgService::start("bob", "HOST-B", 2425, txb);
+    let b = IpmsgService::start("bob", "HOST-B", 2425, txb, default_broadcast_targets());
     if b.is_err() {
         eprintln!("2425 单机双绑不支持,跳过(真实场景是两台机器)");
         return;
@@ -53,8 +53,8 @@ fn wait_text(rx: &Receiver<IpmsgEvent>, want_body: &str, secs: u64) -> bool {
 fn two_ipmsg_instances_exchange_text() {
     let (txa, rxa) = std::sync::mpsc::channel();
     let (txb, rxb) = std::sync::mpsc::channel();
-    let a = IpmsgService::start("alice", "HOST-A", 2425, txa).unwrap();
-    let b = IpmsgService::start("bob", "HOST-B", 2425, txb);
+    let a = IpmsgService::start("alice", "HOST-A", 2425, txa, default_broadcast_targets()).unwrap();
+    let b = IpmsgService::start("bob", "HOST-B", 2425, txb, default_broadcast_targets());
     if b.is_err() {
         eprintln!("2425 单机双绑不支持,跳过(真实场景是两台机器)");
         return;

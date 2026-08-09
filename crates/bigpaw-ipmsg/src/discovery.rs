@@ -126,11 +126,29 @@ fn interruptible_sleep(stop: &AtomicBool, dur: Duration) {
     }
 }
 
-fn broadcast(socket: &UdpSocket, buf: &[u8], port: u16) {
-    let dest = SocketAddrV4::new(Ipv4Addr::BROADCAST, port);
-    let _ = socket.send_to(buf, dest);
+/// 定向广播目标表:std 原语(该 crate 不依赖 bigpaw-core、无 tokio),
+/// 由调用方(bigpaw-core)按网卡排除清单填充,支持运行期热更新——
+/// `IpmsgService::start` 只持有 `Arc` 克隆,调用方改的是同一份底层 `Vec`。
+pub type BroadcastTargets = Arc<Mutex<Vec<Ipv4Addr>>>;
+
+/// 兜底目标表:`vec![Ipv4Addr::BROADCAST]`,即改造前的全网段广播行为。
+/// 供独立使用本 crate(不接 net_ifaces)的调用方与测试保持同机回环语义。
+pub fn default_broadcast_targets() -> BroadcastTargets {
+    Arc::new(Mutex::new(vec![Ipv4Addr::BROADCAST]))
 }
 
+/// 逐目标发送同一份报文:先在锁内克隆出目标列表,发送(阻塞 IO)全程在锁外
+/// 进行,不跨锁持有。单个目标发送失败(如网卡已拔出)`let _` 容错,不影响
+/// 其余目标。目标表为空 = 完全不发(隐身语义,供“全部网卡排除”场景使用)。
+fn broadcast(socket: &UdpSocket, buf: &[u8], targets: &BroadcastTargets, port: u16) {
+    let addrs = targets.lock().unwrap().clone();
+    for ip in addrs {
+        let dest = SocketAddrV4::new(ip, port);
+        let _ = socket.send_to(buf, dest);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_entry(
     socket: &UdpSocket,
     packet_no: &AtomicU32,
@@ -138,6 +156,7 @@ fn send_entry(
     host: &str,
     port: u16,
     self_token: &str,
+    targets: &BroadcastTargets,
 ) {
     let packet = Packet {
         version: IPMSG_VERSION.to_string(),
@@ -147,10 +166,11 @@ fn send_entry(
         command: command::BR_ENTRY,
         extra: entry_extra(nick, self_token),
     };
-    broadcast(socket, &proto::encode(&packet), port);
+    broadcast(socket, &proto::encode(&packet), targets, port);
 }
 
 /// 发送线程主循环:启动发一次 BR_ENTRY,之后每 ENTRY_INTERVAL 刷新一次。
+#[allow(clippy::too_many_arguments)]
 fn send_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
@@ -159,14 +179,31 @@ fn send_loop(
     host: String,
     port: u16,
     self_token: Arc<String>,
+    targets: BroadcastTargets,
 ) {
-    send_entry(&socket, &packet_no, &nick, &host, port, &self_token);
+    send_entry(
+        &socket,
+        &packet_no,
+        &nick,
+        &host,
+        port,
+        &self_token,
+        &targets,
+    );
     loop {
         interruptible_sleep(&stop, ENTRY_INTERVAL);
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        send_entry(&socket, &packet_no, &nick, &host, port, &self_token);
+        send_entry(
+            &socket,
+            &packet_no,
+            &nick,
+            &host,
+            port,
+            &self_token,
+            &targets,
+        );
     }
 }
 
@@ -207,6 +244,13 @@ fn dispatch(
     let is_bigpaw = packet.extra.contains(BIGPAW_TAG);
 
     match Command(packet.command).num() {
+        // 已知局限(留 TODO,本期接受):`recv` 侧的 UDP socket 仍绑 0.0.0.0,
+        // 不区分来源网卡是否在排除清单里——`broadcast()` 的定向目标表只控制
+        // "我方主动广播发给谁",不控制"谁发来的 BR_ENTRY 我方会回应"。所以
+        // 被排除网段的对端若仍能把 BR_ENTRY 发到本机(例如同网段内广播),
+        // 这里依旧会单播回 ANSENTRY——即被排除网段对端的“看见我方”这半边
+        // 无法通过本任务的定向广播完全消除。真正做到双向隔离需要 recv 侧也
+        // 按来源网卡过滤,留给后续任务(不在 Step 4 范围)。
         command::BR_ENTRY => {
             let reply = Packet {
                 version: IPMSG_VERSION.to_string(),
@@ -393,6 +437,10 @@ pub struct IpmsgService {
     host: String,
     port: u16,
     self_token: Arc<String>,
+    /// 定向广播目标表:BR_ENTRY 周期刷新与 shutdown 的 BR_EXIT 都发给这份表里的地址
+    /// (见 `broadcast()`)。持有 `Arc` 克隆,调用方(bigpaw-core)对底层 `Vec` 的
+    /// 热更新对本服务立即生效。
+    targets: BroadcastTargets,
     /// 已发出、待对端 RECVMSG 回执确认的 packet_no → 发送时刻。
     /// M5 不做重发/超时,Instant 目前只为将来扩展预留,收到 RECVMSG 即移除。
     pending_acks: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -409,11 +457,16 @@ pub struct IpmsgService {
 impl IpmsgService {
     /// 绑定 UDP `0.0.0.0:port`(SO_REUSEADDR + SO_BROADCAST),起发送/接收线程。
     /// 端口被占用(如飞秋已在运行)返回 `IpmsgError::PortInUse`,不静默失败。
+    ///
+    /// `targets`:BR_ENTRY/BR_EXIT 定向广播的目标地址表(必须启动时传入——
+    /// `send_loop` 起来就发第一条 BR_ENTRY)。独立使用本 crate 或不关心网卡
+    /// 排除的调用方可传 `default_broadcast_targets()` 保持全网段广播行为。
     pub fn start(
         nick: &str,
         host: &str,
         port: u16,
         tx: Sender<IpmsgEvent>,
+        targets: BroadcastTargets,
     ) -> Result<IpmsgService, IpmsgError> {
         let socket = Arc::new(bind_socket(port)?);
         let stop = Arc::new(AtomicBool::new(false));
@@ -446,8 +499,11 @@ impl IpmsgService {
             let nick = nick.to_string();
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
+            let targets = Arc::clone(&targets);
             std::thread::spawn(move || {
-                send_loop(socket, stop, packet_no, nick, host, port, self_token)
+                send_loop(
+                    socket, stop, packet_no, nick, host, port, self_token, targets,
+                )
             })
         };
 
@@ -481,6 +537,7 @@ impl IpmsgService {
             host: host.to_string(),
             port,
             self_token,
+            targets,
             pending_acks,
             offered_files,
             send_handle: Some(send_handle),
@@ -632,7 +689,12 @@ impl IpmsgService {
             command: command::BR_EXIT,
             extra: self.self_token.to_string(),
         };
-        broadcast(&self.socket, &proto::encode(&packet), self.port);
+        broadcast(
+            &self.socket,
+            &proto::encode(&packet),
+            &self.targets,
+            self.port,
+        );
 
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.send_handle.take() {
@@ -984,6 +1046,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn default_broadcast_targets_is_global_broadcast() {
+        let targets = default_broadcast_targets();
+        assert_eq!(*targets.lock().unwrap(), vec![Ipv4Addr::BROADCAST]);
+    }
+
+    /// 目标表为空 = 隐身语义:`broadcast()` 完全不发,对端 socket 收不到任何报文。
+    #[test]
+    fn broadcast_with_empty_targets_sends_nothing() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let receiver_port = receiver.local_addr().unwrap().port();
+
+        let targets: BroadcastTargets = Arc::new(Mutex::new(Vec::new()));
+        broadcast(&sender, b"hello", &targets, receiver_port);
+
+        let mut buf = [0u8; 16];
+        let err = receiver.recv_from(&mut buf).unwrap_err();
+        assert!(matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    /// 核心回归测试:**一次** `broadcast()` 调用、目标表里有多个元素,必须
+    /// 每个元素都真的发了一份出去——不能在循环里意外 break/return 导致只发了
+    /// 第一个就退出。
+    ///
+    /// 沙箱环境没有 root 权限配置额外的回环地址别名(`127.0.0.2` 等 bind 会
+    /// 返回 `AddrNotAvailable`,已用探测脚本确认),所以这里没法让 3 个目标
+    /// 各自解析到 3 个"看起来不同"的 socket 地址。改用一个可达的目标地址
+    /// (`127.0.0.1`)重复 3 次组成目标表,**同一次** `broadcast()` 调用发出
+    /// 后断言 receiver 恰好收到 3 份、且都是同一份报文内容——收到的次数
+    /// 直接等于 `targets.len()`,足以逮住"循环提前退出只发一个"这类回归
+    /// (生产环境里多个目标本就是同一个端口上的不同地址,变量只在 IP,不在
+    /// 发送次数这件事上,所以计数断言完整覆盖了本任务要保护的性质)。
+    #[test]
+    fn broadcast_sends_to_every_target_in_a_single_call() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+
+        const TARGET_COUNT: usize = 3;
+        let targets: BroadcastTargets =
+            Arc::new(Mutex::new(vec![Ipv4Addr::LOCALHOST; TARGET_COUNT]));
+
+        broadcast(&sender, b"probe", &targets, port);
+
+        let mut buf = [0u8; 16];
+        for i in 0..TARGET_COUNT {
+            let (n, _) = receiver
+                .recv_from(&mut buf)
+                .unwrap_or_else(|e| panic!("目标 #{i}/{TARGET_COUNT} 未送达: {e}"));
+            assert_eq!(&buf[..n], b"probe");
+        }
+
+        // 恰好 3 份,不多不少:再等一小段时间确认没有第 4 份意外到达。
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let extra = receiver.recv_from(&mut buf);
+        assert!(
+            extra.is_err(),
+            "targets 只有 {TARGET_COUNT} 个,不应该收到第 {}份",
+            TARGET_COUNT + 1
+        );
+    }
+
+    /// 锁不跨网络 IO:先 clone 目标列表再逐个 send_to,所以就算目标列表很大
+    /// (这里用 3 个)也不会在持锁状态下阻塞。间接验证方式:broadcast() 期间
+    /// 目标表仍可被其它线程正常 lock(不会死锁/阻塞超时)。
+    #[test]
+    fn broadcast_does_not_hold_lock_across_send() {
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let targets: BroadcastTargets = Arc::new(Mutex::new(vec![
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::LOCALHOST,
+        ]));
+        // 用一个明显不可能 listen 的高位端口即可,不关心报文是否真的被接收,
+        // 只关心 broadcast() 返回后锁立刻可用。
+        broadcast(&sender, b"probe", &targets, 39999);
+        let locked = targets.try_lock();
+        assert!(locked.is_ok(), "broadcast() 返回后锁应已释放");
+    }
+
     /// 端口被占用必须明确报错,不能静默失败。
     /// 用一个不带 REUSEADDR 的普通 UdpSocket 先占住端口作为"对照组"。
     /// 注:若本机确有进程占用测试用端口(与对照组冲突),提前返回跳过——
@@ -1001,7 +1155,8 @@ mod tests {
         };
 
         let (tx, _rx) = std::sync::mpsc::channel();
-        let result = IpmsgService::start("me", "HOST-ME", TEST_PORT, tx);
+        let result =
+            IpmsgService::start("me", "HOST-ME", TEST_PORT, tx, default_broadcast_targets());
         drop(guard);
 
         match result {

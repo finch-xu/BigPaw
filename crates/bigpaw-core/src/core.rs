@@ -6,12 +6,13 @@ use crate::discovery::announce::{
 };
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
+use crate::net_ifaces::{self, IfaceEntry, IfaceSnapshot, IfaceView, InterfaceRegistry};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::storage::Storage;
 use crate::transport::manager::{
     MessageEvent, SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
-use bigpaw_ipmsg::discovery::{IpmsgError, IpmsgEvent, IpmsgService};
+use bigpaw_ipmsg::discovery::{BroadcastTargets, IpmsgError, IpmsgEvent, IpmsgService};
 use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -37,6 +38,24 @@ const ROSTER_TICK: Duration = Duration::from_secs(5);
 /// 延迟。与其余组件的中断步长同量级(announce/ipmsg 的 SLEEP_STEP=200ms)。
 const ROSTER_POLL: Duration = Duration::from_millis(200);
 
+/// 网卡快照的主动刷新节奏(设计文档:网卡选择,Step 7 热生效)。排除清单
+/// 之外的系统级变化(拔插网线、切 Wi-Fi、VPN 连接/断开)不会主动通知我们
+/// ——`InterfaceRegistry::refresh()` 靠 roster 线程按这个节奏定期轮询兜底
+/// 感知。announce/transport 走 `watch` 订阅自动收到新快照;ipmsg 没有
+/// watch 机制,变化时需要显式覆写 `Core::ipmsg_bcast` 里的 `Vec`(见
+/// roster 线程实现;覆写经过 `IpmsgBcastGuard` 的 generation 守卫,防止
+/// 这条定期刷新与 `apply_settings` 热生效路径并发时互相用 stale 快照覆盖,
+/// 见该类型文档);mdns 的排除清单由 `apply_settings` 显式路径管理,
+/// 这条定期刷新不碰它(daemon 自己每 5s 自查网卡 IP 变化,不需要我们管)。
+///
+/// 取值推导:30s = 6 × `ROSTER_TICK`(5s)。网卡枚举是本机系统调用,不像
+/// 对端 `PEER_TIMEOUT` 那样受局域网抖动约束,没有必须匹配的外部节奏
+/// ——选它的倍数只是为了刷新检查点能安全地挂在既有的 `ROSTER_TICK`/
+/// `ROSTER_POLL` 轮询骨架上("检查点每 `ROSTER_POLL` 命中一次,真正执行
+/// 只在到点时才做"的模式与过期扫描一致),而不是引入第二套独立定时器;
+/// 6 倍留出足够余量,保证刷新频率明显低于过期扫描,不会成为新的热点。
+const IFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 对端超过这个时长未被任何发现通道(mDNS `Seen` 或 UDP 宣告 `Seen`)刷新,
 /// 判定离线——mDNS/UDP 宣告周期通常 20-30s,60s ≈ 2-3 个漏掉的心跳周期,
 /// 兼顾及时性与抖动容错(设计文档 §4 "心跳超时判离线")。这个阈值补的是
@@ -56,6 +75,118 @@ fn stale_fingerprints(
         .filter(|(_, t)| now.duration_since(**t) > timeout)
         .map(|(fp, _)| fp.clone())
         .collect()
+}
+
+/// 探测成功后决定写入历史 IP 表的地址子集(设计文档:网卡选择,Step 7)。
+/// `iface_entries` 非空时只记与本机某张网卡同网段的地址——跨网段地址多半
+/// 是抖动/多网卡多路径解析出来的噪声,记它对"下次启动时单播唤醒"没有
+/// 意义。`iface_entries` 为空(排除清单把所有网卡都排掉,或调用方还没
+/// 来得及准备快照)时保持"全记"的旧行为,不做任何过滤——这是刻意的零
+/// 语义漂移(3 处既有单测传 `vec![]` 无需改动预期)。抽成纯函数是为了不
+/// 必起真实探测线程就能确定性单测这条过滤规则(镜像 `stale_fingerprints`
+/// 的做法)。
+fn addrs_to_record(addrs: &[IpAddr], iface_entries: &[IfaceEntry]) -> Vec<IpAddr> {
+    if iface_entries.is_empty() {
+        addrs.to_vec()
+    } else {
+        addrs
+            .iter()
+            .copied()
+            .filter(|ip| net_ifaces::same_subnet(*ip, iface_entries))
+            .collect()
+    }
+}
+
+/// `Core::apply_settings` 的核心决策 + 副作用编排(设计文档:网卡选择,
+/// Step 7)。抽成自由函数、把"清单变了怎么通知 mdns"外置成回调,是为了让
+/// 行为测试不必起一个真实的 `Discovery`/mdns daemon 就能用合成的排除清单
+/// (包括一个测试机上必然不存在的网卡名)确定性验证下面两条关键分离逻辑:
+///
+/// - ipmsg 定向广播目标表只在**快照**真的变化时才覆写(`registry.set_excluded`
+///   已经用 `send_if_modified` 语义保证这一点,这里只是消费它的返回值);
+/// - mdns 排除清单则要比较**清单本身**(`old_list != excluded`),而不是看
+///   快照变没变——排除一个当前系统里根本不存在的网卡名时,快照不会变
+///   (没有任何条目因此被滤掉),但 daemon 必须记住这个名字,不然它日后
+///   插上来还是会被广播出去。
+fn apply_excluded_interfaces(
+    registry: &InterfaceRegistry,
+    ipmsg_bcast: &IpmsgBcastGuard,
+    excluded: &[String],
+    mut on_list_changed: impl FnMut(&[String], &[String]),
+) {
+    let (old_list, new_snapshot) = registry.set_excluded(excluded.to_vec());
+
+    if let Some(snapshot) = &new_snapshot {
+        ipmsg_bcast.apply_if_newer(snapshot);
+    }
+
+    if old_list != excluded {
+        on_list_changed(excluded, &old_list);
+    }
+}
+
+/// ipmsg 定向广播目标表的写入守卫(Important 1,最终评审修复;经复审指出
+/// 首版用 `AtomicU64::fetch_max` 做"两段式" check-then-write 仍有竞态窗口
+/// 后,改成本版的单锁临界区实现)。
+///
+/// 背景:`apply_settings` 热生效路径(`InterfaceRegistry::set_excluded`)与
+/// roster 线程按 `IFACE_REFRESH_INTERVAL` 的定期 `refresh()` 都可能产生一份
+/// 新快照,两者各自在拿到快照**之后**(已经离开 registry 内部的 `excluded`
+/// 锁)才去锁 `ipmsg_bcast` 并覆写它的 `Vec`——这一步不受 `excluded` 锁保护。
+/// 若线程调度恰好让"读到旧快照的一方"晚于"读到新快照的一方"执行这个覆写
+/// (例如 roster 线程的 refresh() 在 apply_settings 发布新排除清单**之前**
+/// 就已经算完自己的旧快照,但因为被抢占,直到 apply_settings 写完之后才
+/// 轮到它执行覆写),就会用 stale 数据把刚生效的新排除清单覆盖回去——而
+/// ipmsg 没有 watch 机制感知这个错误,这个 stale 状态会无限期留存(直到
+/// 下一次快照内容碰巧真的变化),持续向已排除的网段发送 BR_ENTRY。
+///
+/// 首版实现的问题(复审指出):用独立的 `AtomicU64` 配 `fetch_max` 只能保证
+/// "谁先执行 fetch_max,谁的 generation 先被原子地记录"，不能保证"记录
+/// generation"与"覆写 targets"这两步对多个线程而言是同一个原子操作——两者
+/// 之间存在一个可被抢占的窗口:线程 B(旧 generation)的 `fetch_max` 检查
+/// 通过后,若在它真正执行 `targets.lock()` 写入之前被调度器换出,线程 A
+/// (新 generation)完整跑完"fetch_max 检查 + 写入"并释放锁,B 恢复执行后
+/// 仍会无条件地把自己更早读到的旧数据写回,覆盖 A 刚写完的新数据。
+///
+/// 现在的修法:不用独立的原子量做"预检",而是把 generation 与
+/// "覆写 targets"这两步收进**同一把锁(`applied_gen: Mutex<u64>`)的临界
+/// 区**——`apply_if_newer` 先锁 `applied_gen`,在**持有它的整个临界区内**
+/// 完成"读 generation → 判断 → 覆写 targets → 更新 generation"全部四步才
+/// 释放锁。固定锁序为"先锁 `applied_gen`,临界区内再锁 `targets`",三个
+/// 调用点(`apply_excluded_interfaces`、roster 线程两处 `refresh` 覆写)
+/// 全部只通过这一个方法接触 `targets`,不存在任何绕开 `applied_gen` 锁直接
+/// 覆写 `targets` 的路径——因此 `apply_if_newer` 的调用之间是完全互斥的,
+/// check 和 write 之间不再有可被插入的窗口,不需要把覆写挪进 registry 内部
+/// 改成回调(那样要给 registry 加 ipmsg 相关依赖,改动面更大)。
+struct IpmsgBcastGuard {
+    targets: BroadcastTargets,
+    applied_gen: Mutex<u64>,
+}
+
+impl IpmsgBcastGuard {
+    /// `initial_gen` 传调用方构造 `targets` 时所依据的那份快照的 generation
+    /// (`Core::start` 里是 `registry.snapshot().generation`),避免后续一份
+    /// generation 相同(理论上不会,但严谨起见)或更旧的快照被误判为"更新"。
+    fn new(targets: BroadcastTargets, initial_gen: u64) -> Self {
+        Self {
+            targets,
+            applied_gen: Mutex::new(initial_gen),
+        }
+    }
+
+    /// check-and-write 在 `applied_gen` 这一把锁的临界区内原子完成(见类型
+    /// 文档"现在的修法"):持锁期间做完"判断 generation → 覆写 targets →
+    /// 更新已应用 generation"三件事才放锁,调用者之间因此完全互斥——不存在
+    /// 让另一个调用者在"判断"和"写入"之间插进来的窗口。收到一份 stale 快照
+    /// (generation 不大于已应用值)时静默跳过,不覆写。
+    fn apply_if_newer(&self, snapshot: &IfaceSnapshot) {
+        let mut applied = self.applied_gen.lock().expect("applied gen lock");
+        if snapshot.generation > *applied {
+            *self.targets.lock().expect("ipmsg bcast lock") =
+                net_ifaces::broadcast_targets(&snapshot.entries);
+            *applied = snapshot.generation;
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -95,6 +226,13 @@ pub struct Core {
     /// 按值传给 `AnnounceService::shutdown`,与 `discovery` 字段同样的幂等模式。
     announce: Arc<Mutex<Option<AnnounceService>>>,
     transport: Arc<TransportManager>,
+    /// 活跃网卡快照的唯一真源(Step 7 编排):announce/transport 在
+    /// `Core::start` 里各自 `subscribe()` 了一份 watch 句柄,自动感知后续
+    /// 变化;mdns 没有 watch 机制,排除清单的变更走 `apply_settings` 里的
+    /// 显式 `discovery.apply_exclusions` 调用。roster 线程按
+    /// `IFACE_REFRESH_INTERVAL` 定期 `refresh()`,兜底感知排除清单之外的
+    /// 系统级网卡变化(拔插网线等)。
+    registry: Arc<InterfaceRegistry>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
     /// `events_rx` 那条 `TransportEvent` 通道的发送端克隆:`respond_file_ipmsg`
     /// 起的后台下载线程要在完成/失败时上报 `FileDone`/`FileFailed`,复用与
@@ -116,6 +254,15 @@ pub struct Core {
     /// 启动时 IPMsg 兼容层是否成功启用,供壳层 `ipmsg_status()` 命令查询,
     /// 让前端能提示"IPMsg 兼容层未启用(2425 被占用)"。启动后固定不变。
     ipmsg_available: bool,
+    /// ipmsg 兼容层的定向广播目标表(`Arc<Mutex<Vec<Ipv4Addr>>>`,Step 7)。
+    /// `IpmsgService`(若启用)内部克隆了同一份底层 `Arc`,这里包一层
+    /// `IpmsgBcastGuard` 用于热更新:排除清单变化后原地覆写内部 `Vec`,
+    /// `IpmsgService` 下次 BR_ENTRY/BR_EXIT 发送时自动感知新目标表,不需要
+    /// 重启服务。兼容层未启用时这份表仍然存在、仍然会被覆写,只是没有人读
+    /// 它,无害。`IpmsgBcastGuard` 的 generation 守卫防止 `apply_settings`
+    /// 热生效路径与 roster 线程定期 `refresh()` 并发覆写时互相用 stale
+    /// 快照覆盖对方(Important 1,最终评审修复,见该类型文档)。
+    ipmsg_bcast: Arc<IpmsgBcastGuard>,
     /// 对端(ipmsg 协议)通过 `SENDMSG|FILEATTACHOPT` 报价的文件:
     /// 本地生成的 `xfer_id -> (packet_no, file_id, 文件名, 大小)` 登记表,
     /// 供 `respond_file` 决定接受时反查、发起 `IpmsgService::request_file`。
@@ -150,11 +297,20 @@ impl Core {
             .or_else(|| settings.nickname.clone())
             .unwrap_or_else(default_nickname);
 
+        // 网卡选择(Step 7 编排):registry 是 announce/mdns/ipmsg/transport
+        // 共用的活跃网卡快照唯一真源。建在读 settings 之后、transport 起动
+        // 之前(与其它组件一样以 registry 为准起步),subscribe() 句柄随后
+        // 分发给 transport/announce/ipmsg 各自的接线点。
+        let registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         // 留一份克隆给 IPMsg 兼容层的事件转发线程(见下):TextReceived/
         // FileOffered 复用与原生传输层相同的 TransportEvent 转发路径。
         let events_tx = msg_tx.clone();
         let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
+        // set_iface_rx 在 transport 起动后立即接线——后续每次拨号前都会
+        // 按最新快照做同网段亲和排序(Step 6 机制)。
+        transport.set_iface_rx(registry.subscribe());
 
         // IPMsg/飞秋兼容层(M5,设计文档 §6):独立 crate,启动失败(最常见
         // 是 2425 已被占用,比如本机在跑飞秋)绝不能让 Core::start 整体失败
@@ -162,8 +318,29 @@ impl Core {
         // 标志供 `ipmsg_available()`/壳层 `ipmsg_status()` 命令查询。
         let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
         let ipmsg_host = hostname_no_local();
+        // 定向广播目标表(Step 7):由 registry 当前快照算出,排除清单已经
+        // 生效。底层 `Arc<Mutex<Vec<_>>>` 另克隆一份原样交给 `IpmsgService`
+        // 持有(它读、我们写);`Core::ipmsg_bcast` 上保留的是包了一层
+        // generation 守卫的 `IpmsgBcastGuard`(Important 1,最终评审修复),
+        // 供 `apply_settings`/roster 线程的定期刷新原地覆写内部 `Vec`——
+        // `IpmsgService` 自己另持有底层 `Arc` 的克隆,下次 BR_ENTRY/BR_EXIT
+        // 发送时自动感知,不需要重启服务。
+        let init_snapshot = registry.snapshot();
+        let ipmsg_bcast_targets: BroadcastTargets = Arc::new(Mutex::new(
+            net_ifaces::broadcast_targets(&init_snapshot.entries),
+        ));
+        let ipmsg_bcast = Arc::new(IpmsgBcastGuard::new(
+            ipmsg_bcast_targets.clone(),
+            init_snapshot.generation,
+        ));
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
-            match IpmsgService::start(&nickname, &ipmsg_host, IPMSG_PORT, ipmsg_evt_tx) {
+            match IpmsgService::start(
+                &nickname,
+                &ipmsg_host,
+                IPMSG_PORT,
+                ipmsg_evt_tx,
+                ipmsg_bcast_targets.clone(),
+            ) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
                     eprintln!("ipmsg: {IPMSG_PORT} 端口不可用({e}),兼容层已禁用(原生栈不受影响)");
@@ -182,7 +359,13 @@ impl Core {
         // 不需要额外同步。
         let (tx, rx) = std::sync::mpsc::channel();
         // 真实端口进 SRV
-        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        let mut discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        // 网卡排除清单初始提交(Step 5):prev=[] 表示"还没提交过任何清单",
+        // 清单非空时才会真正 disable + unregister/re-register;为空时是
+        // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)走
+        // `apply_settings`,这里只做启动时这一次。
+        discovery.apply_exclusions(&settings.excluded_interfaces, &[])?;
+
         // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
         // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
         let announce_service = AnnounceService::start(
@@ -191,6 +374,7 @@ impl Core {
             transport.port(),
             DEFAULT_ANNOUNCE_PORT,
             tx.clone(),
+            registry.subscribe(),
         )?;
         let announce = Arc::new(Mutex::new(Some(announce_service)));
 
@@ -242,6 +426,18 @@ impl Core {
         // 历史 IP 单播唤醒(M4 简化版双向注册):对已知历史设备逐个发一份
         // 单播宣告,串行、间隔 ≥50ms,让对方回连/回宣告,走正常发现流程
         // 重新进入 roster——不做端口扫描、不直接建连接。
+        //
+        // 已知局限(留 TODO,本期接受,镜像
+        // `bigpaw_ipmsg::discovery::dispatch` 里 BR_ENTRY 分支、以及
+        // `announce::recv_loop` 的同一条局限——见后者注释):`AnnounceService::poke`
+        // 直接对给定 IP 发一份定向单播,不看当前网卡快照/排除清单——即使用户
+        // 已经把这个历史 IP 所在的网段整张网卡都排除掉("隐身"=不主动宣告),
+        // 这条唤醒线程仍会向它发一个单播包,是"隐身"语义里尚未堵上的一个
+        // 缺口。之所以本期不修:`poke` 不经过 `send_targets`/`send_dual` 的
+        // 网卡枚举路径,要按来源网卡过滤就要么给它传网卡快照做同网段判断,
+        // 要么整条唤醒线程感知 registry——影响面超出本轮 Important 2 的最低
+        // 版本(被动应答/接收侧隐身)范围,留给后续任务按来源子网过滤时一并
+        // 处理。
         {
             let announce_for_wake = announce.clone();
             let wake_ips = history.lock().expect("history lock").ips();
@@ -262,6 +458,8 @@ impl Core {
         let roster_stop = Arc::new(AtomicBool::new(false));
         let roster_stop_for_thread = roster_stop.clone();
         let storage_for_roster = storage.clone();
+        let registry_for_thread = registry.clone();
+        let ipmsg_bcast_for_thread = ipmsg_bcast.clone();
         let roster_thread = std::thread::spawn(move || {
             let transport = transport_for_thread;
             // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
@@ -270,6 +468,12 @@ impl Core {
             // 过期扫描按 ROSTER_TICK 节奏;recv 轮询按 ROSTER_POLL 粒度。
             // 两者解耦:停止信号 200ms 内可见,扫描频率不因此提高 25 倍。
             let mut last_scan = Instant::now();
+            // 网卡快照的主动刷新节奏(IFACE_REFRESH_INTERVAL=30s,Step 7)。
+            // `Instant` 比较零成本,检查点放在 Timeout 分支和 Ok(ev) 分支
+            // 尾部各一份——只放 Timeout 分支的话,持续有事件流入(mDNS/UDP
+            // 宣告频繁)时 recv_timeout 会一直命中 Ok(ev) 而不是 Timeout,
+            // 30s 刷新会被无限期饿死。
+            let mut last_iface_refresh = Instant::now();
             loop {
                 match rx.recv_timeout(ROSTER_POLL) {
                     Ok(ev) => {
@@ -330,7 +534,14 @@ impl Core {
                         if let Some((fp, addrs, port)) = probe_target {
                             if !already_reachable {
                                 spawn_probe(
-                                    &transport, &tx, &in_flight, &history, &data_dir, fp, addrs,
+                                    &transport,
+                                    &tx,
+                                    &in_flight,
+                                    &history,
+                                    &data_dir,
+                                    registry_for_thread.snapshot().entries,
+                                    fp,
+                                    addrs,
                                     port,
                                 );
                             }
@@ -344,10 +555,36 @@ impl Core {
                         if roster_stop_for_thread.load(Ordering::Relaxed) {
                             break;
                         }
+
+                        // 网卡快照刷新检查(见 last_iface_refresh 声明处注释):
+                        // 持续有事件流入时也不能让 30s 刷新被无限期饿死。
+                        if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
+                            last_iface_refresh = Instant::now();
+                            if let Some(snapshot) = registry_for_thread.refresh() {
+                                // 经 generation 守卫覆写(Important 1):若这份
+                                // 快照因线程调度延迟到达,已经被 apply_settings
+                                // 发布的更新一代覆盖过,这里会被识别为 stale 而
+                                // 静默跳过,不会覆写回旧的广播目标表。
+                                ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
+                            }
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         if roster_stop_for_thread.load(Ordering::Relaxed) {
                             break;
+                        }
+                        // 网卡快照刷新检查(与 Ok(ev) 分支尾部同一份逻辑):
+                        // 放在 last_scan 的 `continue` 之前,避免"未到扫描
+                        // 节奏就 continue"顺带把这个检查点也跳过。
+                        if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
+                            last_iface_refresh = Instant::now();
+                            if let Some(snapshot) = registry_for_thread.refresh() {
+                                // 经 generation 守卫覆写(Important 1):若这份
+                                // 快照因线程调度延迟到达,已经被 apply_settings
+                                // 发布的更新一代覆盖过,这里会被识别为 stale 而
+                                // 静默跳过,不会覆写回旧的广播目标表。
+                                ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
+                            }
                         }
                         // 未到扫描节奏就继续轮询:这个分支现在每 ROSTER_POLL
                         // (200ms)就会命中一次,扫描本身仍按 ROSTER_TICK 执行。
@@ -406,12 +643,14 @@ impl Core {
             discovery: std::sync::Mutex::new(Some(discovery)),
             announce,
             transport,
+            registry,
             events_rx: Mutex::new(Some(pump_rx)),
             events_tx,
             roster_stop,
             roster_thread: Mutex::new(Some(roster_thread)),
             ipmsg: Mutex::new(ipmsg_service),
             ipmsg_available,
+            ipmsg_bcast,
             ipmsg_offers,
             storage,
         })
@@ -634,6 +873,40 @@ impl Core {
         self.ipmsg_available
     }
 
+    /// 网卡排除清单热生效入口(设计文档:网卡选择,Step 7)。壳层设置页保存
+    /// 新的 `Settings`(已经 `settings::save` 落盘)后调用它,让运行中的
+    /// announce/transport/ipmsg/mdns 全部感知新的排除清单,不需要重启 app。
+    ///
+    /// 实际决策逻辑在自由函数 `apply_excluded_interfaces` 里(TDD 友好:
+    /// 测试可以注入一个 spy 闭包代替真实 `discovery.apply_exclusions`,
+    /// 不需要起真实 mDNS daemon)。这里只负责提供"清单变了该怎么通知 mdns"
+    /// 这一步真实的副作用实现:持 `discovery` 锁调用 `apply_exclusions`
+    /// 是安全的——Step 5 已经把它做成非阻塞的投递式调用(内部先做纯函数
+    /// diff,只在结果非空时才触碰 daemon,且 `disable_interface`/
+    /// `enable_interface`/`re_register` 都是非阻塞 API),不会让这把锁跨越
+    /// 真正的网络 IO;若此刻 `discovery` 已经是 `None`(`shutdown` 之后),
+    /// 静默跳过。
+    pub fn apply_settings(&self, s: &crate::settings::Settings) {
+        apply_excluded_interfaces(
+            &self.registry,
+            &self.ipmsg_bcast,
+            &s.excluded_interfaces,
+            |new, old| {
+                let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
+                if let Some(d) = discovery.as_mut() {
+                    if let Err(e) = d.apply_exclusions(new, old) {
+                        eprintln!("mdns: 排除清单热生效失败: {e}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// 列出全部网卡(不滤排除项),标注 excluded 状态,供壳层设置页展示。
+    pub fn list_interfaces(&self) -> Vec<IfaceView> {
+        self.registry.list_all()
+    }
+
     /// 主动下线:注销 mDNS(发 goodbye)+ 停止 UDP 宣告收发,对端立刻收到
     /// Lost 而不是等 TTL 过期;随后停掉 roster 消费线程并 join 它,确保
     /// `shutdown` 返回时线程已经真正退出(不是"发个信号就当作已停")。
@@ -733,6 +1006,10 @@ fn persist_event(storage: &Storage, ev: &TransportEvent) {
 /// 内部的阻塞网络 IO——这把锁如果跨了阻塞拨号,会让同一 fp 的所有后续
 /// Seen 事件在等这次探测期间被迫串行阻塞在锁上,而 `in_flight` 集合本身
 /// 已经足够防止探测风暴,不需要用锁再多做这件事。
+///
+/// `iface_entries`(Step 7):探测成功后决定记入历史 IP 表的地址子集,
+/// 实际过滤逻辑在纯函数 `addrs_to_record` 里——非空时只记同网段地址,
+/// 为空时保持全记(零语义漂移,见该函数注释)。
 #[allow(clippy::too_many_arguments)]
 fn spawn_probe(
     transport: &Arc<TransportManager>,
@@ -740,6 +1017,7 @@ fn spawn_probe(
     in_flight: &Arc<Mutex<HashSet<String>>>,
     history: &Arc<Mutex<HistoryStore>>,
     data_dir: &Path,
+    iface_entries: Vec<IfaceEntry>,
     fingerprint: String,
     addrs: Vec<IpAddr>,
     port: u16,
@@ -760,10 +1038,11 @@ fn spawn_probe(
         let ok = transport.probe_reachable(&fingerprint, &addrs, port);
         let result_ev = if ok {
             // 回连成功:这几个地址里至少一个确实可达,记入历史 IP(供将来
-            // mDNS 不可用时的单播兜底探测使用)。
+            // mDNS 不可用时的单播兜底探测使用)——具体记哪些见
+            // `addrs_to_record` 注释。
             let mut h = history.lock().expect("history lock");
-            for ip in &addrs {
-                h.record(*ip);
+            for ip in addrs_to_record(&addrs, &iface_entries) {
+                h.record(ip);
             }
             h.save(&data_dir);
             drop(h);
@@ -911,6 +1190,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             id_b.fingerprint.clone(),
             local.clone(),
             transport_b.port(),
@@ -953,6 +1233,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             dead_fp.clone(),
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             1, // 无人监听
@@ -984,6 +1265,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             "bbbb".to_string(),
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             1,
@@ -1093,6 +1375,327 @@ mod tests {
                 .expect("测试机器已启动超过 60s"),
         );
         assert!(stale_fingerprints(&last_seen, now, Duration::from_secs(60)).is_empty());
+    }
+
+    // ---- addrs_to_record:spawn_probe 的历史 IP 过滤规则(Step 7) ----
+
+    fn iface_entry(name: &str, ip: Ipv4Addr, netmask: Ipv4Addr) -> IfaceEntry {
+        IfaceEntry {
+            name: name.to_string(),
+            ip,
+            netmask,
+            broadcast: net_ifaces::directed_broadcast(ip, netmask),
+            is_virtual_hint: false,
+        }
+    }
+
+    #[test]
+    fn addrs_to_record_keeps_all_when_entries_empty() {
+        // entries 为空(全排除/尚未初始化)保持"全记"的旧行为——现有 3 处
+        // spawn_probe 单测传 vec![] 正是依赖这条零语义漂移保证。
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)),
+        ];
+        assert_eq!(addrs_to_record(&addrs, &[]), addrs);
+    }
+
+    #[test]
+    fn addrs_to_record_filters_to_same_subnet_when_entries_present() {
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),   // 不同网段:该被滤掉
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), // 同网段:该保留
+        ];
+        assert_eq!(
+            addrs_to_record(&addrs, &entries),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))]
+        );
+    }
+
+    #[test]
+    fn addrs_to_record_empty_result_when_no_addr_matches_any_entry() {
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let addrs = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
+        assert!(addrs_to_record(&addrs, &entries).is_empty());
+    }
+
+    // ---- apply_excluded_interfaces:apply_settings 的核心决策(Step 7) ----
+    //
+    // 用真实 InterfaceRegistry(网卡枚举依赖真实主机,没有 mock 钩子),但
+    // mdns 一侧换成记录调用参数的 spy 闭包,不必起真实 Discovery/mdns
+    // daemon——这是"清单变化 → registry 快照变化 → ipmsg targets 被覆写"
+    // 这条编排逻辑可确定性单测的关键(与 brief 要求的"合成数据"对应:
+    // 一个测试机上必然不存在的网卡名,以及测试机当前真实的网卡名清单)。
+
+    /// 测试用:构造一份底层目标表 + generation=0 起步的 `IpmsgBcastGuard`,
+    /// 返回两者供测试既能调用 `apply_excluded_interfaces`,又能直接读底层
+    /// `BroadcastTargets` 断言写入结果。
+    fn new_bcast_guard() -> (BroadcastTargets, IpmsgBcastGuard) {
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+        (targets, guard)
+    }
+
+    #[test]
+    fn apply_excluded_interfaces_skips_mdns_callback_when_list_unchanged() {
+        let registry = InterfaceRegistry::new(vec!["already-excluded".to_string()]);
+        let (_targets, ipmsg_bcast) = new_bcast_guard();
+        let mut calls = 0;
+        apply_excluded_interfaces(
+            &registry,
+            &ipmsg_bcast,
+            &["already-excluded".to_string()],
+            |_, _| calls += 1,
+        );
+        assert_eq!(calls, 0, "清单没变不该触碰 mdns");
+    }
+
+    #[test]
+    fn apply_excluded_interfaces_notifies_mdns_for_nonexistent_iface_name_even_if_snapshot_unchanged(
+    ) {
+        // 关键分离逻辑:排除一个当前系统里根本不存在的网卡名——快照不会
+        // 变(没有任何条目因此被滤掉),但 daemon 必须记住这个名字(不然它
+        // 日后插上来还是会被广播出去),所以 mdns 回调仍然必须被调用。
+        let registry = InterfaceRegistry::new(vec![]);
+        let (targets, ipmsg_bcast) = new_bcast_guard();
+        let before_snapshot = registry.snapshot();
+        let before_bcast = targets.lock().unwrap().clone();
+
+        let fake_name = "definitely-not-a-real-iface-zzz".to_string();
+        let mut calls: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        apply_excluded_interfaces(
+            &registry,
+            &ipmsg_bcast,
+            std::slice::from_ref(&fake_name),
+            |new, old| {
+                calls.push((new.to_vec(), old.to_vec()));
+            },
+        );
+
+        assert_eq!(calls, vec![(vec![fake_name], vec![])], "清单变了必须通知 mdns");
+        assert_eq!(
+            registry.snapshot().entries,
+            before_snapshot.entries,
+            "不存在的网卡名不该改变快照"
+        );
+        assert_eq!(
+            *targets.lock().unwrap(),
+            before_bcast,
+            "快照没变,ipmsg 目标表不该被覆写"
+        );
+    }
+
+    #[test]
+    fn apply_excluded_interfaces_overwrites_ipmsg_bcast_when_snapshot_changes() {
+        let registry = InterfaceRegistry::new(vec![]);
+        let names: Vec<String> = registry.list_all().into_iter().map(|v| v.name).collect();
+        if names.is_empty() {
+            eprintln!("测试机无非回环网卡,跳过(快照永远不会因排除清单而变化)");
+            return;
+        }
+        let (targets, ipmsg_bcast) = new_bcast_guard();
+
+        let mut calls = 0;
+        apply_excluded_interfaces(&registry, &ipmsg_bcast, &names, |_, _| calls += 1);
+
+        assert_eq!(calls, 1, "清单从空变成非空,必须通知 mdns");
+        let expected = net_ifaces::broadcast_targets(&registry.snapshot().entries);
+        assert_eq!(
+            *targets.lock().unwrap(),
+            expected,
+            "快照真的变了,ipmsg 目标表必须原地覆写成新快照算出的广播地址"
+        );
+    }
+
+    // ---- IpmsgBcastGuard:generation 守卫堵 stale 覆写竞态(Important 1,
+    // 最终评审修复)----
+    //
+    // `apply_settings`(set_excluded)与 roster 线程定期 `refresh()` 并发时,
+    // 真实的交错时序依赖线程调度、无法在单测里可靠复现;能确定性验证的是
+    // 修复所依赖的结构保证本身——generation 更旧的写入,无论它在时间线上
+    // 排在 generation 更新的写入*之后*才执行到覆写这一步,都必须被识别为
+    // stale 并跳过。下面直接构造"新写入先发生、旧写入后到达"的交错顺序
+    // (对应评审描述的竞态:roster 线程 refresh() 发布 gen N 后被抢占,
+    // apply_settings 发布 gen N+1 并写 bcast,roster 恢复后用 gen N 覆写
+    // 回去),断言最终状态是新写入的结果、没有被旧写入覆盖。
+
+    #[test]
+    fn ipmsg_bcast_guard_rejects_stale_generation_applied_after_newer_one() {
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+
+        // "旧"快照:对应 roster 线程 refresh() 在 apply_settings 之前读到的
+        // 那份(排除生效之前,en0 仍在),generation=1。
+        let stale_entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let stale = IfaceSnapshot {
+            generation: 1,
+            entries: stale_entries,
+        };
+
+        // "新"快照:对应 apply_settings 里 set_excluded 排除掉 en0 之后发布的
+        // 那份,generation=2(严格新于 stale)。
+        let fresh_entries = vec![iface_entry(
+            "en1",
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(255, 0, 0, 0),
+        )];
+        let fresh = IfaceSnapshot {
+            generation: 2,
+            entries: fresh_entries.clone(),
+        };
+
+        // 交错顺序:新的先落地(apply_settings 抢先执行完覆写),旧的因为
+        // 线程调度延迟,后落地(roster 线程恢复执行、试图覆写回去)。
+        guard.apply_if_newer(&fresh);
+        guard.apply_if_newer(&stale);
+
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&fresh_entries),
+            "generation 更旧的写入即使后执行到覆写这一步,也不该覆盖更新一代的结果"
+        );
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_applies_when_generation_arrives_in_order() {
+        // 正常顺序(无竞态)下,新一代快照仍应正确覆写——防止守卫逻辑矫枉
+        // 过正,把所有写入都挡住。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+
+        let e1 = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        guard.apply_if_newer(&IfaceSnapshot {
+            generation: 1,
+            entries: e1,
+        });
+
+        let e2 = vec![iface_entry(
+            "en1",
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(255, 0, 0, 0),
+        )];
+        guard.apply_if_newer(&IfaceSnapshot {
+            generation: 2,
+            entries: e2.clone(),
+        });
+
+        assert_eq!(*targets.lock().unwrap(), net_ifaces::broadcast_targets(&e2));
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_same_generation_reapplied_is_a_harmless_noop() {
+        // 同一代重复应用(两个调用方都读到了同一份最新快照)不该 panic,
+        // 第二次是 no-op(条件是严格大于,不是大于等于)。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let snapshot = IfaceSnapshot {
+            generation: 1,
+            entries: entries.clone(),
+        };
+
+        guard.apply_if_newer(&snapshot);
+        guard.apply_if_newer(&snapshot);
+
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&entries)
+        );
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_concurrent_interleaved_generations_converge_to_the_max() {
+        // 多线程压力测试(复审要求):同线程顺序调用只能验证"逻辑上旧的不该
+        // 覆盖新的",验证不了"check 和 write 之间是否真的不可被抢占插入"这个
+        // 并发属性本身——两条线程各 1000 次交替以递增 generation 调用
+        // `apply_if_newer`,制造大量"新旧交错"的真实调度机会。这类压力测试
+        // 不能穷尽所有调度顺序,但配合 `apply_if_newer` 的锁序论证(见类型
+        // 文档"现在的修法":check-and-write 在同一把 `applied_gen` 锁的临界
+        // 区内原子完成,调用者之间完全互斥)已经足够——现在的实现下这个
+        // 断言应当 100% 确定性成立(不是"大概率成立"),因为整把锁序保证了
+        // "最终状态 = 出现过的最高 generation"这一收敛性质,与线程调度顺序
+        // 无关;首版 `fetch_max` 两段式实现在这个测试上并不保证必然失败
+        // (窗口很窄,压力测试可能撞不上),这正是复审指出"结构性论证"比
+        // "跑几次不挂"更重要的原因——本测试是锁序论证之外的补充信心,不是
+        // 唯一证据。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = Arc::new(IpmsgBcastGuard::new(targets.clone(), 0));
+
+        const ITERS: u64 = 1000;
+        fn entries_for_gen(gen: u64) -> Vec<IfaceEntry> {
+            vec![iface_entry(
+                "en0",
+                Ipv4Addr::new(10, 0, ((gen >> 8) & 0xff) as u8, (gen & 0xff) as u8),
+                Ipv4Addr::new(255, 255, 255, 0),
+            )]
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        // 线程 A:偶数代 2, 4, ..., 2*ITERS(全局最高的一代 2*ITERS 出自这里)。
+        let guard_a = guard.clone();
+        let barrier_a = barrier.clone();
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait(); // 尽量让两条线程同时起跑,加大交错概率
+            for i in 1..=ITERS {
+                let gen = i * 2;
+                guard_a.apply_if_newer(&IfaceSnapshot {
+                    generation: gen,
+                    entries: entries_for_gen(gen),
+                });
+            }
+        });
+
+        // 线程 B:奇数代 1, 3, ..., 2*ITERS-1——每一个都紧跟在线程 A 同轮次
+        // 的偶数代之后一个整数,专门制造"旧的紧跟在新的后面尝试覆写"的场景。
+        let guard_b = guard.clone();
+        let barrier_b = barrier.clone();
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            for i in 1..=ITERS {
+                let gen = i * 2 - 1;
+                guard_b.apply_if_newer(&IfaceSnapshot {
+                    generation: gen,
+                    entries: entries_for_gen(gen),
+                });
+            }
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // 两条线程整个压力测试期间出现过的全局最高 generation 是 2*ITERS
+        // (线程 A 的最后一次调用)。无论实际调度交错成什么顺序,最终状态都
+        // 必须与它一致——不能被任何一次更旧 generation 的调用事后覆盖。
+        let max_gen = ITERS * 2;
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&entries_for_gen(max_gen)),
+            "两线程 {ITERS} 次交替 apply 之后,最终 targets 必须与压力测试中\
+             出现过的最高 generation({max_gen})一致,不能被更旧的 generation \
+             事后覆盖"
+        );
     }
 
     // ---- forward_ipmsg_event:IPMsg → roster/transport 事件映射(M5) ----
@@ -1496,6 +2099,7 @@ mod tests {
                 nickname: Some("设置里的名字".to_string()),
                 download_dir: None,
                 ipmsg_enabled: true,
+                excluded_interfaces: Vec::new(),
             },
         )
         .unwrap();
@@ -1517,6 +2121,7 @@ mod tests {
                 nickname: None,
                 download_dir: None,
                 ipmsg_enabled: false,
+                excluded_interfaces: Vec::new(),
             },
         )
         .unwrap();

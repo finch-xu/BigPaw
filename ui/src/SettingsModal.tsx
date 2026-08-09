@@ -1,11 +1,22 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
-import { useAppStore, type Settings } from "./store";
+import { useAppStore, type NetIface, type Settings } from "./store";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 import { IS_TAURI } from "./mock";
 
-const MOCK_SETTINGS: Settings = { nickname: null, downloadDir: null, ipmsgEnabled: true };
+const MOCK_SETTINGS: Settings = {
+  nickname: null,
+  downloadDir: null,
+  ipmsgEnabled: true,
+  excludedInterfaces: [],
+};
+
+const MOCK_IFACES: NetIface[] = [
+  { name: "en0", ip: "192.168.1.23", netmask: "255.255.255.0", isVirtual: false, excluded: false },
+  { name: "en5", ip: "192.168.56.10", netmask: "255.255.255.0", isVirtual: false, excluded: false },
+  { name: "utun3", ip: "10.8.0.2", netmask: "255.255.255.0", isVirtual: true, excluded: false },
+];
 
 const THEME_OPTIONS: Array<[ThemePref, string]> = [
   ["light", "亮色"],
@@ -28,6 +39,7 @@ export default function SettingsModal() {
   const setShowSettings = useAppStore((s) => s.setShowSettings);
   const clearAll = useAppStore((s) => s.clearAll);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [ifaces, setIfaces] = useState<NetIface[]>([]);
   const [needRestart, setNeedRestart] = useState(false);
   const [error, setError] = useState("");
   const [theme, setTheme] = useState<ThemePref>(getThemePref());
@@ -35,15 +47,18 @@ export default function SettingsModal() {
   useEffect(() => {
     if (!IS_TAURI) {
       setSettings(MOCK_SETTINGS);
+      setIfaces(MOCK_IFACES);
       return;
     }
     invoke<Settings>("get_settings")
       .then(setSettings)
       .catch((e) => setError(String(e)));
+    invoke<NetIface[]>("list_network_interfaces")
+      .then(setIfaces)
+      .catch((e) => setError(String(e)));
   }, []);
 
   async function save(next: Settings, restartHint: boolean) {
-    const prev = settings;
     setSettings(next);
     if (!IS_TAURI) return;
     try {
@@ -51,8 +66,14 @@ export default function SettingsModal() {
       if (restartHint) setNeedRestart(true);
       setError("");
     } catch (e) {
-      // 回滚:失败的改动不得被后续保存夹带落盘(set_settings 是整对象覆盖)
-      setSettings(prev);
+      // 回滚:不能恢复"本次调用开始时"的快照——多个 save 连续触发时(如网络接口区
+      // 连点几个 checkbox),陈旧快照会把后一次已成功落盘的改动从 UI 上抹掉。
+      // 后端(settings.json,由 set_settings 落盘)才是唯一真源,失败后应以它为准。
+      try {
+        setSettings(await invoke<Settings>("get_settings"));
+      } catch {
+        // 拉真值也失败:保底保留当前乐观值,不再引入二次状态跳变
+      }
       setError(String(e));
     }
   }
@@ -65,6 +86,16 @@ export default function SettingsModal() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  function toggleIface(name: string, enabled: boolean) {
+    if (!settings) return;
+    const next = enabled
+      ? settings.excludedInterfaces.filter((n) => n !== name)
+      : [...settings.excludedInterfaces, name];
+    // checkbox 展示只读 settings.excludedInterfaces,ifaces.excluded 目前无渲染路径读取,
+    // 不再维护这份影子状态,避免它与 settings 不同步却无人察觉。
+    void save({ ...settings, excludedInterfaces: next }, false);
   }
 
   async function handleClearAll() {
@@ -169,6 +200,31 @@ export default function SettingsModal() {
               </button>
             </div>
           </div>
+        </Section>
+
+        <Section title="网络接口">
+          <div className="flex flex-col gap-1.5">
+            {ifaces.map((f) => (
+              <label key={f.name} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={!settings.excludedInterfaces.includes(f.name)}
+                  onChange={(e) => toggleIface(f.name, e.target.checked)}
+                  className="accent-(--primary)"
+                />
+                <span>{f.name}</span>
+                <span className="text-xs text-muted-foreground">{f.ip}</span>
+                {f.isVirtual && (
+                  <span className="rounded-full bg-panel px-1.5 py-0.5 text-[10px] text-fg2">
+                    虚拟
+                  </span>
+                )}
+              </label>
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            取消勾选后,BigPaw 不在该网络上宣告自己(即时生效);新插入的网卡默认启用。
+          </p>
         </Section>
 
         <Section title="兼容">

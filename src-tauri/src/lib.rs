@@ -218,8 +218,41 @@ fn get_settings(app: AppHandle) -> Settings {
 }
 
 #[tauri::command]
-fn set_settings(app: AppHandle, value: Settings) -> Result<(), String> {
-    settings::save(&data_dir(&app), &value).map_err(|e| e.to_string())
+fn set_settings(app: AppHandle, core: State<'_, AppCore>, value: Settings) -> Result<(), String> {
+    // 顺序不可反:必须先落盘成功,再让 Core 热生效——落盘失败时不能让运行中的
+    // announce/transport/ipmsg/mdns 用上一份还未持久化的设置,否则重启后状态
+    // 又会回退,造成"热生效了但重启就丢"的不一致。
+    settings::save(&data_dir(&app), &value).map_err(|e| e.to_string())?;
+    core.0.apply_settings(&value);
+    Ok(())
+}
+
+/// 网卡视图 DTO:字段与 `bigpaw_core::net_ifaces::IfaceView` 一一对应,camelCase
+/// 序列化供前端设置页展示网卡列表(名称/IP/子网掩码/是否疑似虚拟网卡/是否已排除)。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IfaceDto {
+    name: String,
+    ip: String,
+    netmask: String,
+    is_virtual: bool,
+    excluded: bool,
+}
+
+/// 列出全部网卡(不滤排除项),供设置页渲染网卡选择列表。
+#[tauri::command]
+fn list_network_interfaces(core: State<'_, AppCore>) -> Vec<IfaceDto> {
+    core.0
+        .list_interfaces()
+        .into_iter()
+        .map(|v| IfaceDto {
+            name: v.name,
+            ip: v.ip.to_string(),
+            netmask: v.netmask.to_string(),
+            is_virtual: v.is_virtual_hint,
+            excluded: v.excluded,
+        })
+        .collect()
 }
 
 #[derive(Serialize, Clone)]
@@ -401,7 +434,8 @@ pub fn run() {
             search_history,
             clear_history,
             get_settings,
-            set_settings
+            set_settings,
+            list_network_interfaces
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
