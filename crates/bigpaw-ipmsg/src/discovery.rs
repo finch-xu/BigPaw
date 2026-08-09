@@ -49,6 +49,8 @@ pub enum IpmsgEvent {
         host: String,
         addr: SocketAddr,
         is_bigpaw: bool,
+        /// 对端声明的工作组名(M7a,`nick\0group` 约定解析,只读尽力)。
+        group: Option<String>,
     },
     Offline {
         key: String,
@@ -87,8 +89,26 @@ pub enum IpmsgError {
 /// extra 尾部附带 BIGPAW_TAG + self_token,供对端识别我方为 BigPaw,
 /// 同时让自己能在 recv 侧识别出这是自己发出去又被操作系统广播回环的报文
 /// (飞秋/feiq 会忽略这段附加数据,不影响与真实飞秋互通)。
-fn entry_extra(nick: &str, self_token: &str) -> String {
-    format!("{nick}{BIGPAW_TAG}{self_token}")
+///
+/// M7a:`group` 为 Some 时按飞鸽 `nick\0group` 约定插在昵称之后——飞秋读
+/// 第一个 `\0` 后的段作为工作组,把我方归到该组;BIGPAW_TAG 自带前导 `\0`,
+/// 线上形态为 `nick\0组名\0BIGPAW<token>`。无组名保持既有格式,零回归。
+fn entry_extra(nick: &str, group: Option<&str>, self_token: &str) -> String {
+    match group {
+        Some(g) => format!("{nick}\u{0}{g}{BIGPAW_TAG}{self_token}"),
+        None => format!("{nick}{BIGPAW_TAG}{self_token}"),
+    }
+}
+
+/// 从 BR_ENTRY/ANSENTRY 的 extra 解析对端声明的工作组名(M7a,只读尽力):
+/// 按 `\0` 分段取第 2 段;空段或以 `BIGPAW` 开头(BigPaw 无组名对端的 tag 段)
+/// 视为无组名。解析不到绝不报错——飞秋兼容是尽力而为,失败归"未分组"。
+fn parse_peer_group(extra: &str) -> Option<String> {
+    extra
+        .split('\u{0}')
+        .nth(1)
+        .filter(|g| !g.is_empty() && !g.starts_with("BIGPAW"))
+        .map(str::to_string)
 }
 
 fn next_packet_no(counter: &AtomicU32) -> u32 {
@@ -153,6 +173,7 @@ fn send_entry(
     socket: &UdpSocket,
     packet_no: &AtomicU32,
     nick: &str,
+    group: Option<&str>,
     host: &str,
     port: u16,
     self_token: &str,
@@ -164,7 +185,7 @@ fn send_entry(
         sender: nick.to_string(),
         host: host.to_string(),
         command: command::BR_ENTRY,
-        extra: entry_extra(nick, self_token),
+        extra: entry_extra(nick, group, self_token),
     };
     broadcast(socket, &proto::encode(&packet), targets, port);
 }
@@ -176,20 +197,41 @@ fn send_loop(
     stop: Arc<AtomicBool>,
     packet_no: Arc<AtomicU32>,
     nick: Arc<Mutex<String>>,
+    group: Arc<Mutex<Option<String>>>,
     host: String,
     port: u16,
     self_token: Arc<String>,
     targets: BroadcastTargets,
 ) {
     let n = nick.lock().unwrap().clone();
-    send_entry(&socket, &packet_no, &n, &host, port, &self_token, &targets);
+    let g = group.lock().unwrap().clone();
+    send_entry(
+        &socket,
+        &packet_no,
+        &n,
+        g.as_deref(),
+        &host,
+        port,
+        &self_token,
+        &targets,
+    );
     loop {
         interruptible_sleep(&stop, ENTRY_INTERVAL);
         if stop.load(Ordering::Relaxed) {
             return;
         }
         let n = nick.lock().unwrap().clone();
-        send_entry(&socket, &packet_no, &n, &host, port, &self_token, &targets);
+        let g = group.lock().unwrap().clone();
+        send_entry(
+            &socket,
+            &packet_no,
+            &n,
+            g.as_deref(),
+            &host,
+            port,
+            &self_token,
+            &targets,
+        );
     }
 }
 
@@ -214,10 +256,12 @@ enum Action {
 /// 反射回本机 recv 的报文(标准 UDP 广播行为),必须在分派前拦下——不回包、
 /// 不上报事件,否则会把自己误判为新发现的对端(见任务说明)。真实对端
 /// (无论是否 BigPaw)不会携带我方 token,不受影响。
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     packet: Packet,
     src: SocketAddr,
     nick: &str,
+    group: Option<&str>,
     host: &str,
     packet_no: &AtomicU32,
     self_token: &str,
@@ -244,10 +288,11 @@ fn dispatch(
                 sender: nick.to_string(),
                 host: host.to_string(),
                 command: command::ANSENTRY,
-                extra: entry_extra(nick, self_token),
+                extra: entry_extra(nick, group, self_token),
             };
             let online = IpmsgEvent::Online {
                 key,
+                group: parse_peer_group(&packet.extra),
                 nick: packet.sender,
                 host: packet.host,
                 addr: src,
@@ -257,6 +302,7 @@ fn dispatch(
         }
         command::ANSENTRY => Action::Emit(IpmsgEvent::Online {
             key,
+            group: parse_peer_group(&packet.extra),
             nick: packet.sender,
             host: packet.host,
             addr: src,
@@ -311,6 +357,7 @@ fn recv_loop(
     stop: Arc<AtomicBool>,
     packet_no: Arc<AtomicU32>,
     nick: Arc<Mutex<String>>,
+    group: Arc<Mutex<Option<String>>>,
     host: String,
     tx: Sender<IpmsgEvent>,
     self_token: Arc<String>,
@@ -343,7 +390,8 @@ fn recv_loop(
         };
 
         let n = nick.lock().unwrap().clone();
-        match dispatch(packet, src, &n, &host, &packet_no, &self_token) {
+        let g = group.lock().unwrap().clone();
+        match dispatch(packet, src, &n, g.as_deref(), &host, &packet_no, &self_token) {
             Action::None => {}
             Action::Emit(ev) => {
                 if tx.send(ev).is_err() {
@@ -422,6 +470,8 @@ pub struct IpmsgService {
     packet_no: Arc<AtomicU32>,
     /// 当前昵称。Arc<Mutex> 共享给发送/接收线程,set_nick 热更新(模式同 targets)。
     nick: Arc<Mutex<String>>,
+    /// 当前工作组名(M7a)。共享/热更新模式同 nick。
+    group: Arc<Mutex<Option<String>>>,
     host: String,
     port: u16,
     self_token: Arc<String>,
@@ -451,6 +501,7 @@ impl IpmsgService {
     /// 排除的调用方可传 `default_broadcast_targets()` 保持全网段广播行为。
     pub fn start(
         nick: &str,
+        group: Option<&str>,
         host: &str,
         port: u16,
         tx: Sender<IpmsgEvent>,
@@ -460,6 +511,7 @@ impl IpmsgService {
         let stop = Arc::new(AtomicBool::new(false));
         let packet_no = Arc::new(AtomicU32::new(1));
         let nick = Arc::new(Mutex::new(nick.to_string()));
+        let group = Arc::new(Mutex::new(group.map(str::to_string)));
         let self_token = Arc::new(new_self_token());
         let pending_acks: Arc<Mutex<HashMap<u32, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let offered_files: OfferedFiles = filexfer::new_offered_files();
@@ -486,12 +538,13 @@ impl IpmsgService {
             let stop = Arc::clone(&stop);
             let packet_no = Arc::clone(&packet_no);
             let nick = Arc::clone(&nick);
+            let group = Arc::clone(&group);
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
             let targets = Arc::clone(&targets);
             std::thread::spawn(move || {
                 send_loop(
-                    socket, stop, packet_no, nick, host, port, self_token, targets,
+                    socket, stop, packet_no, nick, group, host, port, self_token, targets,
                 )
             })
         };
@@ -501,6 +554,7 @@ impl IpmsgService {
             let stop = Arc::clone(&stop);
             let packet_no = Arc::clone(&packet_no);
             let nick = Arc::clone(&nick);
+            let group = Arc::clone(&group);
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
             let pending_acks = Arc::clone(&pending_acks);
@@ -510,6 +564,7 @@ impl IpmsgService {
                     stop,
                     packet_no,
                     nick,
+                    group,
                     host,
                     tx,
                     self_token,
@@ -523,6 +578,7 @@ impl IpmsgService {
             socket,
             packet_no,
             nick,
+            group,
             host: host.to_string(),
             port,
             self_token,
@@ -540,10 +596,29 @@ impl IpmsgService {
     /// (定向广播目标表为空时不发,与隐身语义一致)。
     pub fn set_nick(&self, nick: &str) {
         *self.nick.lock().unwrap() = nick.to_string();
+        let group = self.group.lock().unwrap().clone();
         send_entry(
             &self.socket,
             &self.packet_no,
             nick,
+            group.as_deref(),
+            &self.host,
+            self.port,
+            &self.self_token,
+            &self.targets,
+        );
+    }
+
+    /// 组名热生效(M7a):更新共享组名并立即补发一次 BR_ENTRY(模式同 set_nick),
+    /// 飞秋对端收到后即把我方归到新工作组。
+    pub fn set_group(&self, group: Option<&str>) {
+        *self.group.lock().unwrap() = group.map(str::to_string);
+        let nick = self.nick.lock().unwrap().clone();
+        send_entry(
+            &self.socket,
+            &self.packet_no,
+            &nick,
+            group,
             &self.host,
             self.port,
             &self.self_token,
@@ -747,8 +822,8 @@ mod tests {
     #[test]
     fn dispatch_br_entry_replies_ansentry_and_emits_online() {
         let counter = AtomicU32::new(1);
-        let packet = br_entry("alice", "HOST-A", &entry_extra("alice", "peer-token"));
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        let packet = br_entry("alice", "HOST-A", &entry_extra("alice", None, "peer-token"));
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(
                 reply,
                 IpmsgEvent::Online {
@@ -757,6 +832,7 @@ mod tests {
                     host,
                     addr,
                     is_bigpaw,
+                    ..
                 },
             ) => {
                 assert_eq!(Command(reply.command).num(), command::ANSENTRY);
@@ -778,7 +854,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         // 真实飞秋不会带 BIGPAW_TAG。
         let packet = br_entry("feiq-user", "HOST-B", "");
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(_, IpmsgEvent::Online { is_bigpaw, .. }) => {
                 assert!(!is_bigpaw);
             }
@@ -789,9 +865,9 @@ mod tests {
     #[test]
     fn dispatch_ansentry_emits_online_without_reply() {
         let counter = AtomicU32::new(1);
-        let mut packet = br_entry("bob", "HOST-B", &entry_extra("bob", "peer-token"));
+        let mut packet = br_entry("bob", "HOST-B", &entry_extra("bob", None, "peer-token"));
         packet.command = command::ANSENTRY;
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::Online {
                 key, nick, host, ..
             }) => {
@@ -808,7 +884,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         let mut packet = br_entry("bob", "HOST-B", "");
         packet.command = command::BR_EXIT;
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::Offline { key }) => {
                 assert_eq!(key, "192.168.1.42:HOST-B");
             }
@@ -848,7 +924,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         let packet = sendmsg_packet("alice", "HOST-A", "你好,BigPaw", true);
         let original_no = packet.packet_no;
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(reply, IpmsgEvent::TextReceived { key, from, body }) => {
                 assert_eq!(Command(reply.command).num(), command::RECVMSG);
                 assert_eq!(reply.extra, original_no.to_string());
@@ -866,7 +942,7 @@ mod tests {
     fn dispatch_sendmsg_without_checkopt_emits_text_without_reply() {
         let counter = AtomicU32::new(1);
         let packet = sendmsg_packet("bob", "HOST-B", "hello", false);
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::TextReceived { key, from, body }) => {
                 assert_eq!(key, "192.168.1.42:HOST-B");
                 assert_eq!(from, "bob");
@@ -881,7 +957,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         let packet = recvmsg_packet("alice", "HOST-A", "42");
         assert!(matches!(
-            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN),
             Action::Ack(42)
         ));
     }
@@ -891,7 +967,7 @@ mod tests {
         let counter = AtomicU32::new(1);
         let packet = recvmsg_packet("alice", "HOST-A", "not-a-number");
         assert!(matches!(
-            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN),
             Action::None
         ));
     }
@@ -904,7 +980,7 @@ mod tests {
         let packet = sendmsg_packet("alice", "HOST-A", "你好,世界🐾", true);
         let wire = proto::encode(&packet);
         let decoded = proto::decode(&wire).unwrap();
-        match dispatch(decoded, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(decoded, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(_, IpmsgEvent::TextReceived { body, .. }) => {
                 assert!(body.starts_with("你好,世界"));
                 assert!(body.contains('?'));
@@ -929,7 +1005,7 @@ mod tests {
             command,
             extra,
         };
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::Emit(IpmsgEvent::FileOffered {
                 key,
                 from,
@@ -973,7 +1049,7 @@ mod tests {
             command,
             extra,
         };
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(
                 reply,
                 IpmsgEvent::FileOffered {
@@ -1012,17 +1088,83 @@ mod tests {
         let mut packet = br_entry("bob", "HOST-B", "");
         packet.command = command::GETFILEDATA;
         assert!(matches!(
-            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN),
             Action::None
         ));
     }
 
     #[test]
     fn entry_extra_embeds_bigpaw_tag_and_self_token() {
-        let extra = entry_extra("nick", "tok123");
+        let extra = entry_extra("nick", None, "tok123");
         assert!(extra.starts_with("nick"));
         assert!(extra.contains(BIGPAW_TAG));
         assert!(extra.contains("tok123"));
+    }
+
+    /// M7a:组名插在昵称之后、BIGPAW_TAG 之前(飞鸽 `nick\0group` 约定,
+    /// 飞秋按第一个 `\0` 后的段读工作组);无组名时保持既有格式,零回归。
+    #[test]
+    fn entry_extra_with_group_inserts_before_tag() {
+        let e = entry_extra("猫", Some("研发部"), "tok");
+        assert_eq!(e, format!("猫\u{0}研发部{BIGPAW_TAG}tok"));
+        let e2 = entry_extra("猫", None, "tok");
+        assert_eq!(e2, format!("猫{BIGPAW_TAG}tok"), "无组名时保持既有格式");
+    }
+
+    /// 对端组名解析:飞秋带组/不带组、BigPaw 带组/不带组、空组名、组名含冒号。
+    #[test]
+    fn parse_peer_group_covers_feiq_and_bigpaw_shapes() {
+        assert_eq!(parse_peer_group("张三\u{0}市场部"), Some("市场部".to_string()));
+        assert_eq!(parse_peer_group("张三"), None);
+        assert_eq!(parse_peer_group("猫\u{0}BIGPAWtok"), None);
+        assert_eq!(
+            parse_peer_group("猫\u{0}研发部\u{0}BIGPAWtok"),
+            Some("研发部".to_string())
+        );
+        assert_eq!(parse_peer_group("张三\u{0}"), None);
+        assert_eq!(parse_peer_group("a\u{0}组:名"), Some("组:名".to_string()));
+    }
+
+    /// BR_ENTRY 携带飞秋工作组 → Online 事件透出 group。
+    #[test]
+    fn dispatch_br_entry_emits_online_with_group() {
+        let counter = AtomicU32::new(1);
+        let packet = br_entry("张三", "HOST-F", "张三\u{0}市场部");
+        match dispatch(
+            packet,
+            src_addr(),
+            "me",
+            None,
+            "HOST-ME",
+            &counter,
+            TEST_TOKEN,
+        ) {
+            Action::ReplyAndEmit(_, IpmsgEvent::Online { group, .. }) => {
+                assert_eq!(group, Some("市场部".to_string()));
+            }
+            _ => panic!("expected ReplyAndEmit(Online)"),
+        }
+    }
+
+    /// 我方设置了组名时,ANSENTRY 回包的 extra 也要带组名(对端才能归组)。
+    #[test]
+    fn dispatch_br_entry_reply_carries_own_group() {
+        let counter = AtomicU32::new(1);
+        let packet = br_entry("alice", "HOST-A", "");
+        match dispatch(
+            packet,
+            src_addr(),
+            "me",
+            Some("后端组"),
+            "HOST-ME",
+            &counter,
+            TEST_TOKEN,
+        ) {
+            Action::ReplyAndEmit(reply, _) => {
+                assert_eq!(reply.extra, entry_extra("me", Some("后端组"), TEST_TOKEN));
+            }
+            _ => panic!("expected ReplyAndEmit"),
+        }
     }
 
     /// 核心自过滤回归测试:一个带有本机 self_token 的报文(即自己的 BR_ENTRY/
@@ -1031,9 +1173,9 @@ mod tests {
     #[test]
     fn dispatch_packet_with_own_self_token_is_ignored() {
         let counter = AtomicU32::new(1);
-        let packet = br_entry("me", "HOST-ME", &entry_extra("me", TEST_TOKEN));
+        let packet = br_entry("me", "HOST-ME", &entry_extra("me", None, TEST_TOKEN));
         assert!(matches!(
-            dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN),
+            dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN),
             Action::None
         ));
     }
@@ -1046,9 +1188,9 @@ mod tests {
         let packet = br_entry(
             "alice",
             "HOST-A",
-            &entry_extra("alice", "a-different-token"),
+            &entry_extra("alice", None, "a-different-token"),
         );
-        match dispatch(packet, src_addr(), "me", "HOST-ME", &counter, TEST_TOKEN) {
+        match dispatch(packet, src_addr(), "me", None, "HOST-ME", &counter, TEST_TOKEN) {
             Action::ReplyAndEmit(_, IpmsgEvent::Online { is_bigpaw, .. }) => {
                 assert!(is_bigpaw);
             }
@@ -1166,7 +1308,7 @@ mod tests {
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let result =
-            IpmsgService::start("me", "HOST-ME", TEST_PORT, tx, default_broadcast_targets());
+            IpmsgService::start("me", None, "HOST-ME", TEST_PORT, tx, default_broadcast_targets());
         drop(guard);
 
         match result {
@@ -1199,6 +1341,7 @@ mod tests {
             &sender,
             &packet_no,
             "改后名",
+            None,
             "HOST-X",
             port,
             "tok-abc",
@@ -1220,7 +1363,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let empty_targets: BroadcastTargets = Arc::new(Mutex::new(Vec::new())); // 不广播
-        let svc = IpmsgService::start("旧名", "HOST-X", port, tx, empty_targets).unwrap();
+        let svc = IpmsgService::start("旧名", None, "HOST-X", port, tx, empty_targets).unwrap();
 
         svc.set_nick("新名");
 

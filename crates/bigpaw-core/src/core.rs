@@ -334,9 +334,11 @@ impl Core {
             ipmsg_bcast_targets.clone(),
             init_snapshot.generation,
         ));
+        let group = effective_group(&settings);
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
             match IpmsgService::start(
                 &nickname,
+                group.as_deref(),
                 &ipmsg_host,
                 IPMSG_PORT,
                 ipmsg_evt_tx,
@@ -1112,6 +1114,17 @@ fn hostname_no_local() -> String {
 
 fn default_nickname() -> String {
     hostname_no_local()
+}
+
+/// 设置里的组名归一化(M7a):剥 `\0`(IPMsg extra 的字段分隔符,混入会破坏
+/// 线上格式)+ trim + 空串→None。与 `effective_nickname` 平行的统一语义,
+/// 三条发现通道(mdns/announce/ipmsg)共用这一份归一化结果。
+fn effective_group(s: &crate::settings::Settings) -> Option<String> {
+    s.group
+        .as_deref()
+        .map(|g| g.replace('\u{0}', ""))
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
 }
 
 /// 设置里的昵称归一化:None/空白 → 主机名默认值(与 UI 侧 trim+空值回退
