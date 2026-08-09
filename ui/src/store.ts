@@ -59,6 +59,16 @@ export interface Settings {
   nickname: string | null;
   downloadDir: string | null;
   ipmsgEnabled: boolean;
+  excludedInterfaces: string[];
+}
+
+/** 与后端 `list_network_interfaces` 返回的 IfaceDto 一一对应。 */
+export interface NetIface {
+  name: string;
+  ip: string;
+  netmask: string;
+  isVirtual: boolean;
+  excluded: boolean;
 }
 
 const PAGE = 50;
