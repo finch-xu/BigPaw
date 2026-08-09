@@ -57,6 +57,13 @@ export interface SearchHit {
   kind: "text" | "file";
 }
 
+/** 与后端 storage::ConvSummary 对应;前端以 peerFp 为键存 Record。 */
+export interface ConvSummary {
+  tsMs: number;
+  snippet: string;
+  kind: "text" | "file";
+}
+
 export interface Settings {
   nickname: string | null;
   /** 我的分组(M7a),null = 未设置 */
@@ -87,6 +94,10 @@ interface AppState {
   peers: Peer[];
   selectedFp: string | null;
   conversations: Record<string, Conversation>;
+  /** 消息视图数据源(M7b):每会话最后一条摘要,启动拉取 + 收发时增量更新 */
+  convSummaries: Record<string, ConvSummary>;
+  /** 未读计数(内存态,重启清零):仅非当前选中会话的入站消息/文件计数 */
+  unread: Record<string, number>;
   ipmsg: { available: boolean; enabled: boolean } | null;
   searchQuery: string;
   searchHits: SearchHit[];
@@ -100,6 +111,7 @@ interface AppState {
   setShowSettings: (v: boolean) => void;
   setHighlightTs: (ts: number | null) => void;
 
+  loadConversations: () => Promise<void>;
   openConversation: (fp: string) => Promise<void>;
   loadOlder: (fp: string) => Promise<void>;
   appendText: (item: TextItem) => void;
@@ -116,6 +128,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   peers: [],
   selectedFp: null,
   conversations: {},
+  convSummaries: {},
+  unread: {},
   ipmsg: null,
   searchQuery: "",
   searchHits: [],
@@ -128,8 +142,19 @@ export const useAppStore = create<AppState>((set, get) => ({
   setShowSettings: (showSettings) => set({ showSettings }),
   setHighlightTs: (highlightTs) => set({ highlightTs }),
 
+  loadConversations: async () => {
+    const list = await invoke<Array<{ peerFp: string } & ConvSummary>>("list_conversations");
+    const summaries: Record<string, ConvSummary> = {};
+    for (const s of list) summaries[s.peerFp] = { tsMs: s.tsMs, snippet: s.snippet, kind: s.kind };
+    set({ convSummaries: summaries });
+  },
+
   openConversation: async (fp) => {
-    set({ selectedFp: fp, highlightTs: null });
+    set((s) => ({
+      selectedFp: fp,
+      highlightTs: null,
+      unread: { ...s.unread, [fp]: 0 },
+    }));
     if (get().conversations[fp]?.loaded) return;
     const items = await invoke<TimelineItem[]>("get_history", {
       fingerprint: fp,
@@ -167,11 +192,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   appendText: (item) =>
     set((s) => {
       const conv = s.conversations[item.peerFp] ?? emptyConv();
+      // 摘要与未读随消息同步更新(M7b):入站且非当前选中会话 → 未读+1
+      const unreadDelta =
+        item.direction === "in" && s.selectedFp !== item.peerFp ? 1 : 0;
       return {
         conversations: {
           ...s.conversations,
           [item.peerFp]: { ...conv, items: [...conv.items, item] },
         },
+        convSummaries: {
+          ...s.convSummaries,
+          [item.peerFp]: { tsMs: item.tsMs, snippet: item.body, kind: "text" },
+        },
+        unread: unreadDelta
+          ? { ...s.unread, [item.peerFp]: (s.unread[item.peerFp] ?? 0) + 1 }
+          : s.unread,
       };
     }),
 
@@ -204,11 +239,21 @@ export const useAppStore = create<AppState>((set, get) => ({
         done: patch.done,
         path: patch.path,
       };
+      // 全新文件条目:摘要与未读同步更新(M7b),规则同 appendText
+      const unreadDelta =
+        item.direction === "in" && s.selectedFp !== item.peerFp ? 1 : 0;
       return {
         conversations: {
           ...s.conversations,
           [patch.peerFp]: { ...conv, items: [...conv.items, item] },
         },
+        convSummaries: {
+          ...s.convSummaries,
+          [item.peerFp]: { tsMs: item.tsMs, snippet: item.name, kind: "file" },
+        },
+        unread: unreadDelta
+          ? { ...s.unread, [item.peerFp]: (s.unread[item.peerFp] ?? 0) + 1 }
+          : s.unread,
       };
     }),
 
@@ -243,16 +288,22 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   clearConversation: async (fp) => {
     await invoke("clear_history", { fingerprint: fp }); // 后端删成功才清 UI
-    set((s) => ({
-      conversations: {
-        ...s.conversations,
-        [fp]: { items: [], hasMore: false, loaded: true },
-      },
-    }));
+    set((s) => {
+      const { [fp]: _dropped, ...restSummaries } = s.convSummaries;
+      const { [fp]: _droppedUnread, ...restUnread } = s.unread;
+      return {
+        conversations: {
+          ...s.conversations,
+          [fp]: { items: [], hasMore: false, loaded: true },
+        },
+        convSummaries: restSummaries,
+        unread: restUnread,
+      };
+    });
   },
 
   clearAll: async () => {
     await invoke("clear_history", {});
-    set({ conversations: {}, searchHits: [] });
+    set({ conversations: {}, searchHits: [], convSummaries: {}, unread: {} });
   },
 }));
