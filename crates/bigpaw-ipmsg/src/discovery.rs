@@ -1073,35 +1073,51 @@ mod tests {
         ));
     }
 
-    /// 逐目标发送:目标表里的每个地址都应收到同一份报文
-    /// (用回环地址代替真实广播地址,验证"逐个发"而非"只发第一个/最后一个")。
+    /// 核心回归测试:**一次** `broadcast()` 调用、目标表里有多个元素,必须
+    /// 每个元素都真的发了一份出去——不能在循环里意外 break/return 导致只发了
+    /// 第一个就退出。
+    ///
+    /// 沙箱环境没有 root 权限配置额外的回环地址别名(`127.0.0.2` 等 bind 会
+    /// 返回 `AddrNotAvailable`,已用探测脚本确认),所以这里没法让 3 个目标
+    /// 各自解析到 3 个"看起来不同"的 socket 地址。改用一个可达的目标地址
+    /// (`127.0.0.1`)重复 3 次组成目标表,**同一次** `broadcast()` 调用发出
+    /// 后断言 receiver 恰好收到 3 份、且都是同一份报文内容——收到的次数
+    /// 直接等于 `targets.len()`,足以逮住"循环提前退出只发一个"这类回归
+    /// (生产环境里多个目标本就是同一个端口上的不同地址,变量只在 IP,不在
+    /// 发送次数这件事上,所以计数断言完整覆盖了本任务要保护的性质)。
     #[test]
-    fn broadcast_sends_to_every_target() {
+    fn broadcast_sends_to_every_target_in_a_single_call() {
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let receiver_a = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let receiver_b = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver_a
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        receiver_b
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let port_a = receiver_a.local_addr().unwrap().port();
-        let port_b = receiver_b.local_addr().unwrap().port();
+        let port = receiver.local_addr().unwrap().port();
 
-        // 两个目标共用同一个 127.0.0.1,但 dest 端口取自各自 socket——为了在同一次
-        // broadcast() 调用里覆盖"逐个目标都真的发了"而不是只发了一个,这里改用两次
-        // 不同端口的 broadcast() 调用模拟"每个目标独立到达"。
-        let targets_a: BroadcastTargets = Arc::new(Mutex::new(vec![Ipv4Addr::LOCALHOST]));
-        broadcast(&sender, b"to-a", &targets_a, port_a);
-        let targets_b: BroadcastTargets = Arc::new(Mutex::new(vec![Ipv4Addr::LOCALHOST]));
-        broadcast(&sender, b"to-b", &targets_b, port_b);
+        const TARGET_COUNT: usize = 3;
+        let targets: BroadcastTargets =
+            Arc::new(Mutex::new(vec![Ipv4Addr::LOCALHOST; TARGET_COUNT]));
+
+        broadcast(&sender, b"probe", &targets, port);
 
         let mut buf = [0u8; 16];
-        let (n, _) = receiver_a.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"to-a");
-        let (n, _) = receiver_b.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], b"to-b");
+        for i in 0..TARGET_COUNT {
+            let (n, _) = receiver
+                .recv_from(&mut buf)
+                .unwrap_or_else(|e| panic!("目标 #{i}/{TARGET_COUNT} 未送达: {e}"));
+            assert_eq!(&buf[..n], b"probe");
+        }
+
+        // 恰好 3 份,不多不少:再等一小段时间确认没有第 4 份意外到达。
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let extra = receiver.recv_from(&mut buf);
+        assert!(
+            extra.is_err(),
+            "targets 只有 {TARGET_COUNT} 个,不应该收到第 {}份",
+            TARGET_COUNT + 1
+        );
     }
 
     /// 锁不跨网络 IO:先 clone 目标列表再逐个 send_to,所以就算目标列表很大
