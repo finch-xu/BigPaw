@@ -177,20 +177,36 @@ fn sync_multicast(socket: &UdpSocket, joined: &mut Vec<Ipv4Addr>, entries: &[Ifa
 /// 组播(否则组播出口网卡由系统路由表决定,不一定是我们想要的那张),随后
 /// 发一次该子网的定向广播——组播+广播双通道兜底(部分交换机 IGMP snooping
 /// 会让纯组播不可达)。`IP_MULTICAST_IF` 只影响组播发送方向,不影响本 socket
-/// 的接收或 `poke` 用到的单播发送。单个目标切网卡/发送失败不影响其余目标
+/// 的接收或 `poke` 用到的单播发送。
+///
+/// 门控范围只包住组播发送:`set_multicast_if_v4` 失败只应跳过"这张卡的组播"
+/// 这一份,定向广播必须无条件照发——组播出口切换失败(权限/平台限制等)恰恰
+/// 是广播兜底要发挥作用的场景,如果连广播也被一并跳过,这张卡就完全哑火了,
+/// 违背"组播+广播双通道兜底"的设计初衷。单个目标的失败不影响其余目标
 /// (铁律:单网卡失败不拖垮整轮)。`entries` 为空(用户排除了全部网卡)时
 /// `send_targets` 返回空列表,本函数因此静默不发——即“全网隐身”。
 fn send_dual(socket: &UdpSocket, buf: &[u8], port: u16, entries: &[IfaceEntry]) {
     for target in send_targets(entries) {
         if SockRef::from(socket)
             .set_multicast_if_v4(&target.iface_ip)
-            .is_err()
+            .is_ok()
         {
-            continue; // 切换组播出口网卡失败,跳过这张卡,不影响其余目标
+            let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
         }
-        let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
+        // 定向广播不依赖 IP_MULTICAST_IF,组播出口切换失败也照发。
         let _ = socket.send_to(buf, SocketAddrV4::new(target.broadcast, port));
     }
+}
+
+/// 统一的全局发送限速判定:距上次发送是否已过 `MIN_SEND_BATCH_INTERVAL`。
+/// `sleep_and_watch_ifaces` 里的"网卡变化补发"与 `send_loop` 里的"边界发送"
+/// 共用这一个判定(而不是各写一份 `elapsed() >= ...`),避免两处口径走样——
+/// 后者正是曾经的 Critical bug:边界发送若不做同样的门控,变化补发和紧随其后
+/// 的边界发送可能只隔一个 `SLEEP_STEP`(200ms),突破"报文速率不高于现状"
+/// 铁律。抽成纯函数(接受显式 `now` 而非内部调用 `Instant::now()`)是为了能
+/// 在不真实睡眠的情况下用构造出的时间点确定性单测。
+fn send_allowed(last_send: Instant, now: Instant) -> bool {
+    now.duration_since(last_send) >= MIN_SEND_BATCH_INTERVAL
 }
 
 /// 中断式休眠 + 网卡热变化响应:每 `SLEEP_STEP`(≤200ms)检查一次停止标志与
@@ -221,7 +237,7 @@ fn sleep_and_watch_ifaces(
                 let mut joined_guard = joined.lock().expect("joined lock");
                 sync_multicast(socket, &mut joined_guard, &snapshot.entries);
             }
-            if last_send.elapsed() >= MIN_SEND_BATCH_INTERVAL {
+            if send_allowed(*last_send, Instant::now()) {
                 send_dual(socket, buf, port, &snapshot.entries);
                 *last_send = Instant::now();
             }
@@ -235,9 +251,15 @@ fn sleep_and_watch_ifaces(
 
 /// 发送线程主循环:启动 3 次指数退避快速宣告(2s/4s/8s),之后转周期宣告
 /// (~25s)。每次发送批次之间的全局最小间隔由退避/周期时长天然保证(均 ≥
-/// `MIN_SEND_BATCH_INTERVAL`)。进循环前先按当前快照同步一次组播 join 状态
-/// (不发送,避免启动瞬间用空 `joined` 集合走一轮"全部 to_join"又立刻被
-/// STARTUP_BACKOFF 的第一次发送重复触发)。
+/// `MIN_SEND_BATCH_INTERVAL`),但 `sleep_and_watch_ifaces` 内部可能因网卡
+/// 快照变化在等待窗口的任意时刻(包括临近结束时)已经补发过一批——因此每次
+/// 睡眠结束后的"边界发送"仍需重新经过 `send_allowed` 门控,不能无条件发送,
+/// 否则变化补发 + 边界发送可能只隔一个 `SLEEP_STEP`(200ms),突破"报文速率
+/// 不高于现状"铁律。跳过边界
+/// 发送不会饿死周期宣告:下一轮的等待时长(≥2s)本身就远大于
+/// `MIN_SEND_BATCH_INTERVAL`(1s),届时必定又满足门槛。进循环前先按当前
+/// 快照同步一次组播 join 状态(不发送,避免启动瞬间用空 `joined` 集合走一轮
+/// "全部 to_join" 又立刻被 STARTUP_BACKOFF 的第一次发送重复触发)。
 fn send_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
@@ -275,9 +297,13 @@ fn send_loop(
         ) {
             return;
         }
-        let entries = ifaces_rx.borrow().entries.clone();
-        send_dual(&socket, &buf, port, &entries);
-        last_send = Instant::now();
+        // 门控:睡眠期间可能已因网卡变化补发过一批,若距那次太近就跳过这次
+        // 边界发送(见 send_allowed 注释),避免速率超出 MIN_SEND_BATCH_INTERVAL。
+        if send_allowed(last_send, Instant::now()) {
+            let entries = ifaces_rx.borrow().entries.clone();
+            send_dual(&socket, &buf, port, &entries);
+            last_send = Instant::now();
+        }
     }
     loop {
         if !sleep_and_watch_ifaces(
@@ -292,9 +318,11 @@ fn send_loop(
         ) {
             return;
         }
-        let entries = ifaces_rx.borrow().entries.clone();
-        send_dual(&socket, &buf, port, &entries);
-        last_send = Instant::now();
+        if send_allowed(last_send, Instant::now()) {
+            let entries = ifaces_rx.borrow().entries.clone();
+            send_dual(&socket, &buf, port, &entries);
+            last_send = Instant::now();
+        }
     }
 }
 
@@ -576,5 +604,54 @@ mod tests {
             receiver.recv_from(&mut buf).is_err(),
             "entries 为空时不应发送任何报文"
         );
+    }
+
+    #[test]
+    fn send_dual_still_sends_broadcast_when_multicast_if_switch_fails() {
+        // 回归测试(Critical 1):TEST-NET-3 地址不属于任何本机网卡,
+        // set_multicast_if_v4 必然失败;门控只应挡住"这张卡的组播"一份,
+        // 定向广播必须无条件照发——否则组播出口切换失败的那张卡就彻底哑火,
+        // 违背"组播+广播双通道兜底"的设计初衷。
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+
+        let mut entry = test_entry(Ipv4Addr::new(203, 0, 113, 5));
+        entry.broadcast = Ipv4Addr::new(127, 0, 0, 1); // 指向本测试的接收端
+
+        send_dual(&socket, b"hello", port, &[entry]);
+
+        let mut buf = [0u8; 16];
+        let (n, _src) = receiver
+            .recv_from(&mut buf)
+            .expect("组播出口切换失败时仍应发出定向广播");
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    // ---------- send_allowed ----------
+
+    #[test]
+    fn send_allowed_is_false_within_the_min_interval() {
+        // 回归测试(Critical 2):网卡变化触发的补发与紧随其后的边界发送必须
+        // 共用同一个限速判定,否则两者可能只隔一个 SLEEP_STEP(200ms)。
+        let last = Instant::now();
+        assert!(
+            !send_allowed(last, last + Duration::from_millis(200)),
+            "200ms 远小于 MIN_SEND_BATCH_INTERVAL(1s),不应允许发送"
+        );
+        assert!(
+            !send_allowed(last, last + Duration::from_millis(999)),
+            "临界值之前 1ms 仍不应允许发送"
+        );
+    }
+
+    #[test]
+    fn send_allowed_is_true_at_and_after_the_min_interval() {
+        let last = Instant::now();
+        assert!(send_allowed(last, last + MIN_SEND_BATCH_INTERVAL));
+        assert!(send_allowed(last, last + Duration::from_secs(2)));
     }
 }
