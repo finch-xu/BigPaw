@@ -19,6 +19,7 @@
 //! 收到 `Err` 从而让该线程正常退出,不会永久悬挂。
 
 use crate::identity::Identity;
+use crate::net_ifaces::{self, IfaceSnapshot};
 use crate::transport::filexfer;
 use crate::transport::proto::{self, Msg};
 use crate::transport::tls;
@@ -32,6 +33,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::watch;
 
 pub const DEFAULT_PORT: u16 = 24917;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -149,6 +151,12 @@ pub struct TransportManager {
     /// 指向自身的弱引用,供 `offer_file` 生成的后台线程使用,
     /// 避免要求调用方以 `Arc<Self>` 形式调用(见 `start` 里 `Arc::new_cyclic`)。
     self_weak: Weak<Self>,
+    /// 网卡快照订阅句柄(Step 6):`None` 表示未接线(构造时的默认值),
+    /// 拨号时原样按传入顺序重试。之所以不做成构造参数,是为了不连锁改动
+    /// 已有的 12 处 `TransportManager::start` 测试调用点——由 `set_iface_rx`
+    /// 事后注入,真正接线是 Step 7 的事(core.rs 拿到 `InterfaceRegistry`
+    /// 后调用一次)。
+    ifaces: Mutex<Option<watch::Receiver<IfaceSnapshot>>>,
 }
 
 impl TransportManager {
@@ -175,6 +183,7 @@ impl TransportManager {
             incoming: Mutex::new(HashMap::new()),
             outgoing: Mutex::new(HashMap::new()),
             self_weak: weak_self.clone(),
+            ifaces: Mutex::new(None),
         });
 
         let server_cfg = tls::server_config(&identity)?;
@@ -253,6 +262,31 @@ impl TransportManager {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// 注入网卡快照订阅句柄(Step 6 机制,Step 7 接线):设好之后,后续每次
+    /// 拨号前都会 `borrow()` 一份最新快照做亲和排序(同网段地址优先)。
+    /// 不在构造函数里加这个参数,是为了不连锁改动既有测试调用点——见字段
+    /// 注释。可重复调用以替换订阅源(比如测试里换一个 receiver)。
+    pub fn set_iface_rx(&self, rx: watch::Receiver<IfaceSnapshot>) {
+        *self.ifaces.lock().expect("ifaces lock") = Some(rx);
+    }
+
+    /// 按当前网卡快照对拨号地址表做亲和度重排(同网段地址前置,组内保持
+    /// 稳定顺序)。锁只覆盖 borrow+clone 这一步,不跨拨号 IO——`connect_and_send`
+    /// 的 for 循环在锁外执行,不会因为持有 `ifaces` 锁而阻塞其他并发拨号。
+    /// 未 `set_iface_rx` 或快照为空时:排序对全等 key 是稳定的,结果就是
+    /// 原始传入顺序,天然满足"零漂移"要求,不需要额外分支。
+    fn affinity_sorted_addrs(&self, addrs: &[IpAddr]) -> Vec<IpAddr> {
+        let mut sorted = addrs.to_vec();
+        let snapshot = {
+            let guard = self.ifaces.lock().expect("ifaces lock");
+            guard.as_ref().map(|rx| rx.borrow().clone())
+        };
+        if let Some(snapshot) = snapshot {
+            net_ifaces::sort_by_affinity(&mut sorted, &snapshot.entries);
+        }
+        sorted
     }
 
     /// 服务端连接的读循环。M2 简化决策:出站连接只写不回读(对端回话走它自己
@@ -426,8 +460,11 @@ impl TransportManager {
         first: &Msg,
     ) -> Result<ClientTls, TransportError> {
         let cfg = tls::client_config(&self.identity, peer_fp)?;
+        // 拨号亲和排序(Step 6):锁只覆盖 borrow+clone(见 `affinity_sorted_addrs`
+        // 注释),排好序的是这里新拷贝出的地址表,不影响调用方持有的原始切片。
+        let sorted_addrs = self.affinity_sorted_addrs(addrs);
         let mut last: Option<io::Error> = None;
-        for ip in addrs {
+        for ip in &sorted_addrs {
             let sa = SocketAddr::new(*ip, port);
             match TcpStream::connect_timeout(&sa, CONNECT_TIMEOUT) {
                 Ok(tcp) => {
@@ -854,5 +891,122 @@ impl Drop for TransportManager {
                 let _ = s.shutdown(Shutdown::Both);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use crate::net_ifaces::IfaceEntry;
+    use std::net::Ipv4Addr;
+
+    /// 构造一个仅用于本模块测试的 manager:临时目录身份 + 端口 0(系统分配)。
+    /// 不做任何真实拨号,只用来验证 `affinity_sorted_addrs` 这一段纯排序逻辑。
+    fn test_manager() -> Arc<TransportManager> {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = Arc::new(Identity::load_or_create(dir.path()).unwrap());
+        let (tx, _rx) = mpsc::channel();
+        TransportManager::start(identity, 0, tx).unwrap()
+    }
+
+    fn entry(name: &str, ip: Ipv4Addr, netmask: Ipv4Addr) -> IfaceEntry {
+        IfaceEntry {
+            name: name.to_string(),
+            ip,
+            netmask,
+            broadcast: crate::net_ifaces::directed_broadcast(ip, netmask),
+            is_virtual_hint: false,
+        }
+    }
+
+    #[test]
+    fn affinity_sorted_addrs_unchanged_when_no_receiver_set() {
+        let mgr = test_manager();
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ];
+        let sorted = mgr.affinity_sorted_addrs(&addrs);
+        assert_eq!(sorted, addrs, "未 set_iface_rx 时应保持原顺序");
+    }
+
+    #[test]
+    fn affinity_sorted_addrs_unchanged_when_snapshot_is_empty() {
+        let mgr = test_manager();
+        let (_tx, rx) = watch::channel(IfaceSnapshot::default());
+        mgr.set_iface_rx(rx);
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ];
+        let sorted = mgr.affinity_sorted_addrs(&addrs);
+        assert_eq!(sorted, addrs, "空快照应保持原顺序");
+    }
+
+    #[test]
+    fn affinity_sorted_addrs_puts_same_subnet_first() {
+        let mgr = test_manager();
+        let entries = vec![entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let (_tx, rx) = watch::channel(IfaceSnapshot {
+            generation: 1,
+            entries,
+        });
+        mgr.set_iface_rx(rx);
+
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),      // 远端
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), // 同网段
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),      // 远端
+        ];
+        let sorted = mgr.affinity_sorted_addrs(&addrs);
+        assert_eq!(
+            sorted,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            ],
+            "同网段地址应前置,远端地址维持原有相对顺序"
+        );
+    }
+
+    #[test]
+    fn set_iface_rx_reflects_live_snapshot_updates() {
+        // 验证 manager 侧不是只读一次快照,而是每次拨号前都 borrow 最新值
+        // (`watch::Sender::send` 更新后,后续 borrow() 应看到新数据)。
+        let mgr = test_manager();
+        let (tx, rx) = watch::channel(IfaceSnapshot::default());
+        mgr.set_iface_rx(rx);
+
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+        ];
+        // 初始空快照:无重排。
+        assert_eq!(mgr.affinity_sorted_addrs(&addrs), addrs);
+
+        // 推送新快照后:同网段地址应前置。
+        tx.send(IfaceSnapshot {
+            generation: 2,
+            entries: vec![entry(
+                "en0",
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(255, 255, 255, 0),
+            )],
+        })
+        .unwrap();
+        let sorted = mgr.affinity_sorted_addrs(&addrs);
+        assert_eq!(
+            sorted,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            ]
+        );
     }
 }
