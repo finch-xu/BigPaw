@@ -63,6 +63,8 @@ pub enum HistoryItem {
         direction: String,
         body: String,
         ts_ms: i64,
+        /// 群消息的发送者指纹(M7c);单聊恒为 None。
+        sender_fp: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     File {
@@ -90,7 +92,7 @@ pub struct Storage {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 impl Storage {
     pub fn open(data_dir: &Path) -> Result<Self, StorageError> {
@@ -108,12 +110,13 @@ impl Storage {
         direction: &str,
         body: &str,
         ts_ms: i64,
+        sender_fp: Option<&str>,
     ) -> Result<(), StorageError> {
         let conn = self.conn.lock().expect("storage lock");
         conn.execute(
-            "INSERT OR IGNORE INTO messages (id, peer_fp, direction, body, ts_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, peer_fp, direction, body, ts_ms],
+            "INSERT OR IGNORE INTO messages (id, peer_fp, direction, body, ts_ms, sender_fp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, peer_fp, direction, body, ts_ms, sender_fp],
         )?;
         Ok(())
     }
@@ -182,11 +185,11 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT * FROM (
                SELECT 'text' AS kind, id AS k1, peer_fp, direction, body AS k2,
-                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms
+                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms, sender_fp AS k7
                FROM messages WHERE peer_fp = ?1
                UNION ALL
                SELECT 'file' AS kind, xfer_id AS k1, peer_fp, direction, name AS k2,
-                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms
+                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms, NULL AS k7
                FROM transfers WHERE peer_fp = ?1
              ) WHERE ts_ms < ?2 OR (ts_ms = ?2 AND k1 < ?3)
              ORDER BY ts_ms DESC, k1 DESC LIMIT ?4",
@@ -216,11 +219,11 @@ impl Storage {
         let mut stmt = conn.prepare(
             "SELECT * FROM (
                SELECT 'text' AS kind, id AS k1, peer_fp, direction, body AS k2,
-                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms
+                      NULL AS k3, 0 AS k4, 0 AS k5, NULL AS k6, ts_ms, sender_fp AS k7
                FROM messages WHERE peer_fp = ?1 AND ts_ms >= ?2
                UNION ALL
                SELECT 'file' AS kind, xfer_id AS k1, peer_fp, direction, name AS k2,
-                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms
+                      status AS k3, size AS k4, is_dir AS k5, path AS k6, ts_ms, NULL AS k7
                FROM transfers WHERE peer_fp = ?1 AND ts_ms >= ?2
              ) ORDER BY ts_ms ASC LIMIT ?3",
         )?;
@@ -333,6 +336,66 @@ impl Storage {
         Ok(sums)
     }
 
+    /// 写入/覆盖一个群(M7c):members 序列化为 JSON 存 members_json。
+    pub fn upsert_group(&self, g: &crate::groups::Group, created_ts: i64) -> Result<(), StorageError> {
+        let members_json = serde_json::to_string(
+            &g.members
+                .iter()
+                .map(|m| (m.fp.clone(), m.nick.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+        let conn = self.conn.lock().expect("storage lock");
+        conn.execute(
+            "INSERT INTO groups (group_id, name, creator_fp, version, members_json, created_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(group_id) DO UPDATE SET
+               name = excluded.name,
+               version = excluded.version,
+               members_json = excluded.members_json",
+            params![
+                g.group_id,
+                g.name,
+                g.creator_fp,
+                g.version as i64,
+                members_json,
+                created_ts
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_group(&self, group_id: &str) -> Result<(), StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        conn.execute("DELETE FROM groups WHERE group_id = ?1", params![group_id])?;
+        Ok(())
+    }
+
+    pub fn load_groups(&self) -> Result<Vec<crate::groups::Group>, StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        let mut stmt = conn.prepare(
+            "SELECT group_id, name, creator_fp, version, members_json FROM groups",
+        )?;
+        let groups = stmt
+            .query_map([], |row| {
+                let members_json: String = row.get(4)?;
+                let pairs: Vec<(String, String)> =
+                    serde_json::from_str(&members_json).unwrap_or_default();
+                Ok(crate::groups::Group {
+                    group_id: row.get(0)?,
+                    name: row.get(1)?,
+                    creator_fp: row.get(2)?,
+                    version: row.get::<_, i64>(3)? as u64,
+                    members: pairs
+                        .into_iter()
+                        .map(|(fp, nick)| crate::groups::GroupMember { fp, nick })
+                        .collect(),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(groups)
+    }
+
     pub fn known_peers(&self) -> Result<Vec<KnownPeer>, StorageError> {
         let conn = self.conn.lock().expect("storage lock");
         let mut stmt = conn.prepare(
@@ -356,7 +419,8 @@ impl Storage {
 }
 
 /// UNION 行 → HistoryItem。列序固定:kind, k1(id/xfer_id), peer_fp,
-/// direction, k2(body/name), k3(status), k4(size), k5(is_dir), k6(path), ts_ms。
+/// direction, k2(body/name), k3(status), k4(size), k5(is_dir), k6(path), ts_ms,
+/// k7(sender_fp,仅 text 有值)。
 fn row_to_item(row: &rusqlite::Row<'_>) -> Result<HistoryItem, rusqlite::Error> {
     let kind: String = row.get(0)?;
     if kind == "text" {
@@ -366,6 +430,7 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> Result<HistoryItem, rusqlite::Error> 
             direction: row.get(3)?,
             body: row.get(4)?,
             ts_ms: row.get(9)?,
+            sender_fp: row.get(10)?,
         })
     } else {
         Ok(HistoryItem::File {
@@ -422,6 +487,22 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
     if version < 2 {
         conn.execute_batch("ALTER TABLE peers ADD COLUMN group_name TEXT;")?;
     }
+    // v3(M7c):群表 + 群消息发送者列。群历史复用 messages 表,
+    // peer_fp 列泛化为会话 id(单聊=对端指纹,群聊=group_id);
+    // sender_fp 仅群聊入站消息有值(单聊 NULL)。
+    if version < 3 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS groups (
+               group_id     TEXT PRIMARY KEY,
+               name         TEXT NOT NULL,
+               creator_fp   TEXT NOT NULL,
+               version      INTEGER NOT NULL,
+               members_json TEXT NOT NULL,
+               created_ts   INTEGER NOT NULL
+             );
+             ALTER TABLE messages ADD COLUMN sender_fp TEXT;",
+        )?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -458,8 +539,8 @@ mod tests {
     #[test]
     fn insert_and_read_message() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "你好", 1000).unwrap();
-        s.insert_message("m2", "peerA", "out", "hi", 2000).unwrap();
+        s.insert_message("m1", "peerA", "in", "你好", 1000, None).unwrap();
+        s.insert_message("m2", "peerA", "out", "hi", 2000, None).unwrap();
         let items = s.history("peerA", None, 50).unwrap();
         assert_eq!(items.len(), 2);
         // 返回升序(旧→新),供 UI 直接渲染
@@ -475,20 +556,20 @@ mod tests {
     #[test]
     fn insert_message_id_conflict_is_idempotent() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        s.insert_message("m1", "peerA", "in", "a", 1, None).unwrap();
         // 同 id 再插不报错(INSERT OR IGNORE)
-        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        s.insert_message("m1", "peerA", "in", "a", 1, None).unwrap();
         assert_eq!(s.history("peerA", None, 50).unwrap().len(), 1);
     }
 
     #[test]
     fn transfer_insert_update_and_merged_history() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "先发一句", 1000).unwrap();
+        s.insert_message("m1", "peerA", "in", "先发一句", 1000, None).unwrap();
         s.insert_transfer("x1", "peerA", "in", "a.zip", 2048, false, "offered", 1500)
             .unwrap();
         s.update_transfer("x1", "done", Some("/tmp/a.zip")).unwrap();
-        s.insert_message("m2", "peerA", "out", "收到了吗", 2000).unwrap();
+        s.insert_message("m2", "peerA", "out", "收到了吗", 2000, None).unwrap();
 
         let items = s.history("peerA", None, 50).unwrap();
         assert_eq!(items.len(), 3, "文本与文件合并进同一条时间线");
@@ -510,7 +591,7 @@ mod tests {
     fn history_cursor_pagination() {
         let s = mem();
         for i in 0..10 {
-            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100).unwrap();
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100, None).unwrap();
         }
         let page1 = s.history("peerA", None, 4).unwrap();
         assert_eq!(
@@ -532,9 +613,9 @@ mod tests {
         let s = mem();
         // 5 条同毫秒消息 + 1 条更早的,页大小 3:边界正好落在同毫秒簇中间
         for i in 0..5 {
-            s.insert_message(&format!("m{i}"), "peerA", "in", "x", 1000).unwrap();
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", 1000, None).unwrap();
         }
-        s.insert_message("m_old", "peerA", "in", "old", 500).unwrap();
+        s.insert_message("m_old", "peerA", "in", "old", 500, None).unwrap();
         let page1 = s.history("peerA", None, 3).unwrap();
         assert_eq!(page1.len(), 3);
         let cursor = |items: &[HistoryItem]| match &items[0] {
@@ -561,8 +642,8 @@ mod tests {
     #[test]
     fn history_isolates_peers() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
-        s.insert_message("m2", "peerB", "in", "b", 2).unwrap();
+        s.insert_message("m1", "peerA", "in", "a", 1, None).unwrap();
+        s.insert_message("m2", "peerB", "in", "b", 2, None).unwrap();
         assert_eq!(s.history("peerA", None, 50).unwrap().len(), 1);
     }
 
@@ -570,7 +651,7 @@ mod tests {
     fn history_around_returns_context_window() {
         let s = mem();
         for i in 0..20 {
-            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100).unwrap();
+            s.insert_message(&format!("m{i}"), "peerA", "in", "x", i * 100, None).unwrap();
         }
         // 目标 ts=1000,前后各 3 条 → [700..=1300],含目标本身
         let items = s.history_around("peerA", 1000, 3).unwrap();
@@ -583,8 +664,8 @@ mod tests {
     #[test]
     fn search_covers_message_body_and_file_name() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "明天开会记得带电脑", 1000).unwrap();
-        s.insert_message("m2", "peerB", "out", "好的", 2000).unwrap();
+        s.insert_message("m1", "peerA", "in", "明天开会记得带电脑", 1000, None).unwrap();
+        s.insert_message("m2", "peerB", "out", "好的", 2000, None).unwrap();
         s.insert_transfer("x1", "peerB", "in", "会议纪要.docx", 10, false, "done", 3000)
             .unwrap();
         let hits = s.search("会", 50).unwrap();
@@ -597,8 +678,8 @@ mod tests {
     #[test]
     fn search_escapes_like_wildcards() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "百分号%字面量", 1000).unwrap();
-        s.insert_message("m2", "peerA", "in", "别的", 2000).unwrap();
+        s.insert_message("m1", "peerA", "in", "百分号%字面量", 1000, None).unwrap();
+        s.insert_message("m2", "peerA", "in", "别的", 2000, None).unwrap();
         let hits = s.search("%", 50).unwrap();
         assert_eq!(hits.len(), 1, "% 应按字面匹配,不是通配一切");
     }
@@ -606,9 +687,9 @@ mod tests {
     #[test]
     fn clear_history_single_peer_and_all() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "a", 1).unwrap();
+        s.insert_message("m1", "peerA", "in", "a", 1, None).unwrap();
         s.insert_transfer("x1", "peerA", "in", "f", 1, false, "done", 2).unwrap();
-        s.insert_message("m2", "peerB", "in", "b", 3).unwrap();
+        s.insert_message("m2", "peerB", "in", "b", 3, None).unwrap();
 
         s.clear_history(Some("peerA")).unwrap();
         assert!(s.history("peerA", None, 50).unwrap().is_empty());
@@ -639,11 +720,11 @@ mod tests {
     #[test]
     fn conversation_summaries_returns_last_item_per_peer() {
         let s = mem();
-        s.insert_message("m1", "peerA", "in", "第一条", 100).unwrap();
-        s.insert_message("m2", "peerA", "out", "A 的最后一条", 300).unwrap();
+        s.insert_message("m1", "peerA", "in", "第一条", 100, None).unwrap();
+        s.insert_message("m2", "peerA", "out", "A 的最后一条", 300, None).unwrap();
         s.insert_transfer("x1", "peerB", "in", "报告.pdf", 10, false, "done", 500)
             .unwrap();
-        s.insert_message("m3", "peerB", "in", "早于文件", 400).unwrap();
+        s.insert_message("m3", "peerB", "in", "早于文件", 400, None).unwrap();
         let sums = s.conversation_summaries().unwrap();
         assert_eq!(sums.len(), 2);
         assert_eq!(sums[0].peer_fp, "peerB", "最近活跃的会话排前");
@@ -683,11 +764,20 @@ mod tests {
     #[test]
     fn migrates_v1_db_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        // 手工造一个 v1 库:建 v1 表结构 + user_version=1 + 一行旧数据
+        // 手工造一个 v1 库:建 v1 完整表结构 + user_version=1 + 一行旧数据
         {
             let conn = Connection::open(dir.path().join("bigpaw.db")).unwrap();
             conn.execute_batch(
-                "CREATE TABLE peers (
+                "CREATE TABLE messages (
+                   id TEXT PRIMARY KEY, peer_fp TEXT NOT NULL, direction TEXT NOT NULL,
+                   body TEXT NOT NULL, ts_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE transfers (
+                   xfer_id TEXT PRIMARY KEY, peer_fp TEXT NOT NULL, direction TEXT NOT NULL,
+                   name TEXT NOT NULL, size INTEGER NOT NULL, is_dir INTEGER NOT NULL DEFAULT 0,
+                   status TEXT NOT NULL, path TEXT, ts_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE peers (
                    fingerprint  TEXT PRIMARY KEY,
                    nickname     TEXT NOT NULL,
                    protocol     TEXT NOT NULL,
@@ -710,6 +800,85 @@ mod tests {
             s.known_peers().unwrap()[0].group,
             Some("市场部".to_string())
         );
+    }
+
+    /// M7c:群表往返/覆盖/删除;群历史(peer_fp=group_id)与单聊不串。
+    #[test]
+    fn groups_table_roundtrip_and_history_isolation() {
+        let s = mem();
+        let g = crate::groups::Group {
+            group_id: "gid-1".to_string(),
+            name: "猫猫群".to_string(),
+            creator_fp: "me".to_string(),
+            version: 1,
+            members: vec![
+                crate::groups::GroupMember { fp: "me".to_string(), nick: "我".to_string() },
+                crate::groups::GroupMember { fp: "b".to_string(), nick: "乙".to_string() },
+            ],
+        };
+        s.upsert_group(&g, 100).unwrap();
+        let loaded = s.load_groups().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], g);
+
+        // 覆盖(版本推进)
+        let mut g2 = g.clone();
+        g2.version = 2;
+        g2.members.pop();
+        s.upsert_group(&g2, 100).unwrap();
+        assert_eq!(s.load_groups().unwrap()[0].version, 2);
+        assert_eq!(s.load_groups().unwrap()[0].members.len(), 1);
+
+        // 群历史与单聊隔离:conv 主键分别是 group_id 与对端指纹
+        s.insert_message("m1", "gid-1", "in", "群里的话", 200, Some("b")).unwrap();
+        s.insert_message("m2", "b", "in", "私聊的话", 300, None).unwrap();
+        let group_hist = s.history("gid-1", None, 10).unwrap();
+        assert_eq!(group_hist.len(), 1);
+        match &group_hist[0] {
+            HistoryItem::Text { sender_fp, body, .. } => {
+                assert_eq!(sender_fp.as_deref(), Some("b"));
+                assert_eq!(body, "群里的话");
+            }
+            other => panic!("期望 Text,得到 {other:?}"),
+        }
+        assert_eq!(s.history("b", None, 10).unwrap().len(), 1, "单聊不串群");
+
+        s.delete_group("gid-1").unwrap();
+        assert!(s.load_groups().unwrap().is_empty());
+    }
+
+    /// v2 老库(有 group_name、无 groups 表/sender_fp)打开时原地迁移。
+    #[test]
+    fn migrates_v2_db_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path().join("bigpaw.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                   id TEXT PRIMARY KEY, peer_fp TEXT NOT NULL, direction TEXT NOT NULL,
+                   body TEXT NOT NULL, ts_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO messages VALUES ('old-m', 'peerX', 'in', '旧消息', 42);
+                 CREATE TABLE transfers (
+                   xfer_id TEXT PRIMARY KEY, peer_fp TEXT NOT NULL, direction TEXT NOT NULL,
+                   name TEXT NOT NULL, size INTEGER NOT NULL, is_dir INTEGER NOT NULL DEFAULT 0,
+                   status TEXT NOT NULL, path TEXT, ts_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE peers (
+                   fingerprint TEXT PRIMARY KEY, nickname TEXT NOT NULL, protocol TEXT NOT NULL,
+                   last_addr TEXT, last_seen_ms INTEGER NOT NULL, group_name TEXT
+                 );
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let s = Storage::open(dir.path()).unwrap();
+        // 旧消息可读,sender_fp 为 None
+        match &s.history("peerX", None, 10).unwrap()[0] {
+            HistoryItem::Text { sender_fp, .. } => assert_eq!(*sender_fp, None),
+            other => panic!("期望 Text,得到 {other:?}"),
+        }
+        assert!(s.load_groups().unwrap().is_empty(), "groups 表已建且为空");
     }
 
     #[test]

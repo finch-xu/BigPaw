@@ -54,10 +54,13 @@ pub enum TransportError {
 
 #[derive(Debug, Clone)]
 pub struct MessageEvent {
+    /// 会话 id:单聊=对端指纹,群聊(M7c)=group_id。
     pub peer_fp: String,
     pub id: String,
     pub body: String,
     pub ts_ms: u64,
+    /// 群消息的发送者指纹(M7c,TLS 层验证过);单聊恒为 None。
+    pub sender_fp: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +98,15 @@ pub enum TransportEvent {
         xfer_id: String,
         reason: String,
     },
+    /// 群聊帧(M7c):GroupInfo/GroupText/GroupLeave 原样上抛,`from_fp` 为
+    /// TLS 层验证过的对端指纹(帧内不自报身份,解释权在 Core)。
+    Group {
+        from_fp: String,
+        msg: Msg,
+    },
+    /// 群列表变化(M7c):Core 的群事件处理产生,携带最新全量列表供壳层
+    /// 直接 emit 给前端(壳层事件线程不便反查 Core 状态)。
+    GroupsChanged(Vec<crate::groups::Group>),
 }
 
 /// `offer_file` 的返回句柄。目前只携带 xfer_id,单独成类型是为了未来扩展
@@ -308,6 +320,7 @@ impl TransportManager {
                         id,
                         body,
                         ts_ms,
+                        sender_fp: None,
                     });
                     if events.send(ev).is_err() {
                         return;
@@ -357,6 +370,18 @@ impl TransportManager {
                         let _ = proto::write_msg(tls_stream, &reply);
                     }
                     return;
+                }
+                // 群聊帧(M7c):原样上抛给 Core 解释(成员校验/LWW 合并都在那边)。
+                Ok(
+                    msg @ (Msg::GroupInfo { .. } | Msg::GroupText { .. } | Msg::GroupLeave { .. }),
+                ) => {
+                    let ev = TransportEvent::Group {
+                        from_fp: peer_fp.clone(),
+                        msg,
+                    };
+                    if events.send(ev).is_err() {
+                        return;
+                    }
                 }
                 // 下面两种只会出现在发起方"专用 offer 控制连接"的读侧
                 // (`await_offer_reply`),不会到这条服务端读循环里;防御性忽略。
@@ -608,7 +633,19 @@ impl TransportManager {
             Msg::Text { id, ts_ms, .. } => (id.clone(), *ts_ms),
             _ => unreachable!(),
         };
+        self.send_msg(peer_fp, addrs, port, &msg)?;
+        Ok(SentText { id, ts_ms })
+    }
 
+    /// 经缓存的出站连接向对端发一帧任意消息(M7c 抽出:send_text 与群聊扇出
+    /// 共用同一条"缓存命中→锁外重拨→回填缓存"路径)。
+    pub fn send_msg(
+        &self,
+        peer_fp: &str,
+        addrs: &[IpAddr],
+        port: u16,
+        msg: &Msg,
+    ) -> Result<(), TransportError> {
         // 改进点(相对 brief 参考实现):不在 dial() 期间持锁——dial 涉及网络
         // IO(连接超时可达 CONNECT_TIMEOUT),持锁会阻塞其他对端的并发发送。
         // 策略:先在短锁范围内尝试缓存连接;miss/失败则释放锁、在锁外 dial,
@@ -620,7 +657,7 @@ impl TransportManager {
             match cache.get_mut(peer_fp) {
                 Some(conn) => {
                     let alive = !Self::conn_is_dead(conn);
-                    if alive && proto::write_msg(conn, &msg).is_ok() {
+                    if alive && proto::write_msg(conn, msg).is_ok() {
                         true
                     } else {
                         cache.remove(peer_fp);
@@ -631,17 +668,17 @@ impl TransportManager {
             }
         };
         if cached_write_ok {
-            return Ok(SentText { id, ts_ms });
+            return Ok(());
         }
 
         // 2) 缓存 miss 或写失败:锁外重拨,避免持锁跨越网络 IO。
         let mut fresh = self.dial(peer_fp, addrs, port)?;
-        proto::write_msg(&mut fresh, &msg)?;
+        proto::write_msg(&mut fresh, msg)?;
 
         // 3) 写成功后再加锁插入缓存。
         let mut cache = self.outbound.lock().expect("outbound lock");
         cache.insert(peer_fp.to_string(), fresh);
-        Ok(SentText { id, ts_ms })
+        Ok(())
     }
 
     /// 发起一次文件传输报价:算 hash → 生成 xfer_id → 经一条**专用**控制

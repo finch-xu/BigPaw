@@ -96,10 +96,13 @@ fn ipmsg_status(app: AppHandle, core: State<'_, AppCore>) -> IpmsgStatusDto {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MessageDto {
+    /// 会话 id:单聊=对端指纹,群聊(M7c)=group_id。
     peer_fp: String,
     id: String,
     body: String,
     ts_ms: u64,
+    /// 群消息发送者指纹(M7c);单聊为 None。
+    sender_fp: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -190,6 +193,62 @@ fn get_history_around(
     core.0
         .storage()
         .history_around(&fingerprint, ts_ms, 25)
+        .map_err(|e| e.to_string())
+}
+
+// ---- 群聊命令(M7c) ----
+
+#[tauri::command]
+fn list_groups(core: State<'_, AppCore>) -> Vec<bigpaw_core::groups::Group> {
+    core.0.list_groups()
+}
+
+#[tauri::command]
+fn create_group(
+    core: State<'_, AppCore>,
+    name: String,
+    member_fps: Vec<String>,
+) -> Result<bigpaw_core::groups::Group, String> {
+    core.0
+        .create_group(&name, &member_fps)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn update_group_members(
+    core: State<'_, AppCore>,
+    group_id: String,
+    member_fps: Vec<String>,
+) -> Result<bigpaw_core::groups::Group, String> {
+    core.0
+        .update_group_members(&group_id, &member_fps)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn leave_group(core: State<'_, AppCore>, group_id: String) -> Result<(), String> {
+    core.0.leave_group(&group_id).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GroupSentDto {
+    id: String,
+    ts_ms: u64,
+}
+
+#[tauri::command]
+fn send_group_text(
+    core: State<'_, AppCore>,
+    group_id: String,
+    body: String,
+) -> Result<GroupSentDto, String> {
+    core.0
+        .send_group_text(&group_id, &body)
+        .map(|s| GroupSentDto {
+            id: s.id,
+            ts_ms: s.ts_ms,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -346,6 +405,7 @@ pub fn run() {
                                         id: ev.id,
                                         body: ev.body,
                                         ts_ms: ev.ts_ms,
+                                        sender_fp: ev.sender_fp,
                                     },
                                 );
                             }
@@ -396,6 +456,12 @@ pub fn run() {
                                 let _ =
                                     handle.emit("file://failed", FileFailedDto { xfer_id, reason });
                             }
+                            // 群列表变化(M7c):全量列表直接转发,前端整体替换。
+                            TransportEvent::GroupsChanged(list) => {
+                                let _ = handle.emit("group://updated", &list);
+                            }
+                            // 群帧在 core 泵线程已被拦截解释,不会到达这里(防御)。
+                            TransportEvent::Group { .. } => {}
                         }
                     }
                 });
@@ -443,6 +509,11 @@ pub fn run() {
             get_history,
             get_history_around,
             list_conversations,
+            list_groups,
+            create_group,
+            update_group_members,
+            leave_group,
+            send_group_text,
             search_history,
             clear_history,
             get_settings,

@@ -14,6 +14,9 @@ const T_FILE_OFFER: u8 = 3;
 const T_FILE_ACCEPT: u8 = 4;
 const T_FILE_REJECT: u8 = 5;
 const T_FILE_START: u8 = 6;
+const T_GROUP_INFO: u8 = 7;
+const T_GROUP_TEXT: u8 = 8;
+const T_GROUP_LEAVE: u8 = 9;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Msg {
@@ -42,6 +45,26 @@ pub enum Msg {
         xfer_id: String,
         offset: u64,
     },
+    /// 群成员表同步(M7c):建群邀请与成员变更共用。members = (fp, nick) 对。
+    GroupInfo {
+        group_id: String,
+        name: String,
+        creator_fp: String,
+        version: u64,
+        members: Vec<(String, String)>,
+    },
+    /// 群文本(M7c):发送者身份由 TLS 层对端识别提供,不在帧内自报。
+    GroupText {
+        group_id: String,
+        id: String,
+        body: String,
+        ts_ms: u64,
+    },
+    /// 主动退群通知(M7c):发给建群者,由其出新版本成员表。
+    GroupLeave {
+        group_id: String,
+        member_fp: String,
+    },
 }
 
 impl Msg {
@@ -53,6 +76,9 @@ impl Msg {
             Msg::FileAccept { .. } => T_FILE_ACCEPT,
             Msg::FileReject { .. } => T_FILE_REJECT,
             Msg::FileStart { .. } => T_FILE_START,
+            Msg::GroupInfo { .. } => T_GROUP_INFO,
+            Msg::GroupText { .. } => T_GROUP_TEXT,
+            Msg::GroupLeave { .. } => T_GROUP_LEAVE,
         }
     }
 }
@@ -93,6 +119,34 @@ pub fn write_msg(w: &mut impl Write, msg: &Msg) -> io::Result<()> {
         Msg::FileStart { xfer_id, offset } => {
             serde_json::json!({ "xfer_id": xfer_id, "offset": offset })
         }
+        Msg::GroupInfo {
+            group_id,
+            name,
+            creator_fp,
+            version,
+            members,
+        } => serde_json::json!({
+            "group_id": group_id,
+            "name": name,
+            "creator_fp": creator_fp,
+            "version": version,
+            "members": members
+        }),
+        Msg::GroupText {
+            group_id,
+            id,
+            body,
+            ts_ms,
+        } => serde_json::json!({
+            "group_id": group_id,
+            "id": id,
+            "body": body,
+            "ts_ms": ts_ms
+        }),
+        Msg::GroupLeave {
+            group_id,
+            member_fp,
+        } => serde_json::json!({ "group_id": group_id, "member_fp": member_fp }),
     };
     let bytes = serde_json::to_vec(&payload)?;
     let total = bytes.len() + 1;
@@ -182,11 +236,39 @@ pub fn read_msg(r: &mut impl Read) -> io::Result<Msg> {
                 .to_string(),
             offset: val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0),
         }),
+        T_GROUP_INFO => Ok(Msg::GroupInfo {
+            group_id: str_field(&val, "group_id"),
+            name: str_field(&val, "name"),
+            creator_fp: str_field(&val, "creator_fp"),
+            version: val.get("version").and_then(|v| v.as_u64()).unwrap_or(0),
+            members: val
+                .get("members")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
+        }),
+        T_GROUP_TEXT => Ok(Msg::GroupText {
+            group_id: str_field(&val, "group_id"),
+            id: str_field(&val, "id"),
+            body: str_field(&val, "body"),
+            ts_ms: val.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        }),
+        T_GROUP_LEAVE => Ok(Msg::GroupLeave {
+            group_id: str_field(&val, "group_id"),
+            member_fp: str_field(&val, "member_fp"),
+        }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unknown frame type",
         )),
     }
+}
+
+/// 宽容读取字符串字段:缺失/类型不符 → 空串(与本文件既有各分支口径一致)。
+fn str_field(val: &serde_json::Value, key: &str) -> String {
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -232,6 +314,48 @@ mod tests {
         buf.extend_from_slice(b"{}");
         let err = read_msg(&mut Cursor::new(buf)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// M7c:群聊三帧型往返(含中文、空成员表)。
+    #[test]
+    fn group_frames_roundtrip() {
+        let msgs = vec![
+            Msg::GroupInfo {
+                group_id: new_id(),
+                name: "猫猫群".to_string(),
+                creator_fp: "a".repeat(64),
+                version: 3,
+                members: vec![
+                    ("a".repeat(64), "建群猫".to_string()),
+                    ("b".repeat(64), "成员狗".to_string()),
+                ],
+            },
+            Msg::GroupInfo {
+                group_id: new_id(),
+                name: "空群".to_string(),
+                creator_fp: "c".repeat(64),
+                version: 1,
+                members: vec![],
+            },
+            Msg::GroupText {
+                group_id: new_id(),
+                id: new_id(),
+                body: "大家好🐾".to_string(),
+                ts_ms: now_ms(),
+            },
+            Msg::GroupLeave {
+                group_id: new_id(),
+                member_fp: "b".repeat(64),
+            },
+        ];
+        let mut buf = Vec::new();
+        for m in &msgs {
+            write_msg(&mut buf, m).unwrap();
+        }
+        let mut r = Cursor::new(buf);
+        for m in &msgs {
+            assert_eq!(&read_msg(&mut r).unwrap(), m);
+        }
     }
 
     #[test]
