@@ -1496,6 +1496,7 @@ mod tests {
                 nickname: Some("设置里的名字".to_string()),
                 download_dir: None,
                 ipmsg_enabled: true,
+                excluded_interfaces: Vec::new(),
             },
         )
         .unwrap();
@@ -1517,6 +1518,7 @@ mod tests {
                 nickname: None,
                 download_dir: None,
                 ipmsg_enabled: false,
+                excluded_interfaces: Vec::new(),
             },
         )
         .unwrap();

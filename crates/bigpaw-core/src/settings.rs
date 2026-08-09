@@ -10,6 +10,7 @@ pub struct Settings {
     pub nickname: Option<String>,
     pub download_dir: Option<String>,
     pub ipmsg_enabled: bool,
+    pub excluded_interfaces: Vec<String>,
 }
 
 impl Default for Settings {
@@ -18,6 +19,7 @@ impl Default for Settings {
             nickname: None,
             download_dir: None,
             ipmsg_enabled: true, // 与 M5 现状一致:默认尝试启用兼容层
+            excluded_interfaces: Vec::new(),
         }
     }
 }
@@ -54,6 +56,7 @@ mod tests {
             nickname: Some("大脚猫".to_string()),
             download_dir: Some("/tmp/dl".to_string()),
             ipmsg_enabled: false,
+            excluded_interfaces: Vec::new(),
         };
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()), s);
@@ -64,5 +67,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("settings.json"), "{oops").unwrap();
         assert_eq!(load(dir.path()), Settings::default());
+    }
+
+    #[test]
+    fn excluded_interfaces_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings {
+            nickname: Some("大脚猫".to_string()),
+            download_dir: Some("/tmp/dl".to_string()),
+            ipmsg_enabled: false,
+            excluded_interfaces: vec!["eth0".to_string(), "wlan0".to_string()],
+        };
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()), s);
+    }
+
+    #[test]
+    fn old_json_without_excluded_interfaces_deserializes_to_empty_list() {
+        let old_json = r#"{"nickname":"旧配置","ipMsgEnabled":true}"#;
+        let s: Settings = serde_json::from_str(old_json).unwrap();
+        assert_eq!(s.nickname, Some("旧配置".to_string()));
+        assert!(s.ipmsg_enabled);
+        assert_eq!(s.excluded_interfaces, Vec::<String>::new());
     }
 }
