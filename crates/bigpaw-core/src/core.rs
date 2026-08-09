@@ -17,7 +17,7 @@ use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,7 +125,9 @@ fn apply_excluded_interfaces(
     }
 }
 
-/// ipmsg 定向广播目标表的写入守卫(Important 1,最终评审修复)。
+/// ipmsg 定向广播目标表的写入守卫(Important 1,最终评审修复;经复审指出
+/// 首版用 `AtomicU64::fetch_max` 做"两段式" check-then-write 仍有竞态窗口
+/// 后,改成本版的单锁临界区实现)。
 ///
 /// 背景:`apply_settings` 热生效路径(`InterfaceRegistry::set_excluded`)与
 /// roster 线程按 `IFACE_REFRESH_INTERVAL` 的定期 `refresh()` 都可能产生一份
@@ -138,16 +140,27 @@ fn apply_excluded_interfaces(
 /// ipmsg 没有 watch 机制感知这个错误,这个 stale 状态会无限期留存(直到
 /// 下一次快照内容碰巧真的变化),持续向已排除的网段发送 BR_ENTRY。
 ///
-/// 修法:`IfaceSnapshot::generation` 由 `InterfaceRegistry` 在唯一一把
-/// `excluded` 锁内单调递增并发布(见 `InterfaceRegistry::refresh` 文档),
-/// 因此是一个可靠的"谁更新"的全序标记。这里用它做写入前的 CAS 守卫:只接受
-/// 严格更新的一代,`AtomicU64::fetch_max` 保证无论两次写入谁先执行到覆写
-/// 这一步,generation 更小的那次都会被识别为 stale 而跳过——不需要把覆写
-/// 挪进 registry 内部改成回调(那样要给 registry 加 ipmsg 相关依赖,改动面
-/// 更大),这是侵入最小的修法。
+/// 首版实现的问题(复审指出):用独立的 `AtomicU64` 配 `fetch_max` 只能保证
+/// "谁先执行 fetch_max,谁的 generation 先被原子地记录"，不能保证"记录
+/// generation"与"覆写 targets"这两步对多个线程而言是同一个原子操作——两者
+/// 之间存在一个可被抢占的窗口:线程 B(旧 generation)的 `fetch_max` 检查
+/// 通过后,若在它真正执行 `targets.lock()` 写入之前被调度器换出,线程 A
+/// (新 generation)完整跑完"fetch_max 检查 + 写入"并释放锁,B 恢复执行后
+/// 仍会无条件地把自己更早读到的旧数据写回,覆盖 A 刚写完的新数据。
+///
+/// 现在的修法:不用独立的原子量做"预检",而是把 generation 与
+/// "覆写 targets"这两步收进**同一把锁(`applied_gen: Mutex<u64>`)的临界
+/// 区**——`apply_if_newer` 先锁 `applied_gen`,在**持有它的整个临界区内**
+/// 完成"读 generation → 判断 → 覆写 targets → 更新 generation"全部四步才
+/// 释放锁。固定锁序为"先锁 `applied_gen`,临界区内再锁 `targets`",三个
+/// 调用点(`apply_excluded_interfaces`、roster 线程两处 `refresh` 覆写)
+/// 全部只通过这一个方法接触 `targets`,不存在任何绕开 `applied_gen` 锁直接
+/// 覆写 `targets` 的路径——因此 `apply_if_newer` 的调用之间是完全互斥的,
+/// check 和 write 之间不再有可被插入的窗口,不需要把覆写挪进 registry 内部
+/// 改成回调(那样要给 registry 加 ipmsg 相关依赖,改动面更大)。
 struct IpmsgBcastGuard {
     targets: BroadcastTargets,
-    applied_gen: AtomicU64,
+    applied_gen: Mutex<u64>,
 }
 
 impl IpmsgBcastGuard {
@@ -157,18 +170,21 @@ impl IpmsgBcastGuard {
     fn new(targets: BroadcastTargets, initial_gen: u64) -> Self {
         Self {
             targets,
-            applied_gen: AtomicU64::new(initial_gen),
+            applied_gen: Mutex::new(initial_gen),
         }
     }
 
-    /// 仅当 `snapshot.generation` 严格新于已应用的一代时才覆写 `targets`;
-    /// 收到一份 stale 快照(generation 不大于已应用值)时静默跳过,不覆写。
+    /// check-and-write 在 `applied_gen` 这一把锁的临界区内原子完成(见类型
+    /// 文档"现在的修法"):持锁期间做完"判断 generation → 覆写 targets →
+    /// 更新已应用 generation"三件事才放锁,调用者之间因此完全互斥——不存在
+    /// 让另一个调用者在"判断"和"写入"之间插进来的窗口。收到一份 stale 快照
+    /// (generation 不大于已应用值)时静默跳过,不覆写。
     fn apply_if_newer(&self, snapshot: &IfaceSnapshot) {
-        let gen = snapshot.generation;
-        let prev_applied = self.applied_gen.fetch_max(gen, Ordering::SeqCst);
-        if gen > prev_applied {
+        let mut applied = self.applied_gen.lock().expect("applied gen lock");
+        if snapshot.generation > *applied {
             *self.targets.lock().expect("ipmsg bcast lock") =
                 net_ifaces::broadcast_targets(&snapshot.entries);
+            *applied = snapshot.generation;
         }
     }
 }
@@ -1605,6 +1621,80 @@ mod tests {
         assert_eq!(
             *targets.lock().unwrap(),
             net_ifaces::broadcast_targets(&entries)
+        );
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_concurrent_interleaved_generations_converge_to_the_max() {
+        // 多线程压力测试(复审要求):同线程顺序调用只能验证"逻辑上旧的不该
+        // 覆盖新的",验证不了"check 和 write 之间是否真的不可被抢占插入"这个
+        // 并发属性本身——两条线程各 1000 次交替以递增 generation 调用
+        // `apply_if_newer`,制造大量"新旧交错"的真实调度机会。这类压力测试
+        // 不能穷尽所有调度顺序,但配合 `apply_if_newer` 的锁序论证(见类型
+        // 文档"现在的修法":check-and-write 在同一把 `applied_gen` 锁的临界
+        // 区内原子完成,调用者之间完全互斥)已经足够——现在的实现下这个
+        // 断言应当 100% 确定性成立(不是"大概率成立"),因为整把锁序保证了
+        // "最终状态 = 出现过的最高 generation"这一收敛性质,与线程调度顺序
+        // 无关;首版 `fetch_max` 两段式实现在这个测试上并不保证必然失败
+        // (窗口很窄,压力测试可能撞不上),这正是复审指出"结构性论证"比
+        // "跑几次不挂"更重要的原因——本测试是锁序论证之外的补充信心,不是
+        // 唯一证据。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = Arc::new(IpmsgBcastGuard::new(targets.clone(), 0));
+
+        const ITERS: u64 = 1000;
+        fn entries_for_gen(gen: u64) -> Vec<IfaceEntry> {
+            vec![iface_entry(
+                "en0",
+                Ipv4Addr::new(10, 0, ((gen >> 8) & 0xff) as u8, (gen & 0xff) as u8),
+                Ipv4Addr::new(255, 255, 255, 0),
+            )]
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        // 线程 A:偶数代 2, 4, ..., 2*ITERS(全局最高的一代 2*ITERS 出自这里)。
+        let guard_a = guard.clone();
+        let barrier_a = barrier.clone();
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait(); // 尽量让两条线程同时起跑,加大交错概率
+            for i in 1..=ITERS {
+                let gen = i * 2;
+                guard_a.apply_if_newer(&IfaceSnapshot {
+                    generation: gen,
+                    entries: entries_for_gen(gen),
+                });
+            }
+        });
+
+        // 线程 B:奇数代 1, 3, ..., 2*ITERS-1——每一个都紧跟在线程 A 同轮次
+        // 的偶数代之后一个整数,专门制造"旧的紧跟在新的后面尝试覆写"的场景。
+        let guard_b = guard.clone();
+        let barrier_b = barrier.clone();
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            for i in 1..=ITERS {
+                let gen = i * 2 - 1;
+                guard_b.apply_if_newer(&IfaceSnapshot {
+                    generation: gen,
+                    entries: entries_for_gen(gen),
+                });
+            }
+        });
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        // 两条线程整个压力测试期间出现过的全局最高 generation 是 2*ITERS
+        // (线程 A 的最后一次调用)。无论实际调度交错成什么顺序,最终状态都
+        // 必须与它一致——不能被任何一次更旧 generation 的调用事后覆盖。
+        let max_gen = ITERS * 2;
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&entries_for_gen(max_gen)),
+            "两线程 {ITERS} 次交替 apply 之后,最终 targets 必须与压力测试中\
+             出现过的最高 generation({max_gen})一致,不能被更旧的 generation \
+             事后覆盖"
         );
     }
 
