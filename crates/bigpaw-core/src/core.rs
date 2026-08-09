@@ -6,6 +6,7 @@ use crate::discovery::announce::{
 };
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
+use crate::net_ifaces::InterfaceRegistry;
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::storage::Storage;
 use crate::transport::manager::{
@@ -183,6 +184,11 @@ impl Core {
         let (tx, rx) = std::sync::mpsc::channel();
         // 真实端口进 SRV
         let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        // 网卡选择(Step 3 最小接线):这里只建 registry 并把订阅句柄传给
+        // announce——完整的"热生效"(排除清单变更后 mdns/ipmsg/transport 联动
+        // 刷新)是 Step 7 的事,这里不做 tick 刷新,也不对外暴露这个实例。
+        let iface_registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+
         // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
         // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
         let announce_service = AnnounceService::start(
@@ -191,6 +197,7 @@ impl Core {
             transport.port(),
             DEFAULT_ANNOUNCE_PORT,
             tx.clone(),
+            iface_registry.subscribe(),
         )?;
         let announce = Arc::new(Mutex::new(Some(announce_service)));
 

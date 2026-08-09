@@ -7,19 +7,21 @@
 //! - 启动快速宣告(2s/4s/8s 退避)后转周期(~25s),发送批次间隔 ≥1s。
 
 use crate::identity::Identity;
+use crate::net_ifaces::{multicast_diff, send_targets, IfaceEntry, IfaceSnapshot};
 use crate::roster::{DiscoveryEvent, Protocol};
 use serde::{Deserialize, Serialize};
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, SockRef, Socket, Type};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::watch;
 
 /// 宣告服务默认端口(设计文档 §4)。
 pub const DEFAULT_ANNOUNCE_PORT: u16 = 24916;
@@ -42,9 +44,6 @@ const PERIODIC_INTERVAL: Duration = Duration::from_secs(25);
 const MIN_SEND_BATCH_INTERVAL: Duration = Duration::from_secs(1);
 /// 中断式休眠的步长,让停止标志能被及时观察到。
 const SLEEP_STEP: Duration = Duration::from_millis(200);
-
-/// 虚拟接口名关键字(隧道/网桥/虚拟网卡),这些不参与广播宣告。
-const VIRTUAL_IFACE_HINTS: [&str; 5] = ["tun", "utun", "bridge", "vnic", "vmnet"];
 
 const MAX_DATAGRAM: usize = 1400;
 const MAX_NICK_BYTES: usize = 64;
@@ -132,34 +131,11 @@ pub enum AnnounceError {
     Io(#[from] std::io::Error),
 }
 
-/// 判断接口名是否为虚拟/隧道类接口(不参与物理网段广播)。
-fn is_virtual_iface(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    VIRTUAL_IFACE_HINTS.iter().any(|hint| lower.contains(hint))
-}
-
-/// 枚举本机物理 IPv4 接口(跳过 loopback 与虚拟接口)。
-fn physical_ipv4_interfaces() -> Vec<if_addrs::Ifv4Addr> {
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|iface| !iface.is_loopback() && !is_virtual_iface(&iface.name))
-        .filter_map(|iface| match iface.addr {
-            if_addrs::IfAddr::V4(v4) => Some(v4),
-            if_addrs::IfAddr::V6(_) => None,
-        })
-        .collect()
-}
-
-/// 由 ip+netmask 计算定向广播地址(ip | !netmask)。
-fn directed_broadcast(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
-    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
-}
-
-/// 绑定 0.0.0.0:port 的 UDP socket:REUSEADDR/REUSEPORT + BROADCAST,TTL=1,
-/// 对每个物理接口尝试 join 组播组(失败的接口跳过,不影响其余接口)。
-/// 返回 (socket, 实际 join 成功的接口 IP 列表) 供 shutdown 时对称 leave。
-fn bind_socket(port: u16) -> Result<(UdpSocket, Vec<Ipv4Addr>), AnnounceError> {
+/// 绑定 0.0.0.0:port 的 UDP socket:REUSEADDR/REUSEPORT + BROADCAST,TTL=1。
+/// 不做任何组播 join——网卡选择已迁到 `net_ifaces::InterfaceRegistry`,组播
+/// 成员关系改由 `sync_multicast` 按其发布的快照增量维护(见 `send_loop`),
+/// 与"当前活跃网卡有哪些"这件事解耦,不再在绑定这一刻一次性枚举定死。
+fn bind_socket(port: u16) -> Result<UdpSocket, AnnounceError> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(SockProtocol::UDP))?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
@@ -171,63 +147,154 @@ fn bind_socket(port: u16) -> Result<(UdpSocket, Vec<Ipv4Addr>), AnnounceError> {
     let bind_addr: SocketAddr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into();
     socket.bind(&SockAddr::from(bind_addr))?;
 
-    let mut joined = Vec::new();
-    for iface in physical_ipv4_interfaces() {
-        if socket
-            .join_multicast_v4(&MULTICAST_GROUP, &iface.ip)
-            .is_ok()
-        {
-            joined.push(iface.ip);
-        }
-        // join 失败的接口直接跳过,不中断其余接口的尝试(铁律:单接口失败不影响整体)。
-    }
-
     socket.set_read_timeout(Some(RECV_POLL_TIMEOUT))?;
-    Ok((socket.into(), joined))
+    Ok(socket.into())
 }
 
-/// 中断式休眠:每 SLEEP_STEP 检查一次停止标志,避免长睡眠拖慢 shutdown。
-fn interruptible_sleep(stop: &AtomicBool, dur: Duration) {
+/// 按当前活跃网卡快照增量同步组播 join/leave 状态(`multicast_diff` 纯计算
+/// 已在 `net_ifaces` 测过,这里只是把结果落到 std `UdpSocket` 自带的
+/// `join_multicast_v4`/`leave_multicast_v4` 上)。全部容错(`let _`/
+/// `is_ok()`):单张网卡 join/leave 失败不影响其余网卡,也不 panic——
+/// `joined` 只记录"确认成功"的那些,失败的 join 不计入(下次快照不变时还会
+/// 再尝试),leave 无论成败都从 `joined` 摘除(避免反复对一个已经不存在的
+/// 接口发起 leave)。
+fn sync_multicast(socket: &UdpSocket, joined: &mut Vec<Ipv4Addr>, entries: &[IfaceEntry]) {
+    let (to_join, to_leave) = multicast_diff(joined, entries);
+    for ip in &to_leave {
+        let _ = socket.leave_multicast_v4(&MULTICAST_GROUP, ip);
+    }
+    joined.retain(|ip| !to_leave.contains(ip));
+    for ip in to_join {
+        if socket.join_multicast_v4(&MULTICAST_GROUP, &ip).is_ok() {
+            joined.push(ip);
+        }
+    }
+}
+
+/// 向组播组 + 各子网定向广播地址双发同一份报文。先用 `send_targets` 做子网
+/// 去重(同一子网多张网卡只发一次,防重复宣告/防飞秋对端列表重复),对每个
+/// 目标临时借用 `socket2::SockRef` 把 `IP_MULTICAST_IF` 切到该网卡再发一次
+/// 组播(否则组播出口网卡由系统路由表决定,不一定是我们想要的那张),随后
+/// 发一次该子网的定向广播——组播+广播双通道兜底(部分交换机 IGMP snooping
+/// 会让纯组播不可达)。`IP_MULTICAST_IF` 只影响组播发送方向,不影响本 socket
+/// 的接收或 `poke` 用到的单播发送。单个目标切网卡/发送失败不影响其余目标
+/// (铁律:单网卡失败不拖垮整轮)。`entries` 为空(用户排除了全部网卡)时
+/// `send_targets` 返回空列表,本函数因此静默不发——即“全网隐身”。
+fn send_dual(socket: &UdpSocket, buf: &[u8], port: u16, entries: &[IfaceEntry]) {
+    for target in send_targets(entries) {
+        if SockRef::from(socket)
+            .set_multicast_if_v4(&target.iface_ip)
+            .is_err()
+        {
+            continue; // 切换组播出口网卡失败,跳过这张卡,不影响其余目标
+        }
+        let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
+        let _ = socket.send_to(buf, SocketAddrV4::new(target.broadcast, port));
+    }
+}
+
+/// 中断式休眠 + 网卡热变化响应:每 `SLEEP_STEP`(≤200ms)检查一次停止标志与
+/// `ifaces_rx` 是否有新快照。快照变化时(网卡热插拔/用户改排除清单)立即按
+/// 新快照 `sync_multicast` 并补发一批宣告,但受 `MIN_SEND_BATCH_INTERVAL`
+/// 全局限速(避免抖动网卡触发发送风暴,不违反“报文速率不高于现状”铁律);
+/// 不打断外层原有的退避/周期发送节奏,只是让"网卡变化秒级可见"。
+/// 返回 `false` 表示被停止信号中断(调用方应立即退出线程)。
+#[allow(clippy::too_many_arguments)]
+fn sleep_and_watch_ifaces(
+    stop: &AtomicBool,
+    ifaces_rx: &mut watch::Receiver<IfaceSnapshot>,
+    joined: &Mutex<Vec<Ipv4Addr>>,
+    socket: &UdpSocket,
+    buf: &[u8],
+    port: u16,
+    last_send: &mut Instant,
+    dur: Duration,
+) -> bool {
     let mut remaining = dur;
     while remaining > Duration::ZERO {
         if stop.load(Ordering::Relaxed) {
-            return;
+            return false;
+        }
+        if ifaces_rx.has_changed().unwrap_or(false) {
+            let snapshot = ifaces_rx.borrow_and_update().clone();
+            {
+                let mut joined_guard = joined.lock().expect("joined lock");
+                sync_multicast(socket, &mut joined_guard, &snapshot.entries);
+            }
+            if last_send.elapsed() >= MIN_SEND_BATCH_INTERVAL {
+                send_dual(socket, buf, port, &snapshot.entries);
+                *last_send = Instant::now();
+            }
         }
         let step = remaining.min(SLEEP_STEP);
         std::thread::sleep(step);
         remaining -= step;
     }
+    true
 }
 
-/// 向组播组 + 所有物理接口的定向广播地址双发同一份报文;单个目标发送失败不影响其余目标。
-fn send_dual(socket: &UdpSocket, buf: &[u8], port: u16) {
-    let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
-    for iface in physical_ipv4_interfaces() {
-        let bcast = directed_broadcast(iface.ip, iface.netmask);
-        let _ = socket.send_to(buf, SocketAddrV4::new(bcast, port));
-    }
-}
-
-/// 发送线程主循环:启动 3 次指数退避快速宣告(2s/4s/8s),之后转周期宣告(~25s)。
-/// 每次发送批次之间的全局最小间隔由退避/周期时长天然保证(均 ≥ MIN_SEND_BATCH_INTERVAL)。
-fn send_loop(socket: Arc<UdpSocket>, stop: Arc<AtomicBool>, buf: Vec<u8>, port: u16) {
+/// 发送线程主循环:启动 3 次指数退避快速宣告(2s/4s/8s),之后转周期宣告
+/// (~25s)。每次发送批次之间的全局最小间隔由退避/周期时长天然保证(均 ≥
+/// `MIN_SEND_BATCH_INTERVAL`)。进循环前先按当前快照同步一次组播 join 状态
+/// (不发送,避免启动瞬间用空 `joined` 集合走一轮"全部 to_join"又立刻被
+/// STARTUP_BACKOFF 的第一次发送重复触发)。
+fn send_loop(
+    socket: Arc<UdpSocket>,
+    stop: Arc<AtomicBool>,
+    buf: Vec<u8>,
+    port: u16,
+    mut ifaces_rx: watch::Receiver<IfaceSnapshot>,
+    joined: Arc<Mutex<Vec<Ipv4Addr>>>,
+) {
     debug_assert!(STARTUP_BACKOFF
         .iter()
         .all(|d| *d >= MIN_SEND_BATCH_INTERVAL));
     debug_assert!(PERIODIC_INTERVAL >= MIN_SEND_BATCH_INTERVAL);
+
+    {
+        let snapshot = ifaces_rx.borrow_and_update().clone();
+        let mut joined_guard = joined.lock().expect("joined lock");
+        sync_multicast(&socket, &mut joined_guard, &snapshot.entries);
+    }
+    // 允许第一次退避发送不被“上次发送时间”误判为过近:初值刻意设在
+    // MIN_SEND_BATCH_INTERVAL 之前。
+    let mut last_send = Instant::now()
+        .checked_sub(MIN_SEND_BATCH_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
     for delay in STARTUP_BACKOFF {
-        interruptible_sleep(&stop, delay);
-        if stop.load(Ordering::Relaxed) {
+        if !sleep_and_watch_ifaces(
+            &stop,
+            &mut ifaces_rx,
+            &joined,
+            &socket,
+            &buf,
+            port,
+            &mut last_send,
+            delay,
+        ) {
             return;
         }
-        send_dual(&socket, &buf, port);
+        let entries = ifaces_rx.borrow().entries.clone();
+        send_dual(&socket, &buf, port, &entries);
+        last_send = Instant::now();
     }
     loop {
-        interruptible_sleep(&stop, PERIODIC_INTERVAL);
-        if stop.load(Ordering::Relaxed) {
+        if !sleep_and_watch_ifaces(
+            &stop,
+            &mut ifaces_rx,
+            &joined,
+            &socket,
+            &buf,
+            port,
+            &mut last_send,
+            PERIODIC_INTERVAL,
+        ) {
             return;
         }
-        send_dual(&socket, &buf, port);
+        let entries = ifaces_rx.borrow().entries.clone();
+        send_dual(&socket, &buf, port, &entries);
+        last_send = Instant::now();
     }
 }
 
@@ -300,7 +367,10 @@ fn recv_loop(
 pub struct AnnounceService {
     stop: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
-    joined: Vec<Ipv4Addr>,
+    /// 当前已 join 组播组的网卡 IP 集合。`Arc<Mutex<_>>` 是因为发送线程
+    /// (`send_loop`/`sleep_and_watch_ifaces`)会在网卡快照变化时并发读写它,
+    /// `shutdown` 时再借这把锁读出最终集合做对称 leave。
+    joined: Arc<Mutex<Vec<Ipv4Addr>>>,
     /// 预编码好的自身宣告报文,`poke` 复用它做定向单播(见下)。
     announce_buf: Vec<u8>,
     send_handle: Option<JoinHandle<()>>,
@@ -308,17 +378,22 @@ pub struct AnnounceService {
 }
 
 impl AnnounceService {
-    /// 启动宣告收发服务:绑定 socket、加入组播组,并分别起发送/接收线程。
+    /// 启动宣告收发服务:绑定 socket,起发送/接收线程。组播 join/leave 不再
+    /// 在这里一次性做——发送线程按 `ifaces_rx` 发布的活跃网卡快照增量维护
+    /// (见 `send_loop`/`sync_multicast`),`ifaces_rx` 由调用方传入(通常是
+    /// `net_ifaces::InterfaceRegistry::subscribe()`),本函数不关心它的来源。
     pub fn start(
         identity: &Identity,
         nick: &str,
         tport: u16,
         port: u16,
         tx: Sender<DiscoveryEvent>,
+        ifaces_rx: watch::Receiver<IfaceSnapshot>,
     ) -> Result<AnnounceService, AnnounceError> {
-        let (socket, joined) = bind_socket(port)?;
+        let socket = bind_socket(port)?;
         let socket = Arc::new(socket);
         let stop = Arc::new(AtomicBool::new(false));
+        let joined: Arc<Mutex<Vec<Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
 
         let announcement = Announcement {
             v: 1,
@@ -334,7 +409,8 @@ impl AnnounceService {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
             let buf = buf.clone();
-            std::thread::spawn(move || send_loop(socket, stop, buf, port))
+            let joined = Arc::clone(&joined);
+            std::thread::spawn(move || send_loop(socket, stop, buf, port, ifaces_rx, joined))
         };
 
         let recv_handle = {
@@ -377,7 +453,8 @@ impl AnnounceService {
         // 两条线程已退出,自己是唯一持有者:可安全拿回 socket 显式 leave_multicast。
         if let Ok(std_socket) = Arc::try_unwrap(self.socket) {
             let sock2 = Socket::from(std_socket);
-            for ip in &self.joined {
+            let joined = self.joined.lock().expect("joined lock").clone();
+            for ip in &joined {
                 let _ = sock2.leave_multicast_v4(&MULTICAST_GROUP, ip);
             }
         }
@@ -436,5 +513,68 @@ mod tests {
         h.save(dir.path());
         let h2 = HistoryStore::load(dir.path());
         assert_eq!(h2.ips().len(), h.ips().len(), "重载一致");
+    }
+
+    // ---------- sync_multicast ----------
+
+    fn test_entry(ip: Ipv4Addr) -> IfaceEntry {
+        IfaceEntry {
+            name: "test0".to_string(),
+            ip,
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            broadcast: Ipv4Addr::new(203, 0, 113, 255),
+            is_virtual_hint: false,
+        }
+    }
+
+    #[test]
+    fn sync_multicast_does_not_record_failed_join() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut joined = Vec::new();
+        // TEST-NET-3(RFC 5737)地址不属于任何本机网卡,join 必然失败——
+        // 验证“单网卡失败不拖垮整轮”:失败的网卡不计入 joined。
+        let entries = vec![test_entry(Ipv4Addr::new(203, 0, 113, 5))];
+        sync_multicast(&socket, &mut joined, &entries);
+        assert!(joined.is_empty(), "join 失败的网卡不应计入 joined");
+    }
+
+    #[test]
+    fn sync_multicast_removes_ip_no_longer_in_snapshot() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        // 即使这个 IP 当初从未真正 join 成功(测试环境不持有它),leave 仍应
+        // 尝试(容错)且无论成败都要把它从 joined 摘除,否则会无限重试。
+        let mut joined = vec![Ipv4Addr::new(203, 0, 113, 5)];
+        sync_multicast(&socket, &mut joined, &[]);
+        assert!(joined.is_empty(), "快照中不再出现的 IP 应从 joined 摘除");
+    }
+
+    #[test]
+    fn sync_multicast_is_a_no_op_when_already_in_sync() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let mut joined = Vec::new();
+        sync_multicast(&socket, &mut joined, &[]);
+        assert!(joined.is_empty());
+    }
+
+    // ---------- send_dual ----------
+
+    #[test]
+    fn send_dual_with_empty_entries_sends_nothing() {
+        // 全部网卡被排除(entries 为空)= “全网隐身”:send_targets 返回空
+        // 列表,send_dual 因此不应向任何地址发出报文。
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+
+        send_dual(&socket, b"hello", port, &[]);
+
+        let mut buf = [0u8; 16];
+        assert!(
+            receiver.recv_from(&mut buf).is_err(),
+            "entries 为空时不应发送任何报文"
+        );
     }
 }
