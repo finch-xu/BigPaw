@@ -198,11 +198,19 @@ impl Discovery {
     /// 后调用,见其文档注释与文件头坑位说明)。instance/host 不变,
     /// fullname 理论上应保持一致,这里仍从新 `ServiceInfo` 重新取一次,
     /// 不假设 mdns-sd 内部实现细节。
+    ///
+    /// 注意:这里**不**像 `shutdown` 那样同步等 unregister 的
+    /// `Receiver<UnregisterStatus>`——`shutdown` 是一次性终局关停,阻塞
+    /// ≤1s 换确定性划算;`apply_exclusions`/`re_register` 是运行期热路径
+    /// (Step 7 会在持有 `Core::discovery` 的 `Mutex` 时调用它),同步等待
+    /// 会变成"锁内阻塞网络 IO"——正是这个代码库刻意避免的反模式(见
+    /// `core.rs` 里 `ipmsg` 字段的锁使用注释)。安全性依据:mdns-sd 的
+    /// daemon 命令由其内部线程按队列顺序串行处理,`unregister` 与紧随其后
+    /// 的 `register` 的先后顺序由这个队列保证,调用方不需要同步等待
+    /// unregister 处理完才能提交 register。
     fn re_register(&mut self) -> Result<(), mdns_sd::Error> {
-        if let Ok(rx) = self.daemon.unregister(&self.fullname) {
-            // 等 goodbye 真正处理完,上限 1s,与 shutdown 同样的等待策略。
-            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
-        }
+        // fire-and-forget:只投递命令,不等结果(见上方注释)。
+        let _ = self.daemon.unregister(&self.fullname);
         let info = build_service_info(
             &self.instance,
             &self.host,
