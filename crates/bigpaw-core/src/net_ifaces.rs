@@ -202,10 +202,28 @@ impl InterfaceRegistry {
 
     /// 重新枚举系统网卡并原子对比发布。数据未变化时不触发订阅者唤醒(`send_if_modified`
     /// 语义),避免 announce/mdns 等下游做无意义的重建。
+    ///
+    /// 持锁贯穿"读 `excluded` → 系统枚举 → 发布"整个流程(而不是只护住
+    /// "读 `excluded`"这一步就放锁)——`excluded` 锁是 `refresh`/`set_excluded`/
+    /// `list_all` 三者唯一的竞争点,`get_if_addrs` 是快系统调用,持锁跨越
+    /// 它的开销可以接受。这样做是为了堵一个丢失更新竞态(Step 7 编排引入
+    /// 并发调用者后才会触发):若 `refresh`(roster 线程每 30s 一次)与
+    /// `set_excluded`(设置页热生效)并发执行且只各自短暂锁一次
+    /// `excluded`,后完成发布的一方可能用自己更早读到的旧 `excluded` 值
+    /// 覆盖对方刚发布的新排除结果——新排除清单要等下一轮 `refresh`
+    /// (最多 30s)才会自愈,这段时间里被排除的网卡实际仍在参与广播,
+    /// 违反"设置立即生效"的预期。把整个流程串行化后,不可能出现这种
+    /// 交错:谁先拿到锁,谁的读取-枚举-发布就完整跑完才轮到下一个。
     pub fn refresh(&self) -> Option<IfaceSnapshot> {
-        let excluded = self.excluded.lock().expect("excluded lock").clone();
+        let excluded = self.excluded.lock().expect("excluded lock");
+        self.refresh_locked(&excluded)
+    }
+
+    /// `refresh` 的核心:调用方已经持有 `excluded` 锁(`refresh` 自己拿,或
+    /// `set_excluded` 在替换清单后原地继续持有),这里只管枚举 + 发布。
+    fn refresh_locked(&self, excluded: &[String]) -> Option<IfaceSnapshot> {
         let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-        let entries = build_entries(&ifaces, &excluded);
+        let entries = build_entries(&ifaces, excluded);
         self.apply_entries(entries)
     }
 
@@ -227,12 +245,15 @@ impl InterfaceRegistry {
 
     /// 更新排除清单并立即 refresh。返回 (旧清单, 若快照因此变化则为新快照)。
     /// 旧清单供 mdns 侧做 enable/disable diff(哪些名字从排除变为放行、反之)。
+    ///
+    /// 替换清单与随后的 `refresh_locked` 共用同一把 `excluded` 锁、中途不
+    /// 释放——这正是 `refresh` 文档注释里说的"整个流程串行化",保证这里
+    /// 发布的快照用的就是刚刚写入的这份新清单,不会被并发的 `refresh`
+    /// 用旧清单抢先或延后发布而覆盖。
     pub fn set_excluded(&self, names: Vec<String>) -> (Vec<String>, Option<IfaceSnapshot>) {
-        let old = {
-            let mut guard = self.excluded.lock().expect("excluded lock");
-            std::mem::replace(&mut *guard, names)
-        };
-        let new_snapshot = self.refresh();
+        let mut guard = self.excluded.lock().expect("excluded lock");
+        let old = std::mem::replace(&mut *guard, names);
+        let new_snapshot = self.refresh_locked(&guard);
         (old, new_snapshot)
     }
 
@@ -264,6 +285,8 @@ impl InterfaceRegistry {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     fn v4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
@@ -702,5 +725,58 @@ mod tests {
         let registry = InterfaceRegistry::new(vec!["a".to_string()]);
         let (old, _new_snapshot) = registry.set_excluded(vec!["b".to_string()]);
         assert_eq!(old, vec!["a".to_string()]);
+    }
+
+    // ---------- 并发:refresh/set_excluded 的丢失更新竞态(Task 7 评审修复) ----------
+
+    /// 结构性证明 `excluded` 锁确实贯穿"读 excluded → 枚举 → 发布"整个
+    /// `refresh`/`set_excluded` 流程,而不是只护住"读 excluded"这一步。
+    ///
+    /// `get_if_addrs` 是真实系统调用,没有钩子可以注入延迟来复现"两个
+    /// 调用交错完成、后者用旧值覆盖前者"的时序竞态本身;能确定性单测的
+    /// 是这条竞态得以修复所依赖的结构保证——即整个操作对同一把锁互斥。
+    /// 用一个线程手工持有 `excluded` 锁模拟"一次 refresh/set_excluded
+    /// 正在进行中",断言并发的 `set_excluded` 会阻塞到锁被释放为止,而不是
+    /// 各自读一次 `excluded` 就放锁、任由两次发布乱序交错。
+    #[test]
+    fn set_excluded_blocks_until_a_concurrent_operation_releases_the_excluded_lock() {
+        let registry = InterfaceRegistry::new(vec![]);
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel::<()>();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+
+        // 线程 A:模拟"正在执行中的 refresh/set_excluded"——抢到 excluded
+        // 锁后按住不放,直到测试主线程发出放行信号。
+        let registry_for_holder = registry.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = registry_for_holder.excluded.lock().expect("excluded lock");
+            holding_tx.send(()).expect("通知主线程已持锁");
+            unblock_rx.recv().expect("等待放行信号");
+        });
+        holding_rx.recv().expect("确认线程 A 已经持锁");
+
+        // 线程 B:此刻调用 set_excluded 必须阻塞在锁上,不能提前完成——
+        // 提前完成就意味着它只锁了"读 excluded"那一小步,读完就放锁了,
+        // 这正是丢失更新竞态的根源。
+        let registry_for_blocked = registry.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_for_blocked = done.clone();
+        let blocked = std::thread::spawn(move || {
+            registry_for_blocked.set_excluded(vec!["x".to_string()]);
+            done_for_blocked.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "线程 A 还按着 excluded 锁时,set_excluded 不该提前完成"
+        );
+
+        unblock_tx.send(()).expect("放行线程 A");
+        holder.join().expect("线程 A join");
+        blocked.join().expect("线程 B join");
+        assert!(
+            done.load(Ordering::SeqCst),
+            "线程 A 释放锁后,set_excluded 应该能继续完成"
+        );
     }
 }

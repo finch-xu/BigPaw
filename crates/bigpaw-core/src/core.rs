@@ -45,6 +45,13 @@ const ROSTER_POLL: Duration = Duration::from_millis(200);
 /// watch 机制,变化时需要显式覆写 `Core::ipmsg_bcast` 里的 `Vec`(见
 /// roster 线程实现);mdns 的排除清单由 `apply_settings` 显式路径管理,
 /// 这条定期刷新不碰它(daemon 自己每 5s 自查网卡 IP 变化,不需要我们管)。
+///
+/// 取值推导:30s = 6 × `ROSTER_TICK`(5s)。网卡枚举是本机系统调用,不像
+/// 对端 `PEER_TIMEOUT` 那样受局域网抖动约束,没有必须匹配的外部节奏
+/// ——选它的倍数只是为了刷新检查点能安全地挂在既有的 `ROSTER_TICK`/
+/// `ROSTER_POLL` 轮询骨架上("检查点每 `ROSTER_POLL` 命中一次,真正执行
+/// 只在到点时才做"的模式与过期扫描一致),而不是引入第二套独立定时器;
+/// 6 倍留出足够余量,保证刷新频率明显低于过期扫描,不会成为新的热点。
 const IFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 对端超过这个时长未被任何发现通道(mDNS `Seen` 或 UDP 宣告 `Seen`)刷新,
@@ -222,17 +229,19 @@ impl Core {
             .or_else(|| settings.nickname.clone())
             .unwrap_or_else(default_nickname);
 
+        // 网卡选择(Step 7 编排):registry 是 announce/mdns/ipmsg/transport
+        // 共用的活跃网卡快照唯一真源。建在读 settings 之后、transport 起动
+        // 之前(与其它组件一样以 registry 为准起步),subscribe() 句柄随后
+        // 分发给 transport/announce/ipmsg 各自的接线点。
+        let registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         // 留一份克隆给 IPMsg 兼容层的事件转发线程(见下):TextReceived/
         // FileOffered 复用与原生传输层相同的 TransportEvent 转发路径。
         let events_tx = msg_tx.clone();
         let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
-
-        // 网卡选择(Step 7 编排):registry 是 announce/mdns/ipmsg/transport
-        // 共用的活跃网卡快照唯一真源,建在 transport 起动之后、其余组件之前
-        // ——set_iface_rx 立即接线,后续每次拨号前都会按最新快照做同网段
-        // 亲和排序(Step 6 机制)。
-        let registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+        // set_iface_rx 在 transport 起动后立即接线——后续每次拨号前都会
+        // 按最新快照做同网段亲和排序(Step 6 机制)。
         transport.set_iface_rx(registry.subscribe());
 
         // IPMsg/飞秋兼容层(M5,设计文档 §6):独立 crate,启动失败(最常见
