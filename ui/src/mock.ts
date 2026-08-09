@@ -1,4 +1,4 @@
-import { useAppStore, type Conversation, type Peer, type TimelineItem } from "./store";
+import { useAppStore, type Conversation, type Group, type Peer, type TimelineItem } from "./store";
 
 /** Tauri 环境检测:桌面 app 里为 true;纯浏览器(vite dev 预览)为 false。 */
 export const IS_TAURI = "__TAURI_INTERNALS__" in window;
@@ -44,6 +44,28 @@ const conv4: TimelineItem[] = [
   { kind: "text", id: "m11", peerFp: fp4, direction: "out", body: "好的,马上来拿", tsMs: now - 18 * MIN },
 ];
 
+/** 群样例(M7c):群会话预览,入站气泡带发送者昵称。 */
+const gid1 = "mock-group-0001";
+const mockSelfFp = "0718f00d5566deadbeef00112233445566778899aabbccddeeff001122334455";
+const groups: Group[] = [
+  {
+    groupId: gid1,
+    name: "猫猫研发群",
+    creatorFp: mockSelfFp,
+    version: 2,
+    members: [
+      { fp: mockSelfFp, nick: "我的MacBook" },
+      { fp: fp1, nick: "工位小王" },
+      { fp: fp3, nick: "Aria" },
+    ],
+  },
+];
+const convG1: TimelineItem[] = [
+  { kind: "text", id: "gm1", peerFp: gid1, direction: "in", body: "这个群拉了 Aria 进来", tsMs: now - 30 * MIN, senderFp: fp1 },
+  { kind: "text", id: "gm2", peerFp: gid1, direction: "in", body: "大家好~", tsMs: now - 29 * MIN, senderFp: fp3 },
+  { kind: "text", id: "gm3", peerFp: gid1, direction: "out", body: "欢迎欢迎,今晚对齐一下进度", tsMs: now - 25 * MIN },
+];
+
 /** 纯浏览器预览:注入假数据,使 UI 无需 Tauri 后端即可完整渲染。 */
 export function installMocks(): void {
   useAppStore.setState({
@@ -57,13 +79,16 @@ export function installMocks(): void {
       [fp4]: conv(conv4),
       [fp5]: conv([]),
       [fp6]: conv([]),
+      [gid1]: conv(convG1),
     },
-    // 消息视图(M7b):有会话往来的两位 + 未读样例
+    // 消息视图(M7b):有会话往来的对象 + 未读样例
     convSummaries: {
       [fp1]: { tsMs: now - MIN, snippet: "素材包", kind: "file" },
       [fp4]: { tsMs: now - 18 * MIN, snippet: "好的,马上来拿", kind: "text" },
+      [gid1]: { tsMs: now - 25 * MIN, snippet: "欢迎欢迎,今晚对齐一下进度", kind: "text" },
     },
-    unread: { [fp1]: 3 },
+    unread: { [fp1]: 3, [gid1]: 1 },
+    groups,
   });
   // 截图调试用:允许在浏览器控制台操纵 store(仅 mock 模式暴露)
   (window as unknown as { __store?: typeof useAppStore }).__store = useAppStore;

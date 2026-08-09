@@ -21,10 +21,13 @@ export interface SelfInfo {
 export interface TextItem {
   kind: "text";
   id: string;
+  /** 会话 id:单聊=对端指纹,群聊(M7c)=groupId */
   peerFp: string;
   direction: "in" | "out";
   body: string;
   tsMs: number;
+  /** 群消息发送者指纹(M7c);单聊无 */
+  senderFp?: string | null;
 }
 
 export interface FileItem {
@@ -64,6 +67,19 @@ export interface ConvSummary {
   kind: "text" | "file";
 }
 
+/** 与后端 groups::Group 对应(M7c)。 */
+export interface GroupMember {
+  fp: string;
+  nick: string;
+}
+export interface Group {
+  groupId: string;
+  name: string;
+  creatorFp: string;
+  version: number;
+  members: GroupMember[];
+}
+
 export interface Settings {
   nickname: string | null;
   /** 我的分组(M7a),null = 未设置 */
@@ -98,6 +114,10 @@ interface AppState {
   convSummaries: Record<string, ConvSummary>;
   /** 未读计数(内存态,重启清零):仅非当前选中会话的入站消息/文件计数 */
   unread: Record<string, number>;
+  /** 已加入的群(M7c):启动拉取 + group://updated 全量替换 */
+  groups: Group[];
+  /** 建群面板开关(M7c) */
+  showCreateGroup: boolean;
   ipmsg: { available: boolean; enabled: boolean } | null;
   searchQuery: string;
   searchHits: SearchHit[];
@@ -112,6 +132,9 @@ interface AppState {
   setHighlightTs: (ts: number | null) => void;
 
   loadConversations: () => Promise<void>;
+  loadGroups: () => Promise<void>;
+  setGroups: (groups: Group[]) => void;
+  setShowCreateGroup: (v: boolean) => void;
   openConversation: (fp: string) => Promise<void>;
   loadOlder: (fp: string) => Promise<void>;
   appendText: (item: TextItem) => void;
@@ -130,6 +153,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   conversations: {},
   convSummaries: {},
   unread: {},
+  groups: [],
+  showCreateGroup: false,
   ipmsg: null,
   searchQuery: "",
   searchHits: [],
@@ -148,6 +173,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     for (const s of list) summaries[s.peerFp] = { tsMs: s.tsMs, snippet: s.snippet, kind: s.kind };
     set({ convSummaries: summaries });
   },
+
+  loadGroups: async () => {
+    set({ groups: await invoke<Group[]>("list_groups") });
+  },
+  setGroups: (groups) => set({ groups }),
+  setShowCreateGroup: (showCreateGroup) => set({ showCreateGroup }),
 
   openConversation: async (fp) => {
     set((s) => ({

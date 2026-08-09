@@ -23,6 +23,7 @@ function keyOf(it: TimelineItem): string {
 
 export default function ChatPane({ fp }: { fp: string }) {
   const peer = useAppStore((s) => s.peers.find((p) => p.fingerprint === fp));
+  const group = useAppStore((s) => s.groups.find((g) => g.groupId === fp));
   const conv = useAppStore((s) => s.conversations[fp]);
   const highlightTs = useAppStore((s) => s.highlightTs);
   const setHighlightTs = useAppStore((s) => s.setHighlightTs);
@@ -35,15 +36,25 @@ export default function ChatPane({ fp }: { fp: string }) {
   const stickBottom = useRef(true); // 用户是否停在底部附近(决定新消息是否自动滚)
   const items = conv?.items ?? [];
 
-  const offline = !peer || peer.state === "offline";
+  const isGroup = !!group;
+  // 群会话不依赖单个对端在线状态:发言逐成员尽力送达(spec 冻结)。
+  const offline = isGroup ? false : !peer || peer.state === "offline";
   const isIpmsg = peer?.protocol === "ipmsg";
-  const stateLabel = offline
-    ? "离线"
-    : peer.state === "unreachable"
-      ? "可见但无法连接"
-      : peer.state === "discovered"
-        ? "已发现"
-        : "在线";
+  const title = isGroup ? group.name : (peer?.nickname ?? fp.slice(0, 8));
+  const stateLabel = isGroup
+    ? `${group.members.length} 位成员`
+    : offline
+      ? "离线"
+      : peer!.state === "unreachable"
+        ? "可见但无法连接"
+        : peer!.state === "discovered"
+          ? "已发现"
+          : "在线";
+  /** 群消息气泡上的发送者昵称:优先群成员表(nick 随成员表同步),兜底 roster。 */
+  const senderNick = (senderFp: string): string =>
+    group?.members.find((m) => m.fp === senderFp)?.nick ??
+    useAppStore.getState().peers.find((p) => p.fingerprint === senderFp)?.nickname ??
+    senderFp.slice(0, 8);
 
   // 新消息自动滚动:仅当用户本就在底部附近;搜索跳转时滚到高亮条目
   useEffect(() => {
@@ -75,14 +86,28 @@ export default function ChatPane({ fp }: { fp: string }) {
     const body = draft.trim();
     if (!body || offline) return;
     try {
-      const sent = await invoke<{ id: string; tsMs: number }>("send_text", {
-        fingerprint: fp,
-        body,
-      });
+      const sent = isGroup
+        ? await invoke<{ id: string; tsMs: number }>("send_group_text", { groupId: fp, body })
+        : await invoke<{ id: string; tsMs: number }>("send_text", { fingerprint: fp, body });
       stickBottom.current = true; // 自己发的永远滚到底
       appendText({ kind: "text", id: sent.id, peerFp: fp, direction: "out", body, tsMs: sent.tsMs });
       setDraft("");
       setError("");
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleLeaveGroup() {
+    const ok = await confirm("退出该群?退出后将不再收到群消息(历史记录保留)。", {
+      title: "退出群聊",
+      kind: "warning",
+    });
+    if (!ok) return;
+    try {
+      await invoke("leave_group", { groupId: fp });
+      const st = useAppStore.getState();
+      st.setGroups(st.groups.filter((g) => g.groupId !== fp));
     } catch (e) {
       setError(String(e));
     }
@@ -127,11 +152,19 @@ export default function ChatPane({ fp }: { fp: string }) {
   return (
     <section className="flex min-w-0 flex-1 flex-col">
       <header className="flex items-center gap-2.5 border-b border-border bg-panel px-4 py-2.5">
-        <Avatar fp={fp} name={peer?.nickname ?? "?"} size={32} />
+        <Avatar fp={fp} name={title} size={32} />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium">{peer?.nickname ?? fp.slice(0, 8)}</div>
+          <div className="truncate text-sm font-medium">{title}</div>
           <div className="text-xs text-muted-foreground">{stateLabel}</div>
         </div>
+        {isGroup && (
+          <button
+            onClick={handleLeaveGroup}
+            className="shrink-0 text-xs text-muted-foreground hover:text-destructive"
+          >
+            退出群聊
+          </button>
+        )}
         <button
           onClick={handleClear}
           className="shrink-0 text-xs text-muted-foreground hover:text-destructive"
@@ -151,6 +184,10 @@ export default function ChatPane({ fp }: { fp: string }) {
         {items.map((it, i) => {
           const out = it.direction === "out";
           const showAvatar = !out && (i === 0 || items[i - 1].direction === "out");
+          // 群消息(M7c):气泡头像/名字用发送者身份,而不是会话本身
+          const itemSenderFp = it.kind === "text" ? (it.senderFp ?? null) : null;
+          const bubbleFp = isGroup && itemSenderFp ? itemSenderFp : fp;
+          const bubbleName = isGroup && itemSenderFp ? senderNick(itemSenderFp) : (peer?.nickname ?? "?");
           return (
             <li key={keyOf(it)}>
               {(i === 0 || !sameDay(items[i - 1].tsMs, it.tsMs)) && (
@@ -167,12 +204,17 @@ export default function ChatPane({ fp }: { fp: string }) {
                 }
               >
                 {!out &&
-                  (showAvatar ? (
-                    <Avatar fp={fp} name={peer?.nickname ?? "?"} size={28} />
+                  (showAvatar || (isGroup && itemSenderFp) ? (
+                    <Avatar fp={bubbleFp} name={bubbleName} size={28} />
                   ) : (
                     <div className="w-7 shrink-0" />
                   ))}
                 <div className={"max-w-[70%] " + (out ? "text-right" : "text-left")}>
+                  {isGroup && !out && itemSenderFp && (
+                    <div className="mb-0.5 text-[10px] text-muted-foreground">
+                      {senderNick(itemSenderFp)}
+                    </div>
+                  )}
                   {it.kind === "text" ? (
                     <span
                       className={
@@ -208,8 +250,8 @@ export default function ChatPane({ fp }: { fp: string }) {
         />
         <button
           onClick={handleSendFile}
-          disabled={offline}
-          title="发送文件"
+          disabled={offline || isGroup}
+          title={isGroup ? "群内暂不支持发文件(仍可私聊发送)" : "发送文件"}
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-border text-fg2 hover:bg-hover disabled:opacity-40"
         >
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>

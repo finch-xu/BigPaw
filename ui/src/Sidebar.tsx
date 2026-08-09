@@ -94,7 +94,15 @@ export default function Sidebar() {
         ) : tab === "chats" ? (
           <ConversationList />
         ) : (
-          <ContactTree />
+          <>
+            <button
+              onClick={() => useAppStore.getState().setShowCreateGroup(true)}
+              className="mx-2 mt-2 flex w-[calc(100%-1rem)] items-center justify-center gap-1.5 rounded-xl border border-dashed border-border py-2 text-xs text-fg2 hover:bg-hover"
+            >
+              <span className="text-sm leading-none">+</span> 创建群聊
+            </button>
+            <ContactTree />
+          </>
         )}
       </div>
       {ipmsg && ipmsg.enabled && !ipmsg.available && (
