@@ -35,6 +35,8 @@ pub struct KnownPeer {
     pub protocol: String,
     pub last_addr: Option<String>,
     pub last_seen_ms: i64,
+    /// 对端最后声明的工作组名(M7a,v2 迁移新增列)。
+    pub group: Option<String>,
 }
 
 /// 会话时间线里的一条记录:文本消息或文件传输。
@@ -76,7 +78,7 @@ pub struct Storage {
     conn: Mutex<Connection>,
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 impl Storage {
     pub fn open(data_dir: &Path) -> Result<Self, StorageError> {
@@ -270,18 +272,20 @@ impl Storage {
         nickname: &str,
         protocol: &str,
         last_addr: Option<&str>,
+        group: Option<&str>,
         last_seen_ms: i64,
     ) -> Result<(), StorageError> {
         let conn = self.conn.lock().expect("storage lock");
         conn.execute(
-            "INSERT INTO peers (fingerprint, nickname, protocol, last_addr, last_seen_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO peers (fingerprint, nickname, protocol, last_addr, group_name, last_seen_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(fingerprint) DO UPDATE SET
                nickname = excluded.nickname,
                protocol = excluded.protocol,
                last_addr = COALESCE(excluded.last_addr, peers.last_addr),
+               group_name = excluded.group_name,
                last_seen_ms = excluded.last_seen_ms",
-            params![fingerprint, nickname, protocol, last_addr, last_seen_ms],
+            params![fingerprint, nickname, protocol, last_addr, group, last_seen_ms],
         )?;
         Ok(())
     }
@@ -289,7 +293,7 @@ impl Storage {
     pub fn known_peers(&self) -> Result<Vec<KnownPeer>, StorageError> {
         let conn = self.conn.lock().expect("storage lock");
         let mut stmt = conn.prepare(
-            "SELECT fingerprint, nickname, protocol, last_addr, last_seen_ms
+            "SELECT fingerprint, nickname, protocol, last_addr, last_seen_ms, group_name
              FROM peers ORDER BY last_seen_ms DESC",
         )?;
         let peers = stmt
@@ -300,6 +304,7 @@ impl Storage {
                     protocol: row.get(2)?,
                     last_addr: row.get(3)?,
                     last_seen_ms: row.get(4)?,
+                    group: row.get(5)?,
                 })
             })?
             .collect::<Result<_, _>>()?;
@@ -368,8 +373,13 @@ fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
                last_seen_ms INTEGER NOT NULL
              );",
         )?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
+    // v2(M7a):peers 表新增 group_name 列(对端声明的工作组名)。
+    // v1→v2 老库与"上面刚建完 v1 表结构的全新库"都走这条 ALTER。
+    if version < 2 {
+        conn.execute_batch("ALTER TABLE peers ADD COLUMN group_name TEXT;")?;
+    }
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -568,18 +578,70 @@ mod tests {
     #[test]
     fn upsert_peer_and_known_peers() {
         let s = mem();
-        s.upsert_peer("fpA", "alice", "native", Some("192.168.1.5"), 1000).unwrap();
-        s.upsert_peer("fpA", "alice-renamed", "native", Some("192.168.1.6"), 2000)
+        s.upsert_peer("fpA", "alice", "native", Some("192.168.1.5"), None, 1000).unwrap();
+        s.upsert_peer("fpA", "alice-renamed", "native", Some("192.168.1.6"), None, 2000)
             .unwrap();
         // COALESCE 回归:last_addr 传 None 不得抹掉旧地址,其余字段照常更新
-        s.upsert_peer("fpA", "alice-renamed", "native", None, 3000).unwrap();
-        s.upsert_peer("ipmsg:k", "bob-feiq", "ipmsg", None, 1500).unwrap();
+        s.upsert_peer("fpA", "alice-renamed", "native", None, None, 3000).unwrap();
+        s.upsert_peer("ipmsg:k", "bob-feiq", "ipmsg", None, None, 1500).unwrap();
         let peers = s.known_peers().unwrap();
         assert_eq!(peers.len(), 2, "同 fingerprint 覆盖不重复");
         let a = peers.iter().find(|p| p.fingerprint == "fpA").unwrap();
         assert_eq!(a.nickname, "alice-renamed");
         assert_eq!(a.last_addr.as_deref(), Some("192.168.1.6"));
         assert_eq!(a.last_seen_ms, 3000);
+    }
+
+    /// M7a:peers 表 v2 迁移新增 group_name 列,组名随 upsert 持久化,
+    /// 重开库(v2 已就位再次 migrate)不报错。
+    #[test]
+    fn peers_table_persists_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path()).unwrap();
+        s.upsert_peer("fpA", "alice", "native", Some("192.168.1.5"), Some("研发部"), 1000)
+            .unwrap();
+        s.upsert_peer("fpB", "bob", "ipmsg", None, None, 2000).unwrap();
+        let peers = s.known_peers().unwrap();
+        let a = peers.iter().find(|p| p.fingerprint == "fpA").unwrap();
+        assert_eq!(a.group, Some("研发部".to_string()));
+        let b = peers.iter().find(|p| p.fingerprint == "fpB").unwrap();
+        assert_eq!(b.group, None);
+        drop(s);
+        let s2 = Storage::open(dir.path()).unwrap();
+        assert_eq!(s2.known_peers().unwrap().len(), 2, "v2 库重开不报错");
+    }
+
+    /// v1 老库(无 group_name 列)打开时必须原地迁移成功且旧数据可读。
+    #[test]
+    fn migrates_v1_db_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        // 手工造一个 v1 库:建 v1 表结构 + user_version=1 + 一行旧数据
+        {
+            let conn = Connection::open(dir.path().join("bigpaw.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                   fingerprint  TEXT PRIMARY KEY,
+                   nickname     TEXT NOT NULL,
+                   protocol     TEXT NOT NULL,
+                   last_addr    TEXT,
+                   last_seen_ms INTEGER NOT NULL
+                 );
+                 INSERT INTO peers VALUES ('fpOld', 'old-nick', 'native', NULL, 42);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let s = Storage::open(dir.path()).unwrap();
+        let peers = s.known_peers().unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].group, None, "老数据组名为 NULL → None");
+        // 迁移后可正常写入组名
+        s.upsert_peer("fpOld", "old-nick", "native", None, Some("市场部"), 100)
+            .unwrap();
+        assert_eq!(
+            s.known_peers().unwrap()[0].group,
+            Some("市场部".to_string())
+        );
     }
 
     #[test]

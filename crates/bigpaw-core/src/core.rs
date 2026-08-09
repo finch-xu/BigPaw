@@ -499,6 +499,7 @@ impl Core {
                                 nickname,
                                 proto,
                                 addr.as_deref(),
+                                None, // 组名随 Seen 事件接入(见 roster Seen.group 接线)
                                 crate::transport::proto::now_ms() as i64,
                             ) {
                                 eprintln!("storage: peer 回写失败: {e}");
@@ -1770,6 +1771,7 @@ mod tests {
             host: "HOST-B".to_string(),
             addr: "192.168.1.9:2425".parse().unwrap(),
             is_bigpaw,
+            group: None,
         }
     }
 
@@ -2134,7 +2136,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let s = Storage::open(dir.path()).unwrap();
-            s.upsert_peer("fpZ", "zoe", "native", Some("192.168.1.7"), 123)
+            s.upsert_peer("fpZ", "zoe", "native", Some("192.168.1.7"), None, 123)
                 .unwrap();
         }
         let core = Core::start(CoreConfig {
