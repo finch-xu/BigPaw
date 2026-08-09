@@ -36,6 +36,7 @@ fn two_instances_announce_and_discover() {
     let _a = AnnounceService::start(
         &ida,
         "alice",
+        None,
         24917,
         port,
         txa,
@@ -45,6 +46,7 @@ fn two_instances_announce_and_discover() {
     let _b = AnnounceService::start(
         &idb,
         "bob",
+        None,
         24918,
         port,
         txb,
@@ -68,6 +70,7 @@ fn poke_wakes_peer_via_unicast_announcement() {
     let a = AnnounceService::start(
         &ida,
         "alice",
+        None,
         24917,
         DEFAULT_ANNOUNCE_PORT,
         txa,
@@ -77,6 +80,7 @@ fn poke_wakes_peer_via_unicast_announcement() {
     let _b = AnnounceService::start(
         &idb,
         "bob",
+        None,
         24918,
         DEFAULT_ANNOUNCE_PORT,
         txb,

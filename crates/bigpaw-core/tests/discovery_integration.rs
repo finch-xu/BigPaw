@@ -43,8 +43,8 @@ fn two_instances_discover_and_lose_each_other() {
     let (tx_a, rx_a) = std::sync::mpsc::channel();
     let (tx_b, rx_b) = std::sync::mpsc::channel();
 
-    let _disc_a = Discovery::start(&id_a, "alice", 0, tx_a).unwrap();
-    let disc_b = Discovery::start(&id_b, "bob", 0, tx_b).unwrap();
+    let _disc_a = Discovery::start(&id_a, "alice", None, 0, tx_a).unwrap();
+    let disc_b = Discovery::start(&id_b, "bob", None, 0, tx_b).unwrap();
 
     assert!(
         wait_seen(&rx_a, &id_b.fingerprint, 15),
@@ -77,8 +77,8 @@ fn apply_exclusions_re_register_keeps_peers_discoverable() {
     let (tx_a, rx_a) = std::sync::mpsc::channel();
     let (tx_b, rx_b) = std::sync::mpsc::channel();
 
-    let mut disc_a = Discovery::start(&id_a, "alice", 0, tx_a).unwrap();
-    let _disc_b = Discovery::start(&id_b, "bob", 0, tx_b).unwrap();
+    let mut disc_a = Discovery::start(&id_a, "alice", None, 0, tx_a).unwrap();
+    let _disc_b = Discovery::start(&id_b, "bob", None, 0, tx_b).unwrap();
 
     assert!(wait_seen(&rx_b, &id_a.fingerprint, 15), "B 应先发现 A");
 
