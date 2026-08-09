@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # 所有构建的前置闸门。版本号在根 Cargo.toml（workspace.package）和
+  # src-tauri/tauri.conf.json 里各存一份，二进制的真实版本取自 tauri.conf.json。
+  # tag 和它们不一致会发出一份"文件名声称 0.2.0、装上去还是 0.1.0"的 release，
+  # 所以在这里拦死。
+  verify-version:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compare the tag against every declared version
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${GITHUB_REF_NAME#v}"
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          # 根 Cargo.toml 的 [workspace.package] version 是全 workspace 唯一的版本源。
+          cargo=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          echo "tag=$want  tauri.conf.json=$conf  Cargo.toml=$cargo"
+
+          fail=0
+          [ "$conf"  = "$want" ] || { echo "::error::tauri.conf.json 是 $conf，tag 是 $want"; fail=1; }
+          [ "$cargo" = "$want" ] || { echo "::error::Cargo.toml 是 $cargo，tag 是 $want"; fail=1; }
+          if [ "$fail" -eq 1 ]; then
+            echo "::error::改完两处版本号并提交后，重新打 tag。"
+            exit 1
+          fi
+          echo "版本号两处一致: $want"
+
+  build-windows-x64:
+    name: Build Windows x64
+    needs: [verify-version]
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Setup Rust (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # workspace 根在仓库根目录，产物落在 ./target 而不是 src-tauri/target。
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64
+
+      - name: Install frontend deps
+        run: npm --prefix ui ci
+
+      - name: Build
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # 只打 nsis: WiX 不支持 arm64，x64 也一并对齐，两个架构产物统一为
+          # NSIS 的 *-setup.exe。
+          args: --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: pwsh
+        run: |
+          $bundleDir = "target/x86_64-pc-windows-msvc/release/bundle"
+          if (Test-Path $bundleDir) {
+            Get-ChildItem -Path $bundleDir -Recurse -File | Select-Object -ExpandProperty FullName | Sort-Object
+          } else {
+            Write-Host "Bundle dir does not exist: $bundleDir"
+          }
+
+      # 改成"应用名_平台-架构"的固定命名，下载链接可长期固定。
+      - name: Rename artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:RELEASE_TAG.TrimStart('v')
+          Get-ChildItem -Path 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' | ForEach-Object {
+            $newName = "BigPaw_${ver}_windows-x64-setup.exe"
+            Write-Host "Renaming $($_.Name) -> $newName"
+            Rename-Item -LiteralPath $_.FullName -NewName $newName
+          }
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  build-windows-arm64:
+    name: Build Windows arm64
+    needs: [verify-version]
+    # 原生 arm64 runner（公开仓库免费），避免从 x64 交叉编译的 C/汇编坑。
+    runs-on: windows-11-arm
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Setup Rust (aarch64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-arm64
+
+      - name: Install frontend deps
+        run: npm --prefix ui ci
+
+      - name: Build
+        uses: tauri-apps/tauri-action@v0
+        with:
+          # 只打 nsis: WiX 不支持 arm64，走 tauri.conf.json 的 targets:"all"
+          # 会触发 MSI 构建失败并拖垮整个 job。
+          args: --target aarch64-pc-windows-msvc --bundles nsis
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: pwsh
+        run: |
+          $bundleDir = "target/aarch64-pc-windows-msvc/release/bundle"
+          if (Test-Path $bundleDir) {
+            Get-ChildItem -Path $bundleDir -Recurse -File | Select-Object -ExpandProperty FullName | Sort-Object
+          } else {
+            Write-Host "Bundle dir does not exist: $bundleDir"
+          }
+
+      - name: Rename artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:RELEASE_TAG.TrimStart('v')
+          Get-ChildItem -Path 'target/aarch64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' | ForEach-Object {
+            $newName = "BigPaw_${ver}_windows-arm64-setup.exe"
+            Write-Host "Renaming $($_.Name) -> $newName"
+            Rename-Item -LiteralPath $_.FullName -NewName $newName
+          }
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  # 草稿翻正式是最后一步: 两个构建都传完之前 release 一直是草稿，
+  # 外部看不到半成品。
+  publish:
+    name: Publish release
+    needs: [build-windows-x64, build-windows-arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flip draft to published
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const release = releases.find(r => r.tag_name === tag);
+            if (!release) {
+              throw new Error(`Release for tag ${tag} not found`);
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              draft: false,
+            });
+            core.info(`Published release ${tag} (id=${release.id})`);
