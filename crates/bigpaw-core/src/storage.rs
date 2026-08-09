@@ -25,6 +25,18 @@ pub struct SearchHit {
     pub kind: String,
 }
 
+/// 会话摘要一行(M7b 消息视图):该 peer 的最后一条消息/文件。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvSummary {
+    pub peer_fp: String,
+    pub ts_ms: i64,
+    /// 文本正文或文件名(原文,截断交给前端 CSS)
+    pub snippet: String,
+    /// "text" | "file"
+    pub kind: String,
+}
+
 /// peers 表一行:启动时预热 roster(Offline 态)用。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -288,6 +300,37 @@ impl Storage {
             params![fingerprint, nickname, protocol, last_addr, group, last_seen_ms],
         )?;
         Ok(())
+    }
+
+    /// 每个会话(peer_fp)的最后一条记录,按时间倒序(M7b 消息视图数据源)。
+    /// 双键 `(ts_ms, k1)` 取最大,口径与 `history` 的游标一致——同毫秒多条时
+    /// 结果确定,不依赖插入顺序。
+    pub fn conversation_summaries(&self) -> Result<Vec<ConvSummary>, StorageError> {
+        let conn = self.conn.lock().expect("storage lock");
+        let mut stmt = conn.prepare(
+            "SELECT peer_fp, ts_ms, k2, kind FROM (
+               SELECT peer_fp, ts_ms, k1, k2, kind,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY peer_fp ORDER BY ts_ms DESC, k1 DESC
+                      ) AS rn
+               FROM (
+                 SELECT peer_fp, ts_ms, id AS k1, body AS k2, 'text' AS kind FROM messages
+                 UNION ALL
+                 SELECT peer_fp, ts_ms, xfer_id AS k1, name AS k2, 'file' AS kind FROM transfers
+               )
+             ) WHERE rn = 1 ORDER BY ts_ms DESC",
+        )?;
+        let sums = stmt
+            .query_map([], |row| {
+                Ok(ConvSummary {
+                    peer_fp: row.get(0)?,
+                    ts_ms: row.get(1)?,
+                    snippet: row.get(2)?,
+                    kind: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(sums)
     }
 
     pub fn known_peers(&self) -> Result<Vec<KnownPeer>, StorageError> {
@@ -590,6 +633,31 @@ mod tests {
         assert_eq!(a.nickname, "alice-renamed");
         assert_eq!(a.last_addr.as_deref(), Some("192.168.1.6"));
         assert_eq!(a.last_seen_ms, 3000);
+    }
+
+    /// M7b:会话摘要 = 每个 peer_fp 的最后一条(文本或文件),按 ts 倒序。
+    #[test]
+    fn conversation_summaries_returns_last_item_per_peer() {
+        let s = mem();
+        s.insert_message("m1", "peerA", "in", "第一条", 100).unwrap();
+        s.insert_message("m2", "peerA", "out", "A 的最后一条", 300).unwrap();
+        s.insert_transfer("x1", "peerB", "in", "报告.pdf", 10, false, "done", 500)
+            .unwrap();
+        s.insert_message("m3", "peerB", "in", "早于文件", 400).unwrap();
+        let sums = s.conversation_summaries().unwrap();
+        assert_eq!(sums.len(), 2);
+        assert_eq!(sums[0].peer_fp, "peerB", "最近活跃的会话排前");
+        assert_eq!(sums[0].snippet, "报告.pdf");
+        assert_eq!(sums[0].kind, "file");
+        assert_eq!(sums[0].ts_ms, 500);
+        assert_eq!(sums[1].peer_fp, "peerA");
+        assert_eq!(sums[1].snippet, "A 的最后一条");
+        assert_eq!(sums[1].kind, "text");
+    }
+
+    #[test]
+    fn conversation_summaries_empty_db_is_empty() {
+        assert!(mem().conversation_summaries().unwrap().is_empty());
     }
 
     /// M7a:peers 表 v2 迁移新增 group_name 列,组名随 upsert 持久化,

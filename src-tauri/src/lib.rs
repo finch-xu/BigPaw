@@ -193,6 +193,17 @@ fn get_history_around(
         .map_err(|e| e.to_string())
 }
 
+/// 消息视图数据源(M7b):每会话最后一条记录,按时间倒序。
+#[tauri::command]
+fn list_conversations(
+    core: State<'_, AppCore>,
+) -> Result<Vec<bigpaw_core::storage::ConvSummary>, String> {
+    core.0
+        .storage()
+        .conversation_summaries()
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn search_history(
     core: State<'_, AppCore>,
@@ -431,6 +442,7 @@ pub fn run() {
             ipmsg_status,
             get_history,
             get_history_around,
+            list_conversations,
             search_history,
             clear_history,
             get_settings,
