@@ -193,7 +193,12 @@ impl Core {
         // 不需要额外同步。
         let (tx, rx) = std::sync::mpsc::channel();
         // 真实端口进 SRV
-        let discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        let mut discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
+        // 网卡排除清单初始提交(Step 5):prev=[] 表示"还没提交过任何清单",
+        // 清单非空时才会真正 disable + unregister/re-register;为空时是
+        // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)是
+        // Step 7 的事,这里只做启动时这一次。
+        discovery.apply_exclusions(&settings.excluded_interfaces, &[])?;
         // 网卡选择(Step 3 最小接线):这里只建 registry 并把订阅句柄传给
         // announce——完整的"热生效"(排除清单变更后 mdns/ipmsg/transport 联动
         // 刷新)是 Step 7 的事,这里不做 tick 刷新,也不对外暴露这个实例。
