@@ -6,13 +6,13 @@ use crate::discovery::announce::{
 };
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
-use crate::net_ifaces::InterfaceRegistry;
+use crate::net_ifaces::{self, IfaceEntry, IfaceView, InterfaceRegistry};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::storage::Storage;
 use crate::transport::manager::{
     MessageEvent, SentText, TransportError, TransportEvent, TransportManager, DEFAULT_PORT,
 };
-use bigpaw_ipmsg::discovery::{IpmsgError, IpmsgEvent, IpmsgService};
+use bigpaw_ipmsg::discovery::{BroadcastTargets, IpmsgError, IpmsgEvent, IpmsgService};
 use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -38,6 +38,15 @@ const ROSTER_TICK: Duration = Duration::from_secs(5);
 /// 延迟。与其余组件的中断步长同量级(announce/ipmsg 的 SLEEP_STEP=200ms)。
 const ROSTER_POLL: Duration = Duration::from_millis(200);
 
+/// 网卡快照的主动刷新节奏(设计文档:网卡选择,Step 7 热生效)。排除清单
+/// 之外的系统级变化(拔插网线、切 Wi-Fi、VPN 连接/断开)不会主动通知我们
+/// ——`InterfaceRegistry::refresh()` 靠 roster 线程按这个节奏定期轮询兜底
+/// 感知。announce/transport 走 `watch` 订阅自动收到新快照;ipmsg 没有
+/// watch 机制,变化时需要显式覆写 `Core::ipmsg_bcast` 里的 `Vec`(见
+/// roster 线程实现);mdns 的排除清单由 `apply_settings` 显式路径管理,
+/// 这条定期刷新不碰它(daemon 自己每 5s 自查网卡 IP 变化,不需要我们管)。
+const IFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 对端超过这个时长未被任何发现通道(mDNS `Seen` 或 UDP 宣告 `Seen`)刷新,
 /// 判定离线——mDNS/UDP 宣告周期通常 20-30s,60s ≈ 2-3 个漏掉的心跳周期,
 /// 兼顾及时性与抖动容错(设计文档 §4 "心跳超时判离线")。这个阈值补的是
@@ -57,6 +66,55 @@ fn stale_fingerprints(
         .filter(|(_, t)| now.duration_since(**t) > timeout)
         .map(|(fp, _)| fp.clone())
         .collect()
+}
+
+/// 探测成功后决定写入历史 IP 表的地址子集(设计文档:网卡选择,Step 7)。
+/// `iface_entries` 非空时只记与本机某张网卡同网段的地址——跨网段地址多半
+/// 是抖动/多网卡多路径解析出来的噪声,记它对"下次启动时单播唤醒"没有
+/// 意义。`iface_entries` 为空(排除清单把所有网卡都排掉,或调用方还没
+/// 来得及准备快照)时保持"全记"的旧行为,不做任何过滤——这是刻意的零
+/// 语义漂移(3 处既有单测传 `vec![]` 无需改动预期)。抽成纯函数是为了不
+/// 必起真实探测线程就能确定性单测这条过滤规则(镜像 `stale_fingerprints`
+/// 的做法)。
+fn addrs_to_record(addrs: &[IpAddr], iface_entries: &[IfaceEntry]) -> Vec<IpAddr> {
+    if iface_entries.is_empty() {
+        addrs.to_vec()
+    } else {
+        addrs
+            .iter()
+            .copied()
+            .filter(|ip| net_ifaces::same_subnet(*ip, iface_entries))
+            .collect()
+    }
+}
+
+/// `Core::apply_settings` 的核心决策 + 副作用编排(设计文档:网卡选择,
+/// Step 7)。抽成自由函数、把"清单变了怎么通知 mdns"外置成回调,是为了让
+/// 行为测试不必起一个真实的 `Discovery`/mdns daemon 就能用合成的排除清单
+/// (包括一个测试机上必然不存在的网卡名)确定性验证下面两条关键分离逻辑:
+///
+/// - ipmsg 定向广播目标表只在**快照**真的变化时才覆写(`registry.set_excluded`
+///   已经用 `send_if_modified` 语义保证这一点,这里只是消费它的返回值);
+/// - mdns 排除清单则要比较**清单本身**(`old_list != excluded`),而不是看
+///   快照变没变——排除一个当前系统里根本不存在的网卡名时,快照不会变
+///   (没有任何条目因此被滤掉),但 daemon 必须记住这个名字,不然它日后
+///   插上来还是会被广播出去。
+fn apply_excluded_interfaces(
+    registry: &InterfaceRegistry,
+    ipmsg_bcast: &BroadcastTargets,
+    excluded: &[String],
+    mut on_list_changed: impl FnMut(&[String], &[String]),
+) {
+    let (old_list, new_snapshot) = registry.set_excluded(excluded.to_vec());
+
+    if let Some(snapshot) = &new_snapshot {
+        *ipmsg_bcast.lock().expect("ipmsg bcast lock") =
+            net_ifaces::broadcast_targets(&snapshot.entries);
+    }
+
+    if old_list != excluded {
+        on_list_changed(excluded, &old_list);
+    }
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +154,13 @@ pub struct Core {
     /// 按值传给 `AnnounceService::shutdown`,与 `discovery` 字段同样的幂等模式。
     announce: Arc<Mutex<Option<AnnounceService>>>,
     transport: Arc<TransportManager>,
+    /// 活跃网卡快照的唯一真源(Step 7 编排):announce/transport 在
+    /// `Core::start` 里各自 `subscribe()` 了一份 watch 句柄,自动感知后续
+    /// 变化;mdns 没有 watch 机制,排除清单的变更走 `apply_settings` 里的
+    /// 显式 `discovery.apply_exclusions` 调用。roster 线程按
+    /// `IFACE_REFRESH_INTERVAL` 定期 `refresh()`,兜底感知排除清单之外的
+    /// 系统级网卡变化(拔插网线等)。
+    registry: Arc<InterfaceRegistry>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<TransportEvent>>>,
     /// `events_rx` 那条 `TransportEvent` 通道的发送端克隆:`respond_file_ipmsg`
     /// 起的后台下载线程要在完成/失败时上报 `FileDone`/`FileFailed`,复用与
@@ -117,6 +182,12 @@ pub struct Core {
     /// 启动时 IPMsg 兼容层是否成功启用,供壳层 `ipmsg_status()` 命令查询,
     /// 让前端能提示"IPMsg 兼容层未启用(2425 被占用)"。启动后固定不变。
     ipmsg_available: bool,
+    /// ipmsg 兼容层的定向广播目标表(`Arc<Mutex<Vec<Ipv4Addr>>>`,Step 7)。
+    /// `IpmsgService`(若启用)内部克隆了同一份 `Arc`,这里保留的克隆用于
+    /// 热更新:排除清单变化后原地覆写内部 `Vec`,`IpmsgService` 下次
+    /// BR_ENTRY/BR_EXIT 发送时自动感知新目标表,不需要重启服务。兼容层
+    /// 未启用时这份表仍然存在、仍然会被覆写,只是没有人读它,无害。
+    ipmsg_bcast: BroadcastTargets,
     /// 对端(ipmsg 协议)通过 `SENDMSG|FILEATTACHOPT` 报价的文件:
     /// 本地生成的 `xfer_id -> (packet_no, file_id, 文件名, 大小)` 登记表,
     /// 供 `respond_file` 决定接受时反查、发起 `IpmsgService::request_file`。
@@ -157,23 +228,34 @@ impl Core {
         let events_tx = msg_tx.clone();
         let transport = TransportManager::start(identity.clone(), DEFAULT_PORT, msg_tx)?;
 
+        // 网卡选择(Step 7 编排):registry 是 announce/mdns/ipmsg/transport
+        // 共用的活跃网卡快照唯一真源,建在 transport 起动之后、其余组件之前
+        // ——set_iface_rx 立即接线,后续每次拨号前都会按最新快照做同网段
+        // 亲和排序(Step 6 机制)。
+        let registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+        transport.set_iface_rx(registry.subscribe());
+
         // IPMsg/飞秋兼容层(M5,设计文档 §6):独立 crate,启动失败(最常见
         // 是 2425 已被占用,比如本机在跑飞秋)绝不能让 Core::start 整体失败
         // ——原生栈已经就绪,只是"旧协议兼容"这一层降级为不可用,记一个
         // 标志供 `ipmsg_available()`/壳层 `ipmsg_status()` 命令查询。
         let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
         let ipmsg_host = hostname_no_local();
+        // 定向广播目标表(Step 7):由 registry 当前快照算出,排除清单已经
+        // 生效。这份 `Arc` 克隆保留在 `Core::ipmsg_bcast` 上,供
+        // `apply_settings`/roster 线程的定期刷新原地覆写内部 `Vec`——
+        // `IpmsgService` 自己另持一份克隆,下次 BR_ENTRY/BR_EXIT 发送时
+        // 自动感知,不需要重启服务。
+        let ipmsg_bcast: BroadcastTargets = Arc::new(Mutex::new(net_ifaces::broadcast_targets(
+            &registry.snapshot().entries,
+        )));
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
-            // 最小传参:临时用 default_broadcast_targets()(=255.255.255.255,保持
-            // 改造前的全网段广播行为)。真正接入 net_ifaces 快照(排除清单生效)
-            // 是 Step 7 的事,这里先只保证编译通过与既有行为不变。
-            let ipmsg_targets = bigpaw_ipmsg::discovery::default_broadcast_targets();
             match IpmsgService::start(
                 &nickname,
                 &ipmsg_host,
                 IPMSG_PORT,
                 ipmsg_evt_tx,
-                ipmsg_targets,
+                ipmsg_bcast.clone(),
             ) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
@@ -196,13 +278,9 @@ impl Core {
         let mut discovery = Discovery::start(&identity, &nickname, transport.port(), tx.clone())?;
         // 网卡排除清单初始提交(Step 5):prev=[] 表示"还没提交过任何清单",
         // 清单非空时才会真正 disable + unregister/re-register;为空时是
-        // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)是
-        // Step 7 的事,这里只做启动时这一次。
+        // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)走
+        // `apply_settings`,这里只做启动时这一次。
         discovery.apply_exclusions(&settings.excluded_interfaces, &[])?;
-        // 网卡选择(Step 3 最小接线):这里只建 registry 并把订阅句柄传给
-        // announce——完整的"热生效"(排除清单变更后 mdns/ipmsg/transport 联动
-        // 刷新)是 Step 7 的事,这里不做 tick 刷新,也不对外暴露这个实例。
-        let iface_registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
 
         // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
         // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
@@ -212,7 +290,7 @@ impl Core {
             transport.port(),
             DEFAULT_ANNOUNCE_PORT,
             tx.clone(),
-            iface_registry.subscribe(),
+            registry.subscribe(),
         )?;
         let announce = Arc::new(Mutex::new(Some(announce_service)));
 
@@ -284,6 +362,8 @@ impl Core {
         let roster_stop = Arc::new(AtomicBool::new(false));
         let roster_stop_for_thread = roster_stop.clone();
         let storage_for_roster = storage.clone();
+        let registry_for_thread = registry.clone();
+        let ipmsg_bcast_for_thread = ipmsg_bcast.clone();
         let roster_thread = std::thread::spawn(move || {
             let transport = transport_for_thread;
             // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
@@ -292,6 +372,12 @@ impl Core {
             // 过期扫描按 ROSTER_TICK 节奏;recv 轮询按 ROSTER_POLL 粒度。
             // 两者解耦:停止信号 200ms 内可见,扫描频率不因此提高 25 倍。
             let mut last_scan = Instant::now();
+            // 网卡快照的主动刷新节奏(IFACE_REFRESH_INTERVAL=30s,Step 7)。
+            // `Instant` 比较零成本,检查点放在 Timeout 分支和 Ok(ev) 分支
+            // 尾部各一份——只放 Timeout 分支的话,持续有事件流入(mDNS/UDP
+            // 宣告频繁)时 recv_timeout 会一直命中 Ok(ev) 而不是 Timeout,
+            // 30s 刷新会被无限期饿死。
+            let mut last_iface_refresh = Instant::now();
             loop {
                 match rx.recv_timeout(ROSTER_POLL) {
                     Ok(ev) => {
@@ -352,7 +438,14 @@ impl Core {
                         if let Some((fp, addrs, port)) = probe_target {
                             if !already_reachable {
                                 spawn_probe(
-                                    &transport, &tx, &in_flight, &history, &data_dir, fp, addrs,
+                                    &transport,
+                                    &tx,
+                                    &in_flight,
+                                    &history,
+                                    &data_dir,
+                                    registry_for_thread.snapshot().entries,
+                                    fp,
+                                    addrs,
                                     port,
                                 );
                             }
@@ -366,10 +459,30 @@ impl Core {
                         if roster_stop_for_thread.load(Ordering::Relaxed) {
                             break;
                         }
+
+                        // 网卡快照刷新检查(见 last_iface_refresh 声明处注释):
+                        // 持续有事件流入时也不能让 30s 刷新被无限期饿死。
+                        if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
+                            last_iface_refresh = Instant::now();
+                            if let Some(snapshot) = registry_for_thread.refresh() {
+                                *ipmsg_bcast_for_thread.lock().expect("ipmsg bcast lock") =
+                                    net_ifaces::broadcast_targets(&snapshot.entries);
+                            }
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         if roster_stop_for_thread.load(Ordering::Relaxed) {
                             break;
+                        }
+                        // 网卡快照刷新检查(与 Ok(ev) 分支尾部同一份逻辑):
+                        // 放在 last_scan 的 `continue` 之前,避免"未到扫描
+                        // 节奏就 continue"顺带把这个检查点也跳过。
+                        if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
+                            last_iface_refresh = Instant::now();
+                            if let Some(snapshot) = registry_for_thread.refresh() {
+                                *ipmsg_bcast_for_thread.lock().expect("ipmsg bcast lock") =
+                                    net_ifaces::broadcast_targets(&snapshot.entries);
+                            }
                         }
                         // 未到扫描节奏就继续轮询:这个分支现在每 ROSTER_POLL
                         // (200ms)就会命中一次,扫描本身仍按 ROSTER_TICK 执行。
@@ -428,12 +541,14 @@ impl Core {
             discovery: std::sync::Mutex::new(Some(discovery)),
             announce,
             transport,
+            registry,
             events_rx: Mutex::new(Some(pump_rx)),
             events_tx,
             roster_stop,
             roster_thread: Mutex::new(Some(roster_thread)),
             ipmsg: Mutex::new(ipmsg_service),
             ipmsg_available,
+            ipmsg_bcast,
             ipmsg_offers,
             storage,
         })
@@ -656,6 +771,40 @@ impl Core {
         self.ipmsg_available
     }
 
+    /// 网卡排除清单热生效入口(设计文档:网卡选择,Step 7)。壳层设置页保存
+    /// 新的 `Settings`(已经 `settings::save` 落盘)后调用它,让运行中的
+    /// announce/transport/ipmsg/mdns 全部感知新的排除清单,不需要重启 app。
+    ///
+    /// 实际决策逻辑在自由函数 `apply_excluded_interfaces` 里(TDD 友好:
+    /// 测试可以注入一个 spy 闭包代替真实 `discovery.apply_exclusions`,
+    /// 不需要起真实 mDNS daemon)。这里只负责提供"清单变了该怎么通知 mdns"
+    /// 这一步真实的副作用实现:持 `discovery` 锁调用 `apply_exclusions`
+    /// 是安全的——Step 5 已经把它做成非阻塞的投递式调用(内部先做纯函数
+    /// diff,只在结果非空时才触碰 daemon,且 `disable_interface`/
+    /// `enable_interface`/`re_register` 都是非阻塞 API),不会让这把锁跨越
+    /// 真正的网络 IO;若此刻 `discovery` 已经是 `None`(`shutdown` 之后),
+    /// 静默跳过。
+    pub fn apply_settings(&self, s: &crate::settings::Settings) {
+        apply_excluded_interfaces(
+            &self.registry,
+            &self.ipmsg_bcast,
+            &s.excluded_interfaces,
+            |new, old| {
+                let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
+                if let Some(d) = discovery.as_mut() {
+                    if let Err(e) = d.apply_exclusions(new, old) {
+                        eprintln!("mdns: 排除清单热生效失败: {e}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// 列出全部网卡(不滤排除项),标注 excluded 状态,供壳层设置页展示。
+    pub fn list_interfaces(&self) -> Vec<IfaceView> {
+        self.registry.list_all()
+    }
+
     /// 主动下线:注销 mDNS(发 goodbye)+ 停止 UDP 宣告收发,对端立刻收到
     /// Lost 而不是等 TTL 过期;随后停掉 roster 消费线程并 join 它,确保
     /// `shutdown` 返回时线程已经真正退出(不是"发个信号就当作已停")。
@@ -755,6 +904,10 @@ fn persist_event(storage: &Storage, ev: &TransportEvent) {
 /// 内部的阻塞网络 IO——这把锁如果跨了阻塞拨号,会让同一 fp 的所有后续
 /// Seen 事件在等这次探测期间被迫串行阻塞在锁上,而 `in_flight` 集合本身
 /// 已经足够防止探测风暴,不需要用锁再多做这件事。
+///
+/// `iface_entries`(Step 7):探测成功后决定记入历史 IP 表的地址子集,
+/// 实际过滤逻辑在纯函数 `addrs_to_record` 里——非空时只记同网段地址,
+/// 为空时保持全记(零语义漂移,见该函数注释)。
 #[allow(clippy::too_many_arguments)]
 fn spawn_probe(
     transport: &Arc<TransportManager>,
@@ -762,6 +915,7 @@ fn spawn_probe(
     in_flight: &Arc<Mutex<HashSet<String>>>,
     history: &Arc<Mutex<HistoryStore>>,
     data_dir: &Path,
+    iface_entries: Vec<IfaceEntry>,
     fingerprint: String,
     addrs: Vec<IpAddr>,
     port: u16,
@@ -782,10 +936,11 @@ fn spawn_probe(
         let ok = transport.probe_reachable(&fingerprint, &addrs, port);
         let result_ev = if ok {
             // 回连成功:这几个地址里至少一个确实可达,记入历史 IP(供将来
-            // mDNS 不可用时的单播兜底探测使用)。
+            // mDNS 不可用时的单播兜底探测使用)——具体记哪些见
+            // `addrs_to_record` 注释。
             let mut h = history.lock().expect("history lock");
-            for ip in &addrs {
-                h.record(*ip);
+            for ip in addrs_to_record(&addrs, &iface_entries) {
+                h.record(ip);
             }
             h.save(&data_dir);
             drop(h);
@@ -933,6 +1088,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             id_b.fingerprint.clone(),
             local.clone(),
             transport_b.port(),
@@ -975,6 +1131,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             dead_fp.clone(),
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             1, // 无人监听
@@ -1006,6 +1163,7 @@ mod tests {
             &in_flight,
             &history,
             history_dir.path(),
+            vec![], // entries 为空:零语义漂移,保持"全记"旧行为
             "bbbb".to_string(),
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
             1,
@@ -1115,6 +1273,136 @@ mod tests {
                 .expect("测试机器已启动超过 60s"),
         );
         assert!(stale_fingerprints(&last_seen, now, Duration::from_secs(60)).is_empty());
+    }
+
+    // ---- addrs_to_record:spawn_probe 的历史 IP 过滤规则(Step 7) ----
+
+    fn iface_entry(name: &str, ip: Ipv4Addr, netmask: Ipv4Addr) -> IfaceEntry {
+        IfaceEntry {
+            name: name.to_string(),
+            ip,
+            netmask,
+            broadcast: net_ifaces::directed_broadcast(ip, netmask),
+            is_virtual_hint: false,
+        }
+    }
+
+    #[test]
+    fn addrs_to_record_keeps_all_when_entries_empty() {
+        // entries 为空(全排除/尚未初始化)保持"全记"的旧行为——现有 3 处
+        // spawn_probe 单测传 vec![] 正是依赖这条零语义漂移保证。
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)),
+        ];
+        assert_eq!(addrs_to_record(&addrs, &[]), addrs);
+    }
+
+    #[test]
+    fn addrs_to_record_filters_to_same_subnet_when_entries_present() {
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let addrs = vec![
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),   // 不同网段:该被滤掉
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), // 同网段:该保留
+        ];
+        assert_eq!(
+            addrs_to_record(&addrs, &entries),
+            vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))]
+        );
+    }
+
+    #[test]
+    fn addrs_to_record_empty_result_when_no_addr_matches_any_entry() {
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let addrs = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))];
+        assert!(addrs_to_record(&addrs, &entries).is_empty());
+    }
+
+    // ---- apply_excluded_interfaces:apply_settings 的核心决策(Step 7) ----
+    //
+    // 用真实 InterfaceRegistry(网卡枚举依赖真实主机,没有 mock 钩子),但
+    // mdns 一侧换成记录调用参数的 spy 闭包,不必起真实 Discovery/mdns
+    // daemon——这是"清单变化 → registry 快照变化 → ipmsg targets 被覆写"
+    // 这条编排逻辑可确定性单测的关键(与 brief 要求的"合成数据"对应:
+    // 一个测试机上必然不存在的网卡名,以及测试机当前真实的网卡名清单)。
+
+    #[test]
+    fn apply_excluded_interfaces_skips_mdns_callback_when_list_unchanged() {
+        let registry = InterfaceRegistry::new(vec!["already-excluded".to_string()]);
+        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let mut calls = 0;
+        apply_excluded_interfaces(
+            &registry,
+            &ipmsg_bcast,
+            &["already-excluded".to_string()],
+            |_, _| calls += 1,
+        );
+        assert_eq!(calls, 0, "清单没变不该触碰 mdns");
+    }
+
+    #[test]
+    fn apply_excluded_interfaces_notifies_mdns_for_nonexistent_iface_name_even_if_snapshot_unchanged(
+    ) {
+        // 关键分离逻辑:排除一个当前系统里根本不存在的网卡名——快照不会
+        // 变(没有任何条目因此被滤掉),但 daemon 必须记住这个名字(不然它
+        // 日后插上来还是会被广播出去),所以 mdns 回调仍然必须被调用。
+        let registry = InterfaceRegistry::new(vec![]);
+        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let before_snapshot = registry.snapshot();
+        let before_bcast = ipmsg_bcast.lock().unwrap().clone();
+
+        let fake_name = "definitely-not-a-real-iface-zzz".to_string();
+        let mut calls: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        apply_excluded_interfaces(
+            &registry,
+            &ipmsg_bcast,
+            std::slice::from_ref(&fake_name),
+            |new, old| {
+                calls.push((new.to_vec(), old.to_vec()));
+            },
+        );
+
+        assert_eq!(calls, vec![(vec![fake_name], vec![])], "清单变了必须通知 mdns");
+        assert_eq!(
+            registry.snapshot().entries,
+            before_snapshot.entries,
+            "不存在的网卡名不该改变快照"
+        );
+        assert_eq!(
+            *ipmsg_bcast.lock().unwrap(),
+            before_bcast,
+            "快照没变,ipmsg 目标表不该被覆写"
+        );
+    }
+
+    #[test]
+    fn apply_excluded_interfaces_overwrites_ipmsg_bcast_when_snapshot_changes() {
+        let registry = InterfaceRegistry::new(vec![]);
+        let names: Vec<String> = registry.list_all().into_iter().map(|v| v.name).collect();
+        if names.is_empty() {
+            eprintln!("测试机无非回环网卡,跳过(快照永远不会因排除清单而变化)");
+            return;
+        }
+        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+
+        let mut calls = 0;
+        apply_excluded_interfaces(&registry, &ipmsg_bcast, &names, |_, _| calls += 1);
+
+        assert_eq!(calls, 1, "清单从空变成非空,必须通知 mdns");
+        let expected = net_ifaces::broadcast_targets(&registry.snapshot().entries);
+        assert_eq!(
+            *ipmsg_bcast.lock().unwrap(),
+            expected,
+            "快照真的变了,ipmsg 目标表必须原地覆写成新快照算出的广播地址"
+        );
     }
 
     // ---- forward_ipmsg_event:IPMsg → roster/transport 事件映射(M5) ----
