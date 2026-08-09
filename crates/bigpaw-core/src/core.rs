@@ -6,7 +6,7 @@ use crate::discovery::announce::{
 };
 use crate::discovery::Discovery;
 use crate::identity::{Identity, IdentityError};
-use crate::net_ifaces::{self, IfaceEntry, IfaceView, InterfaceRegistry};
+use crate::net_ifaces::{self, IfaceEntry, IfaceSnapshot, IfaceView, InterfaceRegistry};
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::storage::Storage;
 use crate::transport::manager::{
@@ -17,7 +17,7 @@ use bigpaw_ipmsg::IPMSG_PORT;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,7 +43,9 @@ const ROSTER_POLL: Duration = Duration::from_millis(200);
 /// ——`InterfaceRegistry::refresh()` 靠 roster 线程按这个节奏定期轮询兜底
 /// 感知。announce/transport 走 `watch` 订阅自动收到新快照;ipmsg 没有
 /// watch 机制,变化时需要显式覆写 `Core::ipmsg_bcast` 里的 `Vec`(见
-/// roster 线程实现);mdns 的排除清单由 `apply_settings` 显式路径管理,
+/// roster 线程实现;覆写经过 `IpmsgBcastGuard` 的 generation 守卫,防止
+/// 这条定期刷新与 `apply_settings` 热生效路径并发时互相用 stale 快照覆盖,
+/// 见该类型文档);mdns 的排除清单由 `apply_settings` 显式路径管理,
 /// 这条定期刷新不碰它(daemon 自己每 5s 自查网卡 IP 变化,不需要我们管)。
 ///
 /// 取值推导:30s = 6 × `ROSTER_TICK`(5s)。网卡枚举是本机系统调用,不像
@@ -108,19 +110,66 @@ fn addrs_to_record(addrs: &[IpAddr], iface_entries: &[IfaceEntry]) -> Vec<IpAddr
 ///   插上来还是会被广播出去。
 fn apply_excluded_interfaces(
     registry: &InterfaceRegistry,
-    ipmsg_bcast: &BroadcastTargets,
+    ipmsg_bcast: &IpmsgBcastGuard,
     excluded: &[String],
     mut on_list_changed: impl FnMut(&[String], &[String]),
 ) {
     let (old_list, new_snapshot) = registry.set_excluded(excluded.to_vec());
 
     if let Some(snapshot) = &new_snapshot {
-        *ipmsg_bcast.lock().expect("ipmsg bcast lock") =
-            net_ifaces::broadcast_targets(&snapshot.entries);
+        ipmsg_bcast.apply_if_newer(snapshot);
     }
 
     if old_list != excluded {
         on_list_changed(excluded, &old_list);
+    }
+}
+
+/// ipmsg 定向广播目标表的写入守卫(Important 1,最终评审修复)。
+///
+/// 背景:`apply_settings` 热生效路径(`InterfaceRegistry::set_excluded`)与
+/// roster 线程按 `IFACE_REFRESH_INTERVAL` 的定期 `refresh()` 都可能产生一份
+/// 新快照,两者各自在拿到快照**之后**(已经离开 registry 内部的 `excluded`
+/// 锁)才去锁 `ipmsg_bcast` 并覆写它的 `Vec`——这一步不受 `excluded` 锁保护。
+/// 若线程调度恰好让"读到旧快照的一方"晚于"读到新快照的一方"执行这个覆写
+/// (例如 roster 线程的 refresh() 在 apply_settings 发布新排除清单**之前**
+/// 就已经算完自己的旧快照,但因为被抢占,直到 apply_settings 写完之后才
+/// 轮到它执行覆写),就会用 stale 数据把刚生效的新排除清单覆盖回去——而
+/// ipmsg 没有 watch 机制感知这个错误,这个 stale 状态会无限期留存(直到
+/// 下一次快照内容碰巧真的变化),持续向已排除的网段发送 BR_ENTRY。
+///
+/// 修法:`IfaceSnapshot::generation` 由 `InterfaceRegistry` 在唯一一把
+/// `excluded` 锁内单调递增并发布(见 `InterfaceRegistry::refresh` 文档),
+/// 因此是一个可靠的"谁更新"的全序标记。这里用它做写入前的 CAS 守卫:只接受
+/// 严格更新的一代,`AtomicU64::fetch_max` 保证无论两次写入谁先执行到覆写
+/// 这一步,generation 更小的那次都会被识别为 stale 而跳过——不需要把覆写
+/// 挪进 registry 内部改成回调(那样要给 registry 加 ipmsg 相关依赖,改动面
+/// 更大),这是侵入最小的修法。
+struct IpmsgBcastGuard {
+    targets: BroadcastTargets,
+    applied_gen: AtomicU64,
+}
+
+impl IpmsgBcastGuard {
+    /// `initial_gen` 传调用方构造 `targets` 时所依据的那份快照的 generation
+    /// (`Core::start` 里是 `registry.snapshot().generation`),避免后续一份
+    /// generation 相同(理论上不会,但严谨起见)或更旧的快照被误判为"更新"。
+    fn new(targets: BroadcastTargets, initial_gen: u64) -> Self {
+        Self {
+            targets,
+            applied_gen: AtomicU64::new(initial_gen),
+        }
+    }
+
+    /// 仅当 `snapshot.generation` 严格新于已应用的一代时才覆写 `targets`;
+    /// 收到一份 stale 快照(generation 不大于已应用值)时静默跳过,不覆写。
+    fn apply_if_newer(&self, snapshot: &IfaceSnapshot) {
+        let gen = snapshot.generation;
+        let prev_applied = self.applied_gen.fetch_max(gen, Ordering::SeqCst);
+        if gen > prev_applied {
+            *self.targets.lock().expect("ipmsg bcast lock") =
+                net_ifaces::broadcast_targets(&snapshot.entries);
+        }
     }
 }
 
@@ -190,11 +239,14 @@ pub struct Core {
     /// 让前端能提示"IPMsg 兼容层未启用(2425 被占用)"。启动后固定不变。
     ipmsg_available: bool,
     /// ipmsg 兼容层的定向广播目标表(`Arc<Mutex<Vec<Ipv4Addr>>>`,Step 7)。
-    /// `IpmsgService`(若启用)内部克隆了同一份 `Arc`,这里保留的克隆用于
-    /// 热更新:排除清单变化后原地覆写内部 `Vec`,`IpmsgService` 下次
-    /// BR_ENTRY/BR_EXIT 发送时自动感知新目标表,不需要重启服务。兼容层
-    /// 未启用时这份表仍然存在、仍然会被覆写,只是没有人读它,无害。
-    ipmsg_bcast: BroadcastTargets,
+    /// `IpmsgService`(若启用)内部克隆了同一份底层 `Arc`,这里包一层
+    /// `IpmsgBcastGuard` 用于热更新:排除清单变化后原地覆写内部 `Vec`,
+    /// `IpmsgService` 下次 BR_ENTRY/BR_EXIT 发送时自动感知新目标表,不需要
+    /// 重启服务。兼容层未启用时这份表仍然存在、仍然会被覆写,只是没有人读
+    /// 它,无害。`IpmsgBcastGuard` 的 generation 守卫防止 `apply_settings`
+    /// 热生效路径与 roster 线程定期 `refresh()` 并发覆写时互相用 stale
+    /// 快照覆盖对方(Important 1,最终评审修复,见该类型文档)。
+    ipmsg_bcast: Arc<IpmsgBcastGuard>,
     /// 对端(ipmsg 协议)通过 `SENDMSG|FILEATTACHOPT` 报价的文件:
     /// 本地生成的 `xfer_id -> (packet_no, file_id, 文件名, 大小)` 登记表,
     /// 供 `respond_file` 决定接受时反查、发起 `IpmsgService::request_file`。
@@ -251,20 +303,27 @@ impl Core {
         let (ipmsg_evt_tx, ipmsg_evt_rx) = std::sync::mpsc::channel::<IpmsgEvent>();
         let ipmsg_host = hostname_no_local();
         // 定向广播目标表(Step 7):由 registry 当前快照算出,排除清单已经
-        // 生效。这份 `Arc` 克隆保留在 `Core::ipmsg_bcast` 上,供
-        // `apply_settings`/roster 线程的定期刷新原地覆写内部 `Vec`——
-        // `IpmsgService` 自己另持一份克隆,下次 BR_ENTRY/BR_EXIT 发送时
-        // 自动感知,不需要重启服务。
-        let ipmsg_bcast: BroadcastTargets = Arc::new(Mutex::new(net_ifaces::broadcast_targets(
-            &registry.snapshot().entries,
-        )));
+        // 生效。底层 `Arc<Mutex<Vec<_>>>` 另克隆一份原样交给 `IpmsgService`
+        // 持有(它读、我们写);`Core::ipmsg_bcast` 上保留的是包了一层
+        // generation 守卫的 `IpmsgBcastGuard`(Important 1,最终评审修复),
+        // 供 `apply_settings`/roster 线程的定期刷新原地覆写内部 `Vec`——
+        // `IpmsgService` 自己另持有底层 `Arc` 的克隆,下次 BR_ENTRY/BR_EXIT
+        // 发送时自动感知,不需要重启服务。
+        let init_snapshot = registry.snapshot();
+        let ipmsg_bcast_targets: BroadcastTargets = Arc::new(Mutex::new(
+            net_ifaces::broadcast_targets(&init_snapshot.entries),
+        ));
+        let ipmsg_bcast = Arc::new(IpmsgBcastGuard::new(
+            ipmsg_bcast_targets.clone(),
+            init_snapshot.generation,
+        ));
         let (ipmsg_service, ipmsg_available) = if settings.ipmsg_enabled {
             match IpmsgService::start(
                 &nickname,
                 &ipmsg_host,
                 IPMSG_PORT,
                 ipmsg_evt_tx,
-                ipmsg_bcast.clone(),
+                ipmsg_bcast_targets.clone(),
             ) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
@@ -351,6 +410,18 @@ impl Core {
         // 历史 IP 单播唤醒(M4 简化版双向注册):对已知历史设备逐个发一份
         // 单播宣告,串行、间隔 ≥50ms,让对方回连/回宣告,走正常发现流程
         // 重新进入 roster——不做端口扫描、不直接建连接。
+        //
+        // 已知局限(留 TODO,本期接受,镜像
+        // `bigpaw_ipmsg::discovery::dispatch` 里 BR_ENTRY 分支、以及
+        // `announce::recv_loop` 的同一条局限——见后者注释):`AnnounceService::poke`
+        // 直接对给定 IP 发一份定向单播,不看当前网卡快照/排除清单——即使用户
+        // 已经把这个历史 IP 所在的网段整张网卡都排除掉("隐身"=不主动宣告),
+        // 这条唤醒线程仍会向它发一个单播包,是"隐身"语义里尚未堵上的一个
+        // 缺口。之所以本期不修:`poke` 不经过 `send_targets`/`send_dual` 的
+        // 网卡枚举路径,要按来源网卡过滤就要么给它传网卡快照做同网段判断,
+        // 要么整条唤醒线程感知 registry——影响面超出本轮 Important 2 的最低
+        // 版本(被动应答/接收侧隐身)范围,留给后续任务按来源子网过滤时一并
+        // 处理。
         {
             let announce_for_wake = announce.clone();
             let wake_ips = history.lock().expect("history lock").ips();
@@ -474,8 +545,11 @@ impl Core {
                         if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
                             last_iface_refresh = Instant::now();
                             if let Some(snapshot) = registry_for_thread.refresh() {
-                                *ipmsg_bcast_for_thread.lock().expect("ipmsg bcast lock") =
-                                    net_ifaces::broadcast_targets(&snapshot.entries);
+                                // 经 generation 守卫覆写(Important 1):若这份
+                                // 快照因线程调度延迟到达,已经被 apply_settings
+                                // 发布的更新一代覆盖过,这里会被识别为 stale 而
+                                // 静默跳过,不会覆写回旧的广播目标表。
+                                ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
                             }
                         }
                     }
@@ -489,8 +563,11 @@ impl Core {
                         if last_iface_refresh.elapsed() >= IFACE_REFRESH_INTERVAL {
                             last_iface_refresh = Instant::now();
                             if let Some(snapshot) = registry_for_thread.refresh() {
-                                *ipmsg_bcast_for_thread.lock().expect("ipmsg bcast lock") =
-                                    net_ifaces::broadcast_targets(&snapshot.entries);
+                                // 经 generation 守卫覆写(Important 1):若这份
+                                // 快照因线程调度延迟到达,已经被 apply_settings
+                                // 发布的更新一代覆盖过,这里会被识别为 stale 而
+                                // 静默跳过,不会覆写回旧的广播目标表。
+                                ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
                             }
                         }
                         // 未到扫描节奏就继续轮询:这个分支现在每 ROSTER_POLL
@@ -1343,10 +1420,19 @@ mod tests {
     // 这条编排逻辑可确定性单测的关键(与 brief 要求的"合成数据"对应:
     // 一个测试机上必然不存在的网卡名,以及测试机当前真实的网卡名清单)。
 
+    /// 测试用:构造一份底层目标表 + generation=0 起步的 `IpmsgBcastGuard`,
+    /// 返回两者供测试既能调用 `apply_excluded_interfaces`,又能直接读底层
+    /// `BroadcastTargets` 断言写入结果。
+    fn new_bcast_guard() -> (BroadcastTargets, IpmsgBcastGuard) {
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+        (targets, guard)
+    }
+
     #[test]
     fn apply_excluded_interfaces_skips_mdns_callback_when_list_unchanged() {
         let registry = InterfaceRegistry::new(vec!["already-excluded".to_string()]);
-        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let (_targets, ipmsg_bcast) = new_bcast_guard();
         let mut calls = 0;
         apply_excluded_interfaces(
             &registry,
@@ -1364,9 +1450,9 @@ mod tests {
         // 变(没有任何条目因此被滤掉),但 daemon 必须记住这个名字(不然它
         // 日后插上来还是会被广播出去),所以 mdns 回调仍然必须被调用。
         let registry = InterfaceRegistry::new(vec![]);
-        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let (targets, ipmsg_bcast) = new_bcast_guard();
         let before_snapshot = registry.snapshot();
-        let before_bcast = ipmsg_bcast.lock().unwrap().clone();
+        let before_bcast = targets.lock().unwrap().clone();
 
         let fake_name = "definitely-not-a-real-iface-zzz".to_string();
         let mut calls: Vec<(Vec<String>, Vec<String>)> = Vec::new();
@@ -1386,7 +1472,7 @@ mod tests {
             "不存在的网卡名不该改变快照"
         );
         assert_eq!(
-            *ipmsg_bcast.lock().unwrap(),
+            *targets.lock().unwrap(),
             before_bcast,
             "快照没变,ipmsg 目标表不该被覆写"
         );
@@ -1400,7 +1486,7 @@ mod tests {
             eprintln!("测试机无非回环网卡,跳过(快照永远不会因排除清单而变化)");
             return;
         }
-        let ipmsg_bcast: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let (targets, ipmsg_bcast) = new_bcast_guard();
 
         let mut calls = 0;
         apply_excluded_interfaces(&registry, &ipmsg_bcast, &names, |_, _| calls += 1);
@@ -1408,9 +1494,117 @@ mod tests {
         assert_eq!(calls, 1, "清单从空变成非空,必须通知 mdns");
         let expected = net_ifaces::broadcast_targets(&registry.snapshot().entries);
         assert_eq!(
-            *ipmsg_bcast.lock().unwrap(),
+            *targets.lock().unwrap(),
             expected,
             "快照真的变了,ipmsg 目标表必须原地覆写成新快照算出的广播地址"
+        );
+    }
+
+    // ---- IpmsgBcastGuard:generation 守卫堵 stale 覆写竞态(Important 1,
+    // 最终评审修复)----
+    //
+    // `apply_settings`(set_excluded)与 roster 线程定期 `refresh()` 并发时,
+    // 真实的交错时序依赖线程调度、无法在单测里可靠复现;能确定性验证的是
+    // 修复所依赖的结构保证本身——generation 更旧的写入,无论它在时间线上
+    // 排在 generation 更新的写入*之后*才执行到覆写这一步,都必须被识别为
+    // stale 并跳过。下面直接构造"新写入先发生、旧写入后到达"的交错顺序
+    // (对应评审描述的竞态:roster 线程 refresh() 发布 gen N 后被抢占,
+    // apply_settings 发布 gen N+1 并写 bcast,roster 恢复后用 gen N 覆写
+    // 回去),断言最终状态是新写入的结果、没有被旧写入覆盖。
+
+    #[test]
+    fn ipmsg_bcast_guard_rejects_stale_generation_applied_after_newer_one() {
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+
+        // "旧"快照:对应 roster 线程 refresh() 在 apply_settings 之前读到的
+        // 那份(排除生效之前,en0 仍在),generation=1。
+        let stale_entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let stale = IfaceSnapshot {
+            generation: 1,
+            entries: stale_entries,
+        };
+
+        // "新"快照:对应 apply_settings 里 set_excluded 排除掉 en0 之后发布的
+        // 那份,generation=2(严格新于 stale)。
+        let fresh_entries = vec![iface_entry(
+            "en1",
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(255, 0, 0, 0),
+        )];
+        let fresh = IfaceSnapshot {
+            generation: 2,
+            entries: fresh_entries.clone(),
+        };
+
+        // 交错顺序:新的先落地(apply_settings 抢先执行完覆写),旧的因为
+        // 线程调度延迟,后落地(roster 线程恢复执行、试图覆写回去)。
+        guard.apply_if_newer(&fresh);
+        guard.apply_if_newer(&stale);
+
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&fresh_entries),
+            "generation 更旧的写入即使后执行到覆写这一步,也不该覆盖更新一代的结果"
+        );
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_applies_when_generation_arrives_in_order() {
+        // 正常顺序(无竞态)下,新一代快照仍应正确覆写——防止守卫逻辑矫枉
+        // 过正,把所有写入都挡住。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+
+        let e1 = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        guard.apply_if_newer(&IfaceSnapshot {
+            generation: 1,
+            entries: e1,
+        });
+
+        let e2 = vec![iface_entry(
+            "en1",
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(255, 0, 0, 0),
+        )];
+        guard.apply_if_newer(&IfaceSnapshot {
+            generation: 2,
+            entries: e2.clone(),
+        });
+
+        assert_eq!(*targets.lock().unwrap(), net_ifaces::broadcast_targets(&e2));
+    }
+
+    #[test]
+    fn ipmsg_bcast_guard_same_generation_reapplied_is_a_harmless_noop() {
+        // 同一代重复应用(两个调用方都读到了同一份最新快照)不该 panic,
+        // 第二次是 no-op(条件是严格大于,不是大于等于)。
+        let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
+        let guard = IpmsgBcastGuard::new(targets.clone(), 0);
+        let entries = vec![iface_entry(
+            "en0",
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(255, 255, 255, 0),
+        )];
+        let snapshot = IfaceSnapshot {
+            generation: 1,
+            entries: entries.clone(),
+        };
+
+        guard.apply_if_newer(&snapshot);
+        guard.apply_if_newer(&snapshot);
+
+        assert_eq!(
+            *targets.lock().unwrap(),
+            net_ifaces::broadcast_targets(&entries)
         );
     }
 
