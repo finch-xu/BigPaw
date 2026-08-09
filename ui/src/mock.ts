@@ -58,6 +58,12 @@ export function installMocks(): void {
       [fp5]: conv([]),
       [fp6]: conv([]),
     },
+    // 消息视图(M7b):有会话往来的两位 + 未读样例
+    convSummaries: {
+      [fp1]: { tsMs: now - MIN, snippet: "素材包", kind: "file" },
+      [fp4]: { tsMs: now - 18 * MIN, snippet: "好的,马上来拿", kind: "text" },
+    },
+    unread: { [fp1]: 3 },
   });
   // 截图调试用:允许在浏览器控制台操纵 store(仅 mock 模式暴露)
   (window as unknown as { __store?: typeof useAppStore }).__store = useAppStore;
