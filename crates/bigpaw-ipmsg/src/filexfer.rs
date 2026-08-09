@@ -677,6 +677,56 @@ mod tests {
         assert_eq!(fs::read(&result).unwrap(), content);
     }
 
+    /// 飞秋对拍回归:真实飞秋(C++ 实现)发的 GETFILEDATA 请求带尾部 `\0`
+    /// (参考实现 `strlen+1` 发送语义)。修复前 `parse_getfiledata_extra` 拿到的
+    /// offset 字段是 `"0\0"`,hex 解析失败 → 静默拒绝 → 飞秋显示"传输失败"。
+    /// 这里直接用手工拼的飞秋风格原始字节(私有版本串 + 尾部 NUL)回归。
+    #[test]
+    fn serve_getfiledata_accepts_feiq_style_nul_terminated_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("feiq.bin");
+        let content = b"feiq interop payload".to_vec();
+        fs::write(&src_path, &content).unwrap();
+
+        let offered = new_offered_files();
+        offered
+            .lock()
+            .unwrap()
+            .entry(0x2a)
+            .or_default()
+            .insert(0, src_path);
+
+        // 飞秋风格:私有版本串、GETFILEDATA(0x60=96)、extra 全 hex、结尾 \0。
+        let raw = proto::gbk_encode("1_lbt6_8#998#abc:7:feiq:FEIQ-HOST:96:2a:0:0\u{0}");
+        let mut wire = raw.clone();
+        let mut response = Vec::new();
+        let mut stream = DuplexBuf {
+            read: Cursor::new(&mut wire),
+            write: &mut response,
+        };
+        serve_getfiledata_request(&mut stream, &offered).unwrap();
+        assert_eq!(response, content, "带尾部 \\0 的请求必须被正常供给");
+    }
+
+    /// 极简双工桩:读侧回放请求字节,写侧收集响应。
+    struct DuplexBuf<'a> {
+        read: Cursor<&'a mut Vec<u8>>,
+        write: &'a mut Vec<u8>,
+    }
+    impl Read for DuplexBuf<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read.read(buf)
+        }
+    }
+    impl Write for DuplexBuf<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn getfiledata_request_for_unregistered_file_id_is_refused() {
         let offered = new_offered_files(); // 空表:什么都没登记过
