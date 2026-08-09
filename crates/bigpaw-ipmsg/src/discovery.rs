@@ -175,35 +175,21 @@ fn send_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
     packet_no: Arc<AtomicU32>,
-    nick: String,
+    nick: Arc<Mutex<String>>,
     host: String,
     port: u16,
     self_token: Arc<String>,
     targets: BroadcastTargets,
 ) {
-    send_entry(
-        &socket,
-        &packet_no,
-        &nick,
-        &host,
-        port,
-        &self_token,
-        &targets,
-    );
+    let n = nick.lock().unwrap().clone();
+    send_entry(&socket, &packet_no, &n, &host, port, &self_token, &targets);
     loop {
         interruptible_sleep(&stop, ENTRY_INTERVAL);
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        send_entry(
-            &socket,
-            &packet_no,
-            &nick,
-            &host,
-            port,
-            &self_token,
-            &targets,
-        );
+        let n = nick.lock().unwrap().clone();
+        send_entry(&socket, &packet_no, &n, &host, port, &self_token, &targets);
     }
 }
 
@@ -324,7 +310,7 @@ fn recv_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
     packet_no: Arc<AtomicU32>,
-    nick: String,
+    nick: Arc<Mutex<String>>,
     host: String,
     tx: Sender<IpmsgEvent>,
     self_token: Arc<String>,
@@ -356,7 +342,8 @@ fn recv_loop(
             continue; // decode None → 丢弃
         };
 
-        match dispatch(packet, src, &nick, &host, &packet_no, &self_token) {
+        let n = nick.lock().unwrap().clone();
+        match dispatch(packet, src, &n, &host, &packet_no, &self_token) {
             Action::None => {}
             Action::Emit(ev) => {
                 if tx.send(ev).is_err() {
@@ -433,7 +420,8 @@ pub struct IpmsgService {
     stop: Arc<AtomicBool>,
     socket: Arc<UdpSocket>,
     packet_no: Arc<AtomicU32>,
-    nick: String,
+    /// 当前昵称。Arc<Mutex> 共享给发送/接收线程,set_nick 热更新(模式同 targets)。
+    nick: Arc<Mutex<String>>,
     host: String,
     port: u16,
     self_token: Arc<String>,
@@ -471,6 +459,7 @@ impl IpmsgService {
         let socket = Arc::new(bind_socket(port)?);
         let stop = Arc::new(AtomicBool::new(false));
         let packet_no = Arc::new(AtomicU32::new(1));
+        let nick = Arc::new(Mutex::new(nick.to_string()));
         let self_token = Arc::new(new_self_token());
         let pending_acks: Arc<Mutex<HashMap<u32, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let offered_files: OfferedFiles = filexfer::new_offered_files();
@@ -496,7 +485,7 @@ impl IpmsgService {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
             let packet_no = Arc::clone(&packet_no);
-            let nick = nick.to_string();
+            let nick = Arc::clone(&nick);
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
             let targets = Arc::clone(&targets);
@@ -511,7 +500,7 @@ impl IpmsgService {
             let socket = Arc::clone(&socket);
             let stop = Arc::clone(&stop);
             let packet_no = Arc::clone(&packet_no);
-            let nick = nick.to_string();
+            let nick = Arc::clone(&nick);
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
             let pending_acks = Arc::clone(&pending_acks);
@@ -533,7 +522,7 @@ impl IpmsgService {
             stop,
             socket,
             packet_no,
-            nick: nick.to_string(),
+            nick,
             host: host.to_string(),
             port,
             self_token,
@@ -546,15 +535,32 @@ impl IpmsgService {
         })
     }
 
+    /// 昵称热生效:更新共享昵称,并立即补发一次 BR_ENTRY(否则要等 ENTRY_INTERVAL
+    /// =30s 的下个周期),飞秋对端收到后即刷新显示名。发送走既有 `send_entry`
+    /// (定向广播目标表为空时不发,与隐身语义一致)。
+    pub fn set_nick(&self, nick: &str) {
+        *self.nick.lock().unwrap() = nick.to_string();
+        send_entry(
+            &self.socket,
+            &self.packet_no,
+            nick,
+            &self.host,
+            self.port,
+            &self.self_token,
+            &self.targets,
+        );
+    }
+
     /// 单播发送一条 SENDMSG|SENDCHECKOPT 文本消息到 `addr`,body 走 GBK 编码。
     /// packet_no 记入待回执表(收到对端 RECVMSG 后由 recv_loop 摘除);
     /// M5 不做重发/超时,记录仅供将来扩展使用。
     pub fn send_text(&self, addr: SocketAddr, body: &str) -> Result<(), IpmsgError> {
         let packet_no = next_packet_no(&self.packet_no);
+        let nick = self.nick.lock().unwrap().clone();
         let packet = Packet {
             version: IPMSG_VERSION.to_string(),
             packet_no,
-            sender: self.nick.clone(),
+            sender: nick,
             host: self.host.clone(),
             command: command::build(command::SENDMSG, &[command::SENDCHECKOPT]),
             extra: body.to_string(),
@@ -593,8 +599,9 @@ impl IpmsgService {
         const SINGLE_FILE_ID: u32 = 0;
 
         let packet_no = next_packet_no(&self.packet_no);
+        let nick = self.nick.lock().unwrap().clone();
         let packet = file_offer_packet(
-            &self.nick,
+            &nick,
             &self.host,
             packet_no,
             SINGLE_FILE_ID,
@@ -637,11 +644,12 @@ impl IpmsgService {
         let mut stream = TcpStream::connect_timeout(&sender_addr, CLIENT_CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
         let my_packet_no = next_packet_no(&self.packet_no);
+        let nick = self.nick.lock().unwrap().clone();
         filexfer::request_file_bytes(
             &mut stream,
             IPMSG_VERSION,
             my_packet_no,
-            &self.nick,
+            &nick,
             &self.host,
             packet_no,
             file_id,
@@ -665,10 +673,11 @@ impl IpmsgService {
     ) -> Result<PathBuf, IpmsgError> {
         let mut stream = TcpStream::connect_timeout(&sender_addr, CLIENT_CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT))?;
+        let nick = self.nick.lock().unwrap().clone();
         let packet = Packet {
             version: IPMSG_VERSION.to_string(),
             packet_no: next_packet_no(&self.packet_no),
-            sender: self.nick.clone(),
+            sender: nick,
             host: self.host.clone(),
             command: command::GETDIRFILES,
             extra: format!("{packet_no:x}:{file_id:x}"),
@@ -681,10 +690,11 @@ impl IpmsgService {
 
     /// 广播 BR_EXIT,停线程,关闭 socket。
     pub fn shutdown(mut self) {
+        let nick = self.nick.lock().unwrap().clone();
         let packet = Packet {
             version: IPMSG_VERSION.to_string(),
             packet_no: next_packet_no(&self.packet_no),
-            sender: self.nick.clone(),
+            sender: nick,
             host: self.host.clone(),
             command: command::BR_EXIT,
             extra: self.self_token.to_string(),
@@ -1170,5 +1180,62 @@ mod tests {
                 panic!("本机 SO_REUSEADDR 允许了重复 bind,PortInUse 分支需人工验证而非单测覆盖");
             }
         }
+    }
+
+    /// send_entry 的 port 参数是显式的:接收 socket 绑 127.0.0.1 临时端口即可
+    /// 验证 BR_ENTRY 携带当前昵称,不需要真广播网络。
+    #[test]
+    fn send_entry_carries_given_nick() {
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let packet_no = AtomicU32::new(1);
+        let targets: BroadcastTargets = Arc::new(Mutex::new(vec![std::net::Ipv4Addr::LOCALHOST]));
+
+        send_entry(
+            &sender,
+            &packet_no,
+            "改后名",
+            "HOST-X",
+            port,
+            "tok-abc",
+            &targets,
+        );
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = receiver.recv_from(&mut buf).expect("应收到 BR_ENTRY");
+        let p = proto::decode(&buf[..n]).expect("BR_ENTRY 可解码");
+        assert_eq!(Command(p.command).num(), command::BR_ENTRY);
+        assert_eq!(p.sender, "改后名");
+    }
+
+    #[test]
+    fn set_nick_updates_unicast_text_sender() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        // 用一个临时 socket 探到空闲端口再释放给服务绑定(测试内可接受的竞态)。
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let empty_targets: BroadcastTargets = Arc::new(Mutex::new(Vec::new())); // 不广播
+        let svc = IpmsgService::start("旧名", "HOST-X", port, tx, empty_targets).unwrap();
+
+        svc.set_nick("新名");
+
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        svc.send_text(receiver.local_addr().unwrap(), "hi").unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = receiver.recv_from(&mut buf).expect("应收到 SENDMSG");
+        let p = proto::decode(&buf[..n]).unwrap();
+        assert_eq!(
+            p.sender, "新名",
+            "set_nick 后单播报文的 sender 必须是新昵称"
+        );
+        svc.shutdown();
     }
 }
