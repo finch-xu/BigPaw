@@ -87,6 +87,8 @@ export interface Settings {
   downloadDir: string | null;
   ipmsgEnabled: boolean;
   excludedInterfaces: string[];
+  /** 允许的对端网段清单(网络范围限定):每项单 IP / CIDR / 起-止区间;空 = 不限制 */
+  allowedNetworks: string[];
 }
 
 /** 与后端 `list_network_interfaces` 返回的 IfaceDto 一一对应。 */

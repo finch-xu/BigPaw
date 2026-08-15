@@ -11,7 +11,19 @@ const MOCK_SETTINGS: Settings = {
   downloadDir: null,
   ipmsgEnabled: true,
   excludedInterfaces: [],
+  allowedNetworks: [],
 };
+
+/** 前端轻校验(只拦明显错误,权威校验在后端 validate_allowed_networks):
+ *  单 IP `a.b.c.d`、CIDR `a.b.c.d/n`、区间 `a.b.c.d-a.b.c.d`。 */
+const SCOPE_LINE_RE = /^\d{1,3}(\.\d{1,3}){3}(\s*\/\s*\d{1,2}|\s*-\s*\d{1,3}(\.\d{1,3}){3})?$/;
+
+function splitScopeLines(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+}
 
 const MOCK_IFACES: NetIface[] = [
   { name: "en0", ip: "192.168.1.23", netmask: "255.255.255.0", isVirtual: false, excluded: false },
@@ -44,6 +56,15 @@ export default function SettingsModal() {
   const [error, setError] = useState("");
   const [theme, setTheme] = useState<ThemePref>(getThemePref());
   const [activeTab, setActiveTab] = useState<TabKey>("personal");
+  // 允许网段清单用本地草稿(多行文本),点"应用"才校验 + 保存——不能像 checkbox
+  // 那样每击键即存:半行输入必然校验失败,会刷屏报错。
+  const [scopeDraft, setScopeDraft] = useState("");
+  const [scopeError, setScopeError] = useState("");
+  const [scopeBusy, setScopeBusy] = useState(false);
+
+  useEffect(() => {
+    if (settings) setScopeDraft(settings.allowedNetworks.join("\n"));
+  }, [settings?.allowedNetworks]);
 
   useEffect(() => {
     if (!IS_TAURI) {
@@ -109,6 +130,32 @@ export default function SettingsModal() {
     // 不再维护这份影子状态,避免它与 settings 不同步却无人察觉。
     void save({ ...settings, excludedInterfaces: next }, false);
   }
+
+  async function applyScope() {
+    if (!settings) return;
+    const lines = splitScopeLines(scopeDraft);
+    const bad = lines.findIndex((l) => !SCOPE_LINE_RE.test(l));
+    if (bad >= 0) {
+      setScopeError(`第 ${bad + 1} 行格式无法识别:${lines[bad]}`);
+      return;
+    }
+    setScopeBusy(true);
+    try {
+      // 后端权威校验并返回归一化文本(CIDR 主机位归零),再落盘 + 热生效
+      const canonical = IS_TAURI
+        ? await invoke<string[]>("validate_allowed_networks", { lines })
+        : lines;
+      setScopeError("");
+      await save({ ...settings, allowedNetworks: canonical }, false);
+    } catch (e) {
+      setScopeError(String(e));
+    } finally {
+      setScopeBusy(false);
+    }
+  }
+
+  const scopeDirty =
+    settings !== null && splitScopeLines(scopeDraft).join("\n") !== settings.allowedNetworks.join("\n");
 
   async function handleClearAll() {
     const ok = await confirm("清空所有聊天记录?此操作不可恢复。", {
@@ -301,6 +348,40 @@ export default function SettingsModal() {
                   IPMsg/飞秋兼容<span className="text-muted-foreground">(重启后生效)</span>
                 </span>
               </label>
+
+              <div className="mt-4 flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">
+                    限定网络范围
+                    <span className="text-muted-foreground">
+                      (留空 = 不限制{settings.allowedNetworks.length > 0 ? ",当前已限定" : ""})
+                    </span>
+                  </span>
+                  <button
+                    onClick={() => void applyScope()}
+                    disabled={!scopeDirty || scopeBusy}
+                    className="shrink-0 rounded-full border border-border px-3 py-1 text-xs text-fg2 hover:bg-hover disabled:cursor-default disabled:opacity-40"
+                  >
+                    {scopeBusy ? "应用中…" : "应用"}
+                  </button>
+                </div>
+                <textarea
+                  value={scopeDraft}
+                  onChange={(e) => {
+                    setScopeDraft(e.target.value);
+                    if (scopeError) setScopeError("");
+                  }}
+                  rows={4}
+                  spellCheck={false}
+                  placeholder={"192.168.1.0/24\n10.0.0.5\n10.0.0.10-10.0.0.20"}
+                  className="w-full resize-y rounded-lg border border-border bg-panel px-2 py-1.5 font-mono text-xs text-fg outline-none focus:border-primary"
+                />
+                {scopeError && <p className="text-xs text-destructive">{scopeError}</p>}
+                <p className="text-xs text-muted-foreground">
+                  每行一条:单 IP / CIDR / 起-止区间。只与范围内的主机互相发现、连接;范围外主机
+                  完全看不到本机(即时生效)。未被整段覆盖的网卡改为逐台单播宣告(每网卡最多 1024 台)。
+                </p>
+              </div>
             </>
           )}
 
