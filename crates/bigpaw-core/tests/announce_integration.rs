@@ -95,3 +95,45 @@ fn poke_wakes_peer_via_unicast_announcement() {
         "b 应通过单播 poke 收到 a 的宣告"
     );
 }
+
+/// 网络范围限定(严格隐身):A 的允许范围不含本机任何地址 → A 不向本机子网
+/// 广播/组播(计划为 Silent/Unicast 到范围内主机),也不回应 B 的宣告;B 因此
+/// 在整个观察窗口内看不到 A。B 不限制,仍照常宣告——但 A 的接收侧按范围
+/// 过滤,同样看不到 B。
+#[test]
+#[ignore = "需要支持组播/广播的网络接口"]
+fn scoped_instance_is_invisible_to_out_of_scope_peer() {
+    let da = tempfile::tempdir().unwrap();
+    let db = tempfile::tempdir().unwrap();
+    let ida = Identity::load_or_create(da.path()).unwrap();
+    let idb = Identity::load_or_create(db.path()).unwrap();
+    let (txa, rxa) = std::sync::mpsc::channel();
+    let (txb, rxb) = std::sync::mpsc::channel();
+    let port = 24916;
+    // TEST-NET-3:不落在任何本机子网,也不是本机地址
+    let scope = std::sync::Arc::new(
+        bigpaw_core::net_scope::NetScope::parse(&["203.0.113.7".to_string()]).unwrap(),
+    );
+    let _a = AnnounceService::start(
+        &ida,
+        "alice",
+        None,
+        24917,
+        port,
+        txa,
+        InterfaceRegistry::new_with_scope(vec![], scope).subscribe(),
+    )
+    .unwrap();
+    let _b = AnnounceService::start(
+        &idb,
+        "bob",
+        None,
+        24918,
+        port,
+        txb,
+        InterfaceRegistry::new(vec![]).subscribe(),
+    )
+    .unwrap();
+    assert!(!wait_seen(&rxb, &ida.fingerprint, 12), "B 不该看到限定范围外的 A");
+    assert!(!wait_seen(&rxa, &idb.fingerprint, 3), "A 的接收侧应过滤掉范围外的 B");
+}

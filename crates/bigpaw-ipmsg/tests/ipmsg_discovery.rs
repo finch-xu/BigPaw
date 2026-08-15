@@ -79,3 +79,36 @@ fn two_ipmsg_instances_exchange_text() {
 
     let _ = b;
 }
+
+/// 网络范围限定:A 的 PeerFilter 拒绝一切来源 → A 收到 B 的 BR_ENTRY 既不回
+/// ANSENTRY 也不上报 Online;B 收不到 A 的回应(A 自己的 BR_ENTRY 广播目标表为
+/// 空,也不主动宣告),整个观察窗口内双方互不可见。
+#[test]
+#[ignore = "需要真实网络接口且同机双绑 2425"]
+fn filtered_instance_neither_replies_nor_reports() {
+    let (txa, rxa) = std::sync::mpsc::channel();
+    let (txb, rxb) = std::sync::mpsc::channel();
+    let deny_all: bigpaw_ipmsg::discovery::PeerFilter = std::sync::Arc::new(|_| false);
+    let silent_targets: bigpaw_ipmsg::discovery::BroadcastTargets =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let a = IpmsgService::start("alice", None, "HOST-A", 2425, txa, silent_targets, deny_all).unwrap();
+    let b = IpmsgService::start("bob", None, "HOST-B", 2425, txb, default_broadcast_targets(), allow_all_peers());
+    let Ok(b) = b else {
+        eprintln!("同机双绑 2425 失败,跳过");
+        a.shutdown();
+        return;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut seen_any = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(IpmsgEvent::Online { .. }) = rxa.recv_timeout(std::time::Duration::from_millis(200)) {
+            seen_any = true;
+        }
+        if let Ok(IpmsgEvent::Online { .. }) = rxb.recv_timeout(std::time::Duration::from_millis(200)) {
+            seen_any = true;
+        }
+    }
+    a.shutdown();
+    b.shutdown();
+    assert!(!seen_any, "过滤一切来源的一侧不该与对端互相上线");
+}
