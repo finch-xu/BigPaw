@@ -13,7 +13,7 @@ use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
@@ -146,10 +146,24 @@ fn interruptible_sleep(stop: &AtomicBool, dur: Duration) {
     }
 }
 
-/// 定向广播目标表:std 原语(该 crate 不依赖 bigpaw-core、无 tokio),
-/// 由调用方(bigpaw-core)按网卡排除清单填充,支持运行期热更新——
-/// `IpmsgService::start` 只持有 `Arc` 克隆,调用方改的是同一份底层 `Vec`。
+/// BR_ENTRY/BR_EXIT 目标地址表(定向广播地址,或网络范围限定下的单播主机
+/// 地址——`broadcast()` 对两者一视同仁逐个 `send_to`):std 原语(该 crate
+/// 不依赖 bigpaw-core、无 tokio),由调用方(bigpaw-core)按网卡排除清单 +
+/// 范围清单填充,支持运行期热更新——`IpmsgService::start` 只持有 `Arc`
+/// 克隆,调用方改的是同一份底层 `Vec`。
 pub type BroadcastTargets = Arc<Mutex<Vec<Ipv4Addr>>>;
+
+/// 对端来源过滤器(网络范围限定):`recv_loop` 在 decode 之后、`dispatch` 之前
+/// 对来源地址调用它,返回 false 的报文**整包丢弃**——不回 ANSENTRY、不上报
+/// 事件、不 ack;TCP GETFILEDATA 监听同样在 accept 后按对端地址过滤。以闭包
+/// 注入(而不是共享一份规则表)是因为本 crate 不依赖 bigpaw-core,而判定
+/// 规则(`NetScope`)在 core 里;闭包每次调用读调用方的最新规则,热更新免费。
+pub type PeerFilter = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// 放行一切:独立使用本 crate 或不做范围限定的调用方使用(与改造前行为一致)。
+pub fn allow_all_peers() -> PeerFilter {
+    Arc::new(|_| true)
+}
 
 /// 兜底目标表:`vec![Ipv4Addr::BROADCAST]`,即改造前的全网段广播行为。
 /// 供独立使用本 crate(不接 net_ifaces)的调用方与测试保持同机回环语义。
@@ -274,13 +288,10 @@ fn dispatch(
     let is_bigpaw = packet.extra.contains(BIGPAW_TAG);
 
     match Command(packet.command).num() {
-        // 已知局限(留 TODO,本期接受):`recv` 侧的 UDP socket 仍绑 0.0.0.0,
-        // 不区分来源网卡是否在排除清单里——`broadcast()` 的定向目标表只控制
-        // "我方主动广播发给谁",不控制"谁发来的 BR_ENTRY 我方会回应"。所以
-        // 被排除网段的对端若仍能把 BR_ENTRY 发到本机(例如同网段内广播),
-        // 这里依旧会单播回 ANSENTRY——即被排除网段对端的“看见我方”这半边
-        // 无法通过本任务的定向广播完全消除。真正做到双向隔离需要 recv 侧也
-        // 按来源网卡过滤,留给后续任务(不在 Step 4 范围)。
+        // 来源过滤不在这里做:`recv_loop` 在调用 `dispatch` 之前已经按
+        // `PeerFilter`(网络范围限定)整包丢弃了范围外来源,所以走到这里的
+        // BR_ENTRY 都是允许回应的——范围外对端"看见我方"这半边由那道预过滤
+        // 堵住,`dispatch` 保持纯函数、不感知过滤规则。
         command::BR_ENTRY => {
             let reply = Packet {
                 version: IPMSG_VERSION.to_string(),
@@ -362,6 +373,7 @@ fn recv_loop(
     tx: Sender<IpmsgEvent>,
     self_token: Arc<String>,
     pending_acks: Arc<Mutex<HashMap<u32, Instant>>>,
+    peer_filter: PeerFilter,
 ) {
     let mut buf = [0u8; RECV_BUF_SIZE];
     loop {
@@ -388,6 +400,9 @@ fn recv_loop(
         let Some(packet) = proto::decode(&buf[..n]) else {
             continue; // decode None → 丢弃
         };
+        if !peer_filter(src.ip()) {
+            continue; // 范围外来源:整包丢弃,不回应、不上报(严格隐身)
+        }
 
         let n = nick.lock().unwrap().clone();
         let g = group.lock().unwrap().clone();
@@ -499,6 +514,10 @@ impl IpmsgService {
     /// `targets`:BR_ENTRY/BR_EXIT 定向广播的目标地址表(必须启动时传入——
     /// `send_loop` 起来就发第一条 BR_ENTRY)。独立使用本 crate 或不关心网卡
     /// 排除的调用方可传 `default_broadcast_targets()` 保持全网段广播行为。
+    ///
+    /// `peer_filter`:来源过滤器(网络范围限定),同样必须启动时传入——recv
+    /// 线程起来就可能收到 BR_ENTRY,事后注入会留下一个可回 ANSENTRY 的窗口。
+    /// 不限定时传 `allow_all_peers()`。
     pub fn start(
         nick: &str,
         group: Option<&str>,
@@ -506,6 +525,7 @@ impl IpmsgService {
         port: u16,
         tx: Sender<IpmsgEvent>,
         targets: BroadcastTargets,
+        peer_filter: PeerFilter,
     ) -> Result<IpmsgService, IpmsgError> {
         let socket = Arc::new(bind_socket(port)?);
         let stop = Arc::new(AtomicBool::new(false));
@@ -523,8 +543,9 @@ impl IpmsgService {
             Ok(listener) => {
                 let stop = Arc::clone(&stop);
                 let offered = Arc::clone(&offered_files);
+                let filter = Arc::clone(&peer_filter);
                 Some(std::thread::spawn(move || {
-                    filexfer::tcp_serve_loop(listener, stop, offered)
+                    filexfer::tcp_serve_loop(listener, stop, offered, filter)
                 }))
             }
             Err(e) => {
@@ -558,6 +579,7 @@ impl IpmsgService {
             let host = host.to_string();
             let self_token = Arc::clone(&self_token);
             let pending_acks = Arc::clone(&pending_acks);
+            let peer_filter = Arc::clone(&peer_filter);
             std::thread::spawn(move || {
                 recv_loop(
                     socket,
@@ -569,6 +591,7 @@ impl IpmsgService {
                     tx,
                     self_token,
                     pending_acks,
+                    peer_filter,
                 )
             })
         };
@@ -1308,7 +1331,7 @@ mod tests {
 
         let (tx, _rx) = std::sync::mpsc::channel();
         let result =
-            IpmsgService::start("me", None, "HOST-ME", TEST_PORT, tx, default_broadcast_targets());
+            IpmsgService::start("me", None, "HOST-ME", TEST_PORT, tx, default_broadcast_targets(), allow_all_peers());
         drop(guard);
 
         match result {
@@ -1363,7 +1386,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let empty_targets: BroadcastTargets = Arc::new(Mutex::new(Vec::new())); // 不广播
-        let svc = IpmsgService::start("旧名", None, "HOST-X", port, tx, empty_targets).unwrap();
+        let svc = IpmsgService::start("旧名", None, "HOST-X", port, tx, empty_targets, allow_all_peers()).unwrap();
 
         svc.set_nick("新名");
 
@@ -1380,5 +1403,53 @@ mod tests {
             "set_nick 后单播报文的 sender 必须是新昵称"
         );
         svc.shutdown();
+    }
+
+    /// 起一个绑 127.0.0.1 临时端口的服务,把 BR_ENTRY 打给它,返回
+    /// (是否收到 ANSENTRY 回应, 是否上报 Online)。`filter` 决定来源是否被放行。
+    fn probe_br_entry_with_filter(filter: PeerFilter) -> (bool, bool) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let empty_targets: BroadcastTargets = Arc::new(Mutex::new(Vec::new()));
+        let svc =
+            IpmsgService::start("me", None, "HOST-ME", port, tx, empty_targets, filter).unwrap();
+
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
+        let entry = br_entry("远端", "HOST-PEER", "远端\0");
+        peer.send_to(&proto::encode(&entry), ("127.0.0.1", port))
+            .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let replied = match peer.recv_from(&mut buf) {
+            Ok((n, _)) => proto::decode(&buf[..n])
+                .map(|p| Command(p.command).num() == command::ANSENTRY)
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        let online = matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(300)),
+            Ok(IpmsgEvent::Online { .. })
+        );
+        svc.shutdown();
+        (replied, online)
+    }
+
+    #[test]
+    fn peer_filter_rejecting_source_suppresses_reply_and_event() {
+        let deny_all: PeerFilter = Arc::new(|_| false);
+        let (replied, online) = probe_br_entry_with_filter(deny_all);
+        assert!(!replied, "范围外来源的 BR_ENTRY 不应得到 ANSENTRY(严格隐身)");
+        assert!(!online, "范围外来源不应上报 Online");
+    }
+
+    #[test]
+    fn peer_filter_allowing_source_keeps_normal_behaviour() {
+        let (replied, online) = probe_br_entry_with_filter(allow_all_peers());
+        assert!(replied, "对照组:放行来源应收到 ANSENTRY");
+        assert!(online, "对照组:放行来源应上报 Online");
     }
 }

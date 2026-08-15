@@ -2,7 +2,7 @@
 //! #[ignore](同机双绑 2425 不稳定,真实场景是两台机器/飞秋 VM,与既有
 //! `ipmsg_discovery.rs` 里的两个 ignored 集成测试同风格、同限制)。
 
-use bigpaw_ipmsg::discovery::{default_broadcast_targets, IpmsgEvent, IpmsgService};
+use bigpaw_ipmsg::discovery::{default_broadcast_targets, IpmsgEvent, IpmsgService, allow_all_peers};
 use std::io::Write;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -47,8 +47,8 @@ fn wait_file_offered(
 fn two_ipmsg_instances_transfer_single_file() {
     let (txa, rxa) = std::sync::mpsc::channel();
     let (txb, rxb) = std::sync::mpsc::channel();
-    let a = IpmsgService::start("alice", None, "HOST-A", 2425, txa, default_broadcast_targets()).unwrap();
-    let b = IpmsgService::start("bob", None, "HOST-B", 2425, txb, default_broadcast_targets());
+    let a = IpmsgService::start("alice", None, "HOST-A", 2425, txa, default_broadcast_targets(), allow_all_peers()).unwrap();
+    let b = IpmsgService::start("bob", None, "HOST-B", 2425, txb, default_broadcast_targets(), allow_all_peers());
     if b.is_err() {
         eprintln!("2425 单机双绑不支持,跳过(真实场景是两台机器)");
         return;

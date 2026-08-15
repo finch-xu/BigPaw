@@ -1,5 +1,6 @@
 use bigpaw_core::core::{Core, CoreConfig};
 use bigpaw_core::roster::Peer;
+use bigpaw_core::net_scope::NetScope;
 use bigpaw_core::settings::{self, Settings};
 use bigpaw_core::transport::manager::TransportEvent;
 use serde::Serialize;
@@ -292,9 +293,22 @@ fn set_settings(app: AppHandle, core: State<'_, AppCore>, value: Settings) -> Re
     // 顺序不可反:必须先落盘成功,再让 Core 热生效——落盘失败时不能让运行中的
     // announce/transport/ipmsg/mdns 用上一份还未持久化的设置,否则重启后状态
     // 又会回退,造成"热生效了但重启就丢"的不一致。
+    // 网络范围限定:落盘前做权威校验(与 Core::apply_settings 用同一个解析器),
+    // 错误文本(含行号)直接回前端展示;坏配置绝不落盘。
+    NetScope::parse(&value.allowed_networks).map_err(|e| e.to_string())?;
     settings::save(&data_dir(&app), &value).map_err(|e| e.to_string())?;
     core.0.apply_settings(&value);
     Ok(())
+}
+
+/// 校验允许网段清单(每项单 IP / CIDR / 起-止区间),成功返回归一化文本
+/// (CIDR 主机位归零后的形式),失败返回带行号的中文错误。前端实时校验用它,
+/// 保证 TS 侧不用复制一份解析规则。
+#[tauri::command]
+fn validate_allowed_networks(lines: Vec<String>) -> Result<Vec<String>, String> {
+    NetScope::parse(&lines)
+        .map(|scope| scope.entries().iter().map(|e| e.canonical()).collect())
+        .map_err(|e| e.to_string())
 }
 
 /// 网卡视图 DTO:字段与 `bigpaw_core::net_ifaces::IfaceView` 一一对应,camelCase
@@ -518,7 +532,8 @@ pub fn run() {
             clear_history,
             get_settings,
             set_settings,
-            list_network_interfaces
+            list_network_interfaces,
+            validate_allowed_networks
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

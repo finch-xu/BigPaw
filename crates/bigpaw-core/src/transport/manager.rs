@@ -20,6 +20,7 @@
 
 use crate::identity::Identity;
 use crate::net_ifaces::{self, IfaceSnapshot};
+use crate::net_scope::NetScope;
 use crate::transport::filexfer;
 use crate::transport::proto::{self, Msg};
 use crate::transport::tls;
@@ -50,6 +51,8 @@ pub enum TransportError {
     Rustls(#[from] rustls::Error),
     #[error("对端无可用地址")]
     NoAddress,
+    #[error("对端地址不在允许的网络范围内")]
+    ScopeDenied,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +209,14 @@ impl TransportManager {
                     break;
                 };
                 let Ok(tcp) = stream else { continue };
+                // 网络范围限定:在登记/起线程/TLS 之前按对端地址准入,范围外
+                // 直接关闭——对端连 TLS 握手都进不来(严格隐身)。
+                if let Ok(peer) = tcp.peer_addr() {
+                    if !mgr.current_scope().allows(peer.ip()) {
+                        let _ = tcp.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                }
                 let cfg = server_cfg.clone();
                 let events = mgr.events.clone();
                 let conn_id = mgr.next_conn_id.fetch_add(1, Ordering::Relaxed);
@@ -299,6 +310,49 @@ impl TransportManager {
             net_ifaces::sort_by_affinity(&mut sorted, &snapshot.entries);
         }
         sorted
+    }
+
+    /// 当前生效的对端地址允许范围(网络范围限定)。未 `set_iface_rx` 时视为
+    /// 不限制。锁只覆盖 borrow+clone(Arc),不跨 IO。
+    fn current_scope(&self) -> Arc<NetScope> {
+        let guard = self.ifaces.lock().expect("ifaces lock");
+        guard
+            .as_ref()
+            .map(|rx| rx.borrow().scope.clone())
+            .unwrap_or_default()
+    }
+
+    /// 范围热生效后切断已建立的越界连接:出站缓存(`outbound`)与入站
+    /// (`inbound_socks`)里对端地址不在 `scope` 内的连接一律 `shutdown` 并
+    /// 移除。锁内只做非阻塞的 shutdown/remove(锁纪律),对端会在下次读写时
+    /// 发现断连——重拨会被本端 accept 层拒绝、本端重拨会被 `connect_and_send`
+    /// 的过滤挡住。
+    pub fn enforce_scope(&self, scope: &NetScope) {
+        {
+            let mut cache = self.outbound.lock().expect("outbound lock");
+            cache.retain(|_, conn| {
+                let keep = conn
+                    .sock
+                    .peer_addr()
+                    .map(|a| scope.allows(a.ip()))
+                    .unwrap_or(false);
+                if !keep {
+                    let _ = conn.sock.shutdown(Shutdown::Both);
+                }
+                keep
+            });
+        }
+        let mut inbound = self.inbound_socks.lock().expect("inbound lock");
+        inbound.retain(|_, sock| {
+            let keep = sock
+                .peer_addr()
+                .map(|a| scope.allows(a.ip()))
+                .unwrap_or(false);
+            if !keep {
+                let _ = sock.shutdown(Shutdown::Both);
+            }
+            keep
+        });
     }
 
     /// 服务端连接的读循环。M2 简化决策:出站连接只写不回读(对端回话走它自己
@@ -487,7 +541,14 @@ impl TransportManager {
         let cfg = tls::client_config(&self.identity, peer_fp)?;
         // 拨号亲和排序(Step 6):锁只覆盖 borrow+clone(见 `affinity_sorted_addrs`
         // 注释),排好序的是这里新拷贝出的地址表,不影响调用方持有的原始切片。
-        let sorted_addrs = self.affinity_sorted_addrs(addrs);
+        let mut sorted_addrs = self.affinity_sorted_addrs(addrs);
+        // 网络范围限定:范围外地址不拨号(手填/历史/发现来的地址一视同仁);
+        // 全部越界则明确报 ScopeDenied,而不是伪装成连接失败。
+        let scope = self.current_scope();
+        sorted_addrs.retain(|ip| scope.allows(*ip));
+        if sorted_addrs.is_empty() && !addrs.is_empty() {
+            return Err(TransportError::ScopeDenied);
+        }
         let mut last: Option<io::Error> = None;
         for ip in &sorted_addrs {
             let sa = SocketAddr::new(*ip, port);
@@ -957,6 +1018,90 @@ mod tests {
         }
     }
 
+    // ---------- 网络范围限定:accept / dial / enforce_scope ----------
+
+    fn scoped_rx(v: &[&str]) -> watch::Receiver<IfaceSnapshot> {
+        let scope = Arc::new(
+            crate::net_scope::NetScope::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .unwrap(),
+        );
+        let (tx, rx) = watch::channel(IfaceSnapshot::with_plans(1, vec![], scope));
+        std::mem::forget(tx); // 让 Sender 活到进程退出,Receiver 才能一直 borrow
+        rx
+    }
+
+    #[test]
+    fn dial_is_scope_denied_when_every_addr_is_outside_scope() {
+        let mgr = test_manager();
+        mgr.set_iface_rx(scoped_rx(&["10.9.9.9"]));
+        match mgr.dial(&"c".repeat(64), &[IpAddr::V4(Ipv4Addr::LOCALHOST)], 1) {
+            Err(TransportError::ScopeDenied) => {}
+            Err(other) => panic!("期望 ScopeDenied,得到 {other:?}"),
+            Ok(_) => panic!("范围外地址不该尝试拨号"),
+        }
+    }
+
+    /// 连到 mgr 的监听端口后立刻 read:被拒 → 服务端 shutdown,读到 EOF/错误;
+    /// 放行 → 服务端在等 TLS 首帧(10s 握手超时),客户端 read 在 500ms 内超时。
+    fn accept_probe(mgr: &TransportManager) -> io::Result<usize> {
+        let mut c = TcpStream::connect(("127.0.0.1", mgr.port())).unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let mut buf = [0u8; 8];
+        io::Read::read(&mut c, &mut buf)
+    }
+
+    #[test]
+    fn accept_drops_peers_outside_scope() {
+        let mgr = test_manager();
+        mgr.set_iface_rx(scoped_rx(&["10.9.9.9"]));
+        let out = accept_probe(&mgr);
+        assert!(
+            matches!(out, Ok(0)) || matches!(out, Err(ref e) if e.kind() != io::ErrorKind::WouldBlock && e.kind() != io::ErrorKind::TimedOut),
+            "范围外对端应被立即关闭,得到 {out:?}"
+        );
+        assert!(mgr.inbound_socks.lock().unwrap().is_empty(), "被拒连接不应登记");
+    }
+
+    #[test]
+    fn accept_keeps_peers_inside_scope() {
+        let mgr = test_manager();
+        mgr.set_iface_rx(scoped_rx(&["127.0.0.1"]));
+        let out = accept_probe(&mgr);
+        assert!(
+            matches!(out, Err(ref e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut),
+            "对照组:范围内对端应保持连接等待首帧,得到 {out:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_scope_closes_cached_outbound_and_inbound_connections() {
+        let (mut ma, mut mb) = (None, None);
+        for slot in [&mut ma, &mut mb] {
+            let dir = tempfile::tempdir().unwrap();
+            let identity = Arc::new(Identity::load_or_create(dir.path()).unwrap());
+            let (tx, rx) = mpsc::channel();
+            *slot = Some((TransportManager::start(identity.clone(), 0, tx).unwrap(), identity, rx));
+        }
+        let (ma, ida, _rxa) = ma.unwrap();
+        let (mb, idb, rxb) = mb.unwrap();
+        ma.send_text(&idb.fingerprint, &[IpAddr::V4(Ipv4Addr::LOCALHOST)], mb.port(), "hi")
+            .unwrap();
+        // 等 B 收到,确保 B 侧 inbound 已登记
+        assert!(matches!(
+            rxb.recv_timeout(Duration::from_secs(5)),
+            Ok(TransportEvent::Message(_))
+        ));
+        assert_eq!(ma.outbound.lock().unwrap().len(), 1);
+        assert!(!mb.inbound_socks.lock().unwrap().is_empty());
+
+        let deny = crate::net_scope::NetScope::parse(&["10.9.9.9".to_string()]).unwrap();
+        ma.enforce_scope(&deny);
+        mb.enforce_scope(&deny);
+        assert!(ma.outbound.lock().unwrap().is_empty(), "越界的出站缓存连接应被切断移除");
+        assert!(mb.inbound_socks.lock().unwrap().is_empty(), "越界的入站连接应被切断移除");
+        let _ = ida;
+    }
+
     #[test]
     fn affinity_sorted_addrs_unchanged_when_no_receiver_set() {
         let mgr = test_manager();
@@ -992,6 +1137,7 @@ mod tests {
         let (_tx, rx) = watch::channel(IfaceSnapshot {
             generation: 1,
             entries,
+            ..Default::default()
         });
         mgr.set_iface_rx(rx);
 
@@ -1035,6 +1181,7 @@ mod tests {
                 Ipv4Addr::new(192, 168, 1, 10),
                 Ipv4Addr::new(255, 255, 255, 0),
             )],
+            ..Default::default()
         })
         .unwrap();
         let sorted = mgr.affinity_sorted_addrs(&addrs);

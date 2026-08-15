@@ -234,16 +234,31 @@ pub fn serve_getfiledata_request(
 
 /// TCP 监听主循环:accept 一条连接就起一个短生命周期线程处理,非阻塞 accept +
 /// 轮询停止标志(与 discovery.rs 里 UDP recv_loop 的中断式设计一致)。
-pub fn tcp_serve_loop(listener: TcpListener, stop: Arc<AtomicBool>, offered: OfferedFiles) {
+///
+/// `peer_filter`(网络范围限定):accept 后先按对端地址过滤,范围外的连接直接
+/// 丢弃(drop 即关闭),不读请求、不回数据。
+pub fn tcp_serve_loop(
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    offered: OfferedFiles,
+    peer_filter: crate::discovery::PeerFilter,
+) {
     let _ = listener.set_nonblocking(true);
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         match listener.accept() {
+            Ok((_stream, peer)) if !peer_filter(peer.ip()) => {
+                // 范围外对端:drop 关闭连接。
+            }
             Ok((mut stream, _peer)) => {
                 let offered = Arc::clone(&offered);
                 std::thread::spawn(move || {
+                    // BSD/macOS 上 accept 出的 socket 会继承监听 socket 的非阻塞
+                    // 标志,首次 read 立刻 WouldBlock 就把连接关了(对端请求稍晚
+                    // 到达即失败)。显式切回阻塞,让下面的 10s 读超时真正生效。
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
                     let _ = serve_getfiledata_request(&mut stream, &offered);
                 });
@@ -464,6 +479,48 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::net::{TcpListener, TcpStream};
+
+    // ---- TCP 监听的来源过滤(网络范围限定) ----
+
+    /// 起 tcp_serve_loop,用给定过滤器;客户端连上后立即 read:
+    /// 被拒绝 → 服务端 drop,客户端读到 EOF(Ok(0));
+    /// 被放行 → 服务端在等请求(10s 读超时),客户端 read 在 500ms 内超时。
+    fn accept_outcome(filter: crate::discovery::PeerFilter) -> std::io::Result<usize> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || tcp_serve_loop(listener, stop, new_offered_files(), filter))
+        };
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let outcome = std::io::Read::read(&mut client, &mut buf);
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        outcome
+    }
+
+    #[test]
+    fn tcp_serve_loop_drops_connections_from_filtered_peers() {
+        let deny_all: crate::discovery::PeerFilter = Arc::new(|_| false);
+        assert!(
+            matches!(accept_outcome(deny_all), Ok(0)),
+            "范围外对端的连接应被立即关闭(读到 EOF)"
+        );
+    }
+
+    #[test]
+    fn tcp_serve_loop_keeps_allowed_connections_open() {
+        let out = accept_outcome(crate::discovery::allow_all_peers());
+        assert!(
+            matches!(out, Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+            "对照组:放行的连接应保持打开等待请求,得到 {out:?}"
+        );
+    }
 
     // ---- 文件清单编解码 ----
 

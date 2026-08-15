@@ -13,6 +13,9 @@ pub struct Settings {
     pub download_dir: Option<String>,
     pub ipmsg_enabled: bool,
     pub excluded_interfaces: Vec<String>,
+    /// 允许的对端地址范围清单(网络范围限定):每项为单 IP / CIDR / 起-止
+    /// 区间文本,由 `net_scope::NetScope::parse` 解析;空 = 不限制。
+    pub allowed_networks: Vec<String>,
 }
 
 impl Default for Settings {
@@ -23,6 +26,7 @@ impl Default for Settings {
             download_dir: None,
             ipmsg_enabled: true, // 与 M5 现状一致:默认尝试启用兼容层
             excluded_interfaces: Vec::new(),
+            allowed_networks: Vec::new(),
         }
     }
 }
@@ -61,6 +65,7 @@ mod tests {
             download_dir: Some("/tmp/dl".to_string()),
             ipmsg_enabled: false,
             excluded_interfaces: Vec::new(),
+            allowed_networks: Vec::new(),
         };
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()), s);
@@ -82,6 +87,7 @@ mod tests {
             download_dir: Some("/tmp/dl".to_string()),
             ipmsg_enabled: false,
             excluded_interfaces: vec!["eth0".to_string(), "wlan0".to_string()],
+            allowed_networks: Vec::new(),
         };
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()), s);
@@ -99,6 +105,23 @@ mod tests {
         // 旧配置无 group 字段 → None
         let old: Settings = serde_json::from_str(r#"{"nickname":"旧"}"#).unwrap();
         assert_eq!(old.group, None);
+    }
+
+    #[test]
+    fn allowed_networks_roundtrip_and_old_json_compat() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings {
+            allowed_networks: vec!["192.168.1.0/24".to_string(), "10.0.0.5".to_string()],
+            ..Settings::default()
+        };
+        save(dir.path(), &s).unwrap();
+        assert_eq!(load(dir.path()).allowed_networks, s.allowed_networks);
+        // 旧配置无 allowedNetworks 字段 → 空清单(不限制)
+        let old: Settings = serde_json::from_str(r#"{"nickname":"旧"}"#).unwrap();
+        assert!(old.allowed_networks.is_empty());
+        // 序列化键名为 camelCase
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"allowedNetworks\""));
     }
 
     #[test]

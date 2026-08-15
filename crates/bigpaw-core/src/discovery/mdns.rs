@@ -11,8 +11,12 @@
 //!   重新枚举出同名接口),不需要我们在热插拔时重新提交;
 //! - daemon 内部每 5s 自查一次 IP 变化,热插拔场景本身也不需要我们管;
 //! - selection 列表是**追加式**的(`apply_intf_selections`),重复提交同一
-//!   个名字会无界增长,所以调用方(`Core::start`/未来 Step 7 的设置变更
-//!   路径)必须只在清单**真的变了**的时候调用 `apply_exclusions`。
+//!   个名字会无界增长,所以 `set_disabled_interfaces` 内部按 `applied_disabled`
+//!   做 diff,只在集合**真的变了**时才提交——调用方(`Core::start`、
+//!   `apply_settings`、roster 线程的定期刷新)可以幂等地重复调用。
+//! - 期望禁用集合 = 用户排除清单 ∪ 网络范围限定下"未被整段覆盖"的网卡
+//!   (严格隐身:该网卡不再做 mDNS 宣告/浏览,改由 UDP 单播宣告承担发现),
+//!   由 `net_ifaces::desired_mdns_disabled` 计算,本模块只管提交。
 //!
 //! 已确认的坑:`disable_interface` 只摘除该网卡对应的 socket/收包缓存,
 //! **不清理 `enable_addr_auto` 服务在 A 记录里已缓存的旧 IP**(源码
@@ -48,6 +52,9 @@ pub struct Discovery {
     instance: String,
     /// 主机名(`{instance}.local.`),ServiceInfo 的 host 参数。
     host: String,
+    /// 已提交给 daemon 的禁用网卡名集合(排序去重),`set_disabled_interfaces`
+    /// 据此做 diff,保证 selection 只在真变化时追加。
+    applied_disabled: Vec<String>,
 }
 
 /// 由重建参数构建一份新的 `ServiceInfo`。抽出来是因为初次注册(`start`)与
@@ -178,40 +185,43 @@ impl Discovery {
             port,
             instance,
             host,
+            applied_disabled: Vec::new(),
         })
     }
 
-    /// 提交一次排除清单变更(设计文档:网卡选择,Step 5)。调用方约定:只在
-    /// 清单**真的变了**时调用——见文件头注释,selection 列表是追加式的,
-    /// 重复提交同名会无界增长。`prev` 为空清单代表"首次提交"(`Core::start`
-    /// 里 mdns 起来后立即调用一次)。
-    ///
-    /// 步骤:
-    /// 1. `exclusion_diff` 算出新排除/重新放行的网卡名(纯函数,见下方单测);
-    /// 2. 无变化直接返回,不碰 daemon;
-    /// 3. 有变化则分别调 `disable_interface`/`enable_interface`(按名字
-    ///    selection,对未来同名网卡持久生效,热插拔由 daemon 自查,不需要
-    ///    我们管);
-    /// 4. 再 `re_register` 一次:disable 不清 addr_auto 服务 A 记录里的旧
-    ///    IP(文件头坑位),必须靠重建 ServiceInfo 才能让残留 IP 消失。
-    pub fn apply_exclusions(
-        &mut self,
-        excluded: &[String],
-        prev: &[String],
-    ) -> Result<(), mdns_sd::Error> {
-        let (newly_excluded, re_enabled) = exclusion_diff(prev, excluded);
-        if newly_excluded.is_empty() && re_enabled.is_empty() {
-            return Ok(());
+    /// 提交"期望禁用的网卡名集合"(设计文档:网卡选择 Step 5 + 网络范围限定)。
+    /// 幂等:内部用 `exclusion_diff(&self.applied_disabled, desired)` 算增量,
+    /// 无变化直接返回 `Ok(false)`、不碰 daemon(见文件头注释,selection
+    /// 是追加式的);有变化则:
+    /// 1. 分别 `disable_interface`/`enable_interface`(按名字 selection,对
+    ///    未来同名网卡持久生效,热插拔由 daemon 自查,不需要我们管);
+    /// 2. 再 `re_register` 一次:disable 不清 addr_auto 服务 A 记录里的旧
+    ///    IP(文件头坑位),必须靠重建 ServiceInfo 才能让残留 IP 消失;
+    /// 3. 记录新的已提交集合,返回 `Ok(true)`。
+    pub fn set_disabled_interfaces(&mut self, desired: &[String]) -> Result<bool, mdns_sd::Error> {
+        let mut desired: Vec<String> = desired.to_vec();
+        desired.sort();
+        desired.dedup();
+        let (newly_disabled, re_enabled) = exclusion_diff(&self.applied_disabled, &desired);
+        if newly_disabled.is_empty() && re_enabled.is_empty() {
+            return Ok(false);
         }
-        if !newly_excluded.is_empty() {
-            let names: Vec<&str> = newly_excluded.iter().map(String::as_str).collect();
+        if !newly_disabled.is_empty() {
+            let names: Vec<&str> = newly_disabled.iter().map(String::as_str).collect();
             self.daemon.disable_interface(names)?;
         }
         if !re_enabled.is_empty() {
             let names: Vec<&str> = re_enabled.iter().map(String::as_str).collect();
             self.daemon.enable_interface(names)?;
         }
-        self.re_register()
+        self.re_register()?;
+        self.applied_disabled = desired;
+        Ok(true)
+    }
+
+    /// 当前已提交给 daemon 的禁用集合(排序去重)。
+    pub fn applied_disabled(&self) -> &[String] {
+        &self.applied_disabled
     }
 
     /// 运行时改名(昵称热生效):更新自持昵称后走既有 `re_register`
@@ -316,6 +326,27 @@ mod tests {
         let (newly_excluded, re_enabled) = exclusion_diff(&prev, &[]);
         assert!(newly_excluded.is_empty());
         assert_eq!(re_enabled, vec!["eth0".to_string(), "wlan0".to_string()]);
+    }
+
+    /// `set_disabled_interfaces` 内部按 `applied_disabled` 做 diff:同一期望
+    /// 集合重复提交不再触碰 daemon(返回 false),集合变化才提交(返回 true)。
+    /// 起一个真实 daemon(不依赖组播可达性,只验证本地状态推进)。
+    #[test]
+    fn set_disabled_interfaces_is_idempotent_and_tracks_applied_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = Identity::load_or_create(dir.path()).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut d = Discovery::start(&id, "n", None, 0, tx).unwrap();
+        assert!(d.applied_disabled().is_empty());
+
+        let want = vec!["not-a-real-iface".to_string()];
+        assert!(d.set_disabled_interfaces(&want).unwrap(), "首次提交应触碰 daemon");
+        assert_eq!(d.applied_disabled(), want.as_slice());
+        assert!(!d.set_disabled_interfaces(&want).unwrap(), "同一集合重复提交应为 no-op");
+
+        assert!(d.set_disabled_interfaces(&[]).unwrap(), "清空应重新放行");
+        assert!(d.applied_disabled().is_empty());
+        d.shutdown();
     }
 
     #[test]
