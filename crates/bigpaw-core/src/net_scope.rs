@@ -237,15 +237,21 @@ impl NetScope {
             return out;
         }
         let (network, broadcast) = subnet_bounds(ip, netmask);
-        // TODO(用户实现,约 6~10 行):
-        // 1. 算出子网的"主机区间" (host_lo, host_hi):
-        //    - 常规子网:[network+1, broadcast-1](去掉网络地址与广播地址)
-        //    - /31 与 /32(broadcast - network < 2):[network, broadcast],两端都算主机
-        // 2. 对 self.merged 里每个归并区间 (s, e) 与主机区间求交集,
-        //    交集非空(max(s,host_lo) <= min(e,host_hi))则收集到 pieces
-        // 3. 调用 collect_hosts(pieces, exclude, cap, &mut out) 展开(它会跳过
-        //    exclude、按 cap 截断并置 truncated);self.merged 已有序,pieces 天然升序
-        let _ = (network, broadcast, exclude, cap);
+        // 主机区间:常规子网去掉网络地址与广播地址;/31、/32(区间宽度 < 2 个
+        // 可去除的端点)两端都算主机(RFC 3021 点对点链路)。
+        let (host_lo, host_hi) = if broadcast - network < 2 {
+            (network, broadcast)
+        } else {
+            (network + 1, broadcast - 1)
+        };
+        // 与归并区间逐一求交:merged 有序不重叠,交集自然升序、无重复。
+        let pieces: Vec<(u32, u32)> = self
+            .merged
+            .iter()
+            .map(|(s, e)| ((*s).max(host_lo), (*e).min(host_hi)))
+            .filter(|(lo, hi)| lo <= hi)
+            .collect();
+        collect_hosts(pieces, exclude, cap, &mut out);
         out
     }
 
