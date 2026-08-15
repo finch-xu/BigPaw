@@ -3,7 +3,19 @@
 //! 维护"活跃网卡快照"(`IfaceSnapshot`):枚举系统 IPv4 接口、滤 loopback、
 //! 滤用户排除清单,通过 `watch` 通道发布给 announce/mdns/ipmsg/transport 订阅。
 //! 本模块不做任何网络 IO,只做枚举 + 纯计算,保持可测试。
+//!
+//! ## 网络范围限定(允许网段清单)
+//!
+//! 快照里同时携带当前生效的 `NetScope`(对端地址允许范围)与由
+//! `entries × scope` 派生出的**发送计划** `SendPlanSet`:每个子网代表网卡
+//! 二选一——范围整段覆盖该子网 → 照常组播 + 定向广播(`Broadcast`);否则
+//! 严格隐身:不广播、关该网卡 mDNS,改为对"范围 ∩ 子网"内的主机逐台单播
+//! (`Unicast`,受 `MAX_UNICAST_HOSTS` 截断),交集为空则 `Silent`;范围中
+//! 不落在任何本机子网内的地址进入跨网段单播池 `off_link`。scope 与 entries
+//! 放同一份快照里原子发布:订阅者不会看到"新 scope + 旧 entries"的中间态,
+//! 且 scope 变化同样递增 `generation`,下游的 stale 守卫无需改动。
 
+use crate::net_scope::{NetScope, MAX_UNICAST_HOSTS};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -41,6 +53,58 @@ pub struct IfaceEntry {
 pub struct IfaceSnapshot {
     pub generation: u64,
     pub entries: Vec<IfaceEntry>,
+    /// 当前生效的对端地址允许范围(空 = 不限制)。`Arc` 让 `borrow().clone()`
+    /// 仍然廉价(announce/transport 每次发送/拨号都会 clone 快照)。
+    pub scope: Arc<NetScope>,
+    /// 由 `entries × scope` 派生的发送计划(见 `send_plans`),一次计算、
+    /// 一处日志、消费者只读。
+    pub plans: Arc<SendPlanSet>,
+}
+
+impl IfaceSnapshot {
+    /// 由条目 + 范围构造一份自洽的快照(plans 已派生)。registry 与测试共用,
+    /// 避免手写字面量时忘了让 plans 与 entries 对应。
+    pub fn with_plans(generation: u64, entries: Vec<IfaceEntry>, scope: Arc<NetScope>) -> Self {
+        let plans = Arc::new(send_plans(&entries, &scope));
+        Self {
+            generation,
+            entries,
+            scope,
+            plans,
+        }
+    }
+}
+
+/// 单个子网代表网卡的发送模式(见模块文档"网络范围限定")。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanMode {
+    /// 范围整段覆盖该子网(或不限制):组播 + 定向广播,与改造前一致。
+    Broadcast { broadcast: Ipv4Addr },
+    /// 部分覆盖:只对这些主机逐台单播,不组播不广播;`truncated` 表示达到
+    /// `MAX_UNICAST_HOSTS` 被截断(隐身优先于可发现性)。
+    Unicast { hosts: Vec<Ipv4Addr>, truncated: bool },
+    /// 范围与该子网无交集:该网卡完全静默。
+    Silent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendPlan {
+    /// 该子网的代表网卡 IP(组播出口 / 单播源),选择规则同 `send_targets`。
+    pub iface_ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub mode: PlanMode,
+}
+
+/// 一份快照对应的完整发送计划。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SendPlanSet {
+    /// 按 `iface_ip` 升序,每个子网一条(与 `send_targets` 同序)。
+    pub per_subnet: Vec<SendPlan>,
+    /// 范围内、但不落在任何本机子网内的地址(跨网段直连单播,路由可达即可)。
+    pub off_link: Vec<Ipv4Addr>,
+    pub off_link_truncated: bool,
+    /// 因过大而整体跳过的跨网段条目(canonical 文本,供日志)。
+    pub skipped_entries: Vec<String>,
 }
 
 /// UI 用的网卡视图:不滤排除项,带 excluded 标记,供设置页展示全量网卡。
@@ -57,6 +121,7 @@ pub struct IfaceView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendTarget {
     pub iface_ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
     pub broadcast: Ipv4Addr,
 }
 
@@ -150,6 +215,7 @@ pub fn send_targets(entries: &[IfaceEntry]) -> Vec<SendTarget> {
             });
             group.first().map(|rep| SendTarget {
                 iface_ip: rep.ip,
+                netmask: rep.netmask,
                 broadcast: rep.broadcast,
             })
         })
@@ -166,11 +232,145 @@ pub fn broadcast_targets(entries: &[IfaceEntry]) -> Vec<Ipv4Addr> {
         .collect()
 }
 
+/// 由活跃网卡条目 × 允许范围派生发送计划(模块文档"网络范围限定")。
+/// 不限制时每个子网都是 `Broadcast`、`off_link` 为空——与旧 `send_targets`
+/// 逐项等价(单测作为回归护栏)。单播枚举的 `exclude` 必须包含该子网组内
+/// **全部**本机 IP(不只是代表卡),否则会给自己另一张卡发宣告。
+pub fn send_plans(entries: &[IfaceEntry], scope: &NetScope) -> SendPlanSet {
+    let mut set = SendPlanSet::default();
+    let targets = send_targets(entries);
+    for t in &targets {
+        let mode = if scope.covers_subnet(t.iface_ip, t.netmask) {
+            PlanMode::Broadcast {
+                broadcast: t.broadcast,
+            }
+        } else {
+            let network = u32::from(t.iface_ip) & u32::from(t.netmask);
+            let local_ips: Vec<Ipv4Addr> = entries
+                .iter()
+                .filter(|e| {
+                    e.netmask == t.netmask && (u32::from(e.ip) & u32::from(e.netmask)) == network
+                })
+                .map(|e| e.ip)
+                .collect();
+            let hl = scope.hosts_within(t.iface_ip, t.netmask, &local_ips, MAX_UNICAST_HOSTS);
+            if hl.hosts.is_empty() {
+                PlanMode::Silent
+            } else {
+                PlanMode::Unicast {
+                    hosts: hl.hosts,
+                    truncated: hl.truncated,
+                }
+            }
+        };
+        set.per_subnet.push(SendPlan {
+            iface_ip: t.iface_ip,
+            netmask: t.netmask,
+            mode,
+        });
+    }
+    if !scope.is_unrestricted() {
+        let subnets: Vec<(Ipv4Addr, Ipv4Addr)> =
+            targets.iter().map(|t| (t.iface_ip, t.netmask)).collect();
+        let hl = scope.hosts_outside(&subnets, MAX_UNICAST_HOSTS);
+        set.off_link = hl.hosts;
+        set.off_link_truncated = hl.truncated;
+        set.skipped_entries = hl.skipped_entries;
+    }
+    set
+}
+
+/// 供 ipmsg 使用的 BR_ENTRY/BR_EXIT 目标地址表:Broadcast → 定向广播地址,
+/// Unicast → 主机地址,Silent → 无;末尾追加跨网段单播池。不限制时等于
+/// `broadcast_targets`。ipmsg 的 `broadcast()` 对广播/单播地址一视同仁逐个
+/// `send_to`,所以这张表可以直接覆写 `BroadcastTargets`。
+pub fn ipmsg_targets(plans: &SendPlanSet) -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+    for p in &plans.per_subnet {
+        match &p.mode {
+            PlanMode::Broadcast { broadcast } => out.push(*broadcast),
+            PlanMode::Unicast { hosts, .. } => out.extend(hosts.iter().copied()),
+            PlanMode::Silent => {}
+        }
+    }
+    out.extend(plans.off_link.iter().copied());
+    out
+}
+
+/// 严格隐身下应关闭 mDNS 的网卡名:该网卡名下**任一** IPv4 地址所在子网未被
+/// 范围整段覆盖即禁(同名多地址取保守)。不限制时为空。排序去重。
+pub fn mdns_disabled_names(entries: &[IfaceEntry], scope: &NetScope) -> Vec<String> {
+    if scope.is_unrestricted() {
+        return Vec::new();
+    }
+    let mut names: Vec<String> = entries
+        .iter()
+        .filter(|e| !scope.covers_subnet(e.ip, e.netmask))
+        .map(|e| e.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// mDNS 的期望禁用集合 = 用户排除清单 ∪ 范围派生的隐身网卡,排序去重。
+/// `entries` 已滤过排除清单,两集合天然不交;并集保证 `Discovery::
+/// set_disabled_interfaces` 的 diff 不会把某一方 enable 回去。
+pub fn desired_mdns_disabled(
+    excluded: &[String],
+    entries: &[IfaceEntry],
+    scope: &NetScope,
+) -> Vec<String> {
+    let mut names = mdns_disabled_names(entries, scope);
+    names.extend(excluded.iter().cloned());
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// 发送计划里的截断/跳过只在这里(计划的唯一计算点)记一次日志,消费者不再各自 log。
+fn log_plan_warnings(plans: &SendPlanSet) {
+    for p in &plans.per_subnet {
+        if let PlanMode::Unicast {
+            hosts,
+            truncated: true,
+        } = &p.mode
+        {
+            eprintln!(
+                "net_scope: 网卡 {} 的单播枚举超过上限 {},已截断为前 {} 台(隐身优先)",
+                p.iface_ip,
+                MAX_UNICAST_HOSTS,
+                hosts.len()
+            );
+        }
+    }
+    if plans.off_link_truncated {
+        eprintln!(
+            "net_scope: 跨网段单播池超过上限 {},已截断为前 {} 台",
+            MAX_UNICAST_HOSTS,
+            plans.off_link.len()
+        );
+    }
+    for e in &plans.skipped_entries {
+        eprintln!("net_scope: 条目 {e} 覆盖地址过多(> {MAX_UNICAST_HOSTS}),不做跨网段单播,仅作为过滤范围");
+    }
+}
+
 /// 活跃网卡快照的唯一真源。持有当前排除清单与 watch 发布通道,供
 /// announce/mdns/ipmsg/transport 订阅;排除清单变更后自动 refresh。
 pub struct InterfaceRegistry {
-    excluded: Mutex<Vec<String>>,
+    /// 排除清单 + 允许范围。一把锁贯穿"读 policy → 枚举 → 发布"(见 `refresh`
+    /// 文档注释里的串行化论证),`set_excluded`/`set_scope`/`set_policy`/
+    /// `refresh`/`list_all` 都只经由它。
+    policy: Mutex<Policy>,
     tx: watch::Sender<IfaceSnapshot>,
+}
+
+/// registry 持有的用户网络策略。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Policy {
+    pub excluded: Vec<String>,
+    pub scope: Arc<NetScope>,
 }
 
 impl InterfaceRegistry {
@@ -178,14 +378,18 @@ impl InterfaceRegistry {
     /// `IfaceSnapshot::default()` 的空快照比较——即使当前恰好没有物理网卡,
     /// 首个快照也代表"已完成一次真实枚举",区别于"尚未枚举")。
     pub fn new(excluded: Vec<String>) -> Arc<Self> {
+        Self::new_with_scope(excluded, Arc::new(NetScope::unrestricted()))
+    }
+
+    /// 同 `new`,但带初始允许范围(`Core::start` 从 settings 读到后使用)。
+    pub fn new_with_scope(excluded: Vec<String>, scope: Arc<NetScope>) -> Arc<Self> {
         let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
         let entries = build_entries(&ifaces, &excluded);
-        let (tx, _rx) = watch::channel(IfaceSnapshot {
-            generation: 1,
-            entries,
-        });
+        let snapshot = IfaceSnapshot::with_plans(1, entries, scope.clone());
+        log_plan_warnings(&snapshot.plans);
+        let (tx, _rx) = watch::channel(snapshot);
         Arc::new(Self {
-            excluded: Mutex::new(excluded),
+            policy: Mutex::new(Policy { excluded, scope }),
             tx,
         })
     }
@@ -215,28 +419,46 @@ impl InterfaceRegistry {
     /// 违反"设置立即生效"的预期。把整个流程串行化后,不可能出现这种
     /// 交错:谁先拿到锁,谁的读取-枚举-发布就完整跑完才轮到下一个。
     pub fn refresh(&self) -> Option<IfaceSnapshot> {
-        let excluded = self.excluded.lock().expect("excluded lock");
-        self.refresh_locked(&excluded)
+        let policy = self.policy.lock().expect("policy lock");
+        self.refresh_locked(&policy)
     }
 
-    /// `refresh` 的核心:调用方已经持有 `excluded` 锁(`refresh` 自己拿,或
-    /// `set_excluded` 在替换清单后原地继续持有),这里只管枚举 + 发布。
-    fn refresh_locked(&self, excluded: &[String]) -> Option<IfaceSnapshot> {
+    /// `refresh` 的核心:调用方已经持有 `policy` 锁(`refresh` 自己拿,或
+    /// `set_*` 在替换策略后原地继续持有),这里只管枚举 + 发布。
+    fn refresh_locked(&self, policy: &Policy) -> Option<IfaceSnapshot> {
         let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
-        let entries = build_entries(&ifaces, excluded);
-        self.apply_entries(entries)
+        let entries = build_entries(&ifaces, &policy.excluded);
+        self.apply_entries_with_scope(entries, policy.scope.clone())
     }
 
-    /// 把已构建好的条目原子对比发布进快照(不做系统枚举)。抽出这一层是为了让 diff/
-    /// 幂等逻辑可以直接喂数据测试,不必 mock `if_addrs::get_if_addrs()`。
+    /// 把已构建好的条目原子对比发布进快照(不做系统枚举),scope 沿用当前
+    /// 快照的值。抽出这一层是为了让 diff/幂等逻辑可以直接喂数据测试,不必
+    /// mock `if_addrs::get_if_addrs()`。
+    #[cfg(test)]
     fn apply_entries(&self, entries: Vec<IfaceEntry>) -> Option<IfaceSnapshot> {
+        let scope = self.tx.borrow().scope.clone();
+        self.apply_entries_with_scope(entries, scope)
+    }
+
+    /// 原子对比 `(entries, scope)` 并发布:任一变化都递增 generation 并重算
+    /// 发送计划(唯一的计划计算点,也是截断/跳过日志的唯一出口)。数据未
+    /// 变化时不触发订阅者唤醒(`send_if_modified` 语义)。
+    fn apply_entries_with_scope(
+        &self,
+        entries: Vec<IfaceEntry>,
+        scope: Arc<NetScope>,
+    ) -> Option<IfaceSnapshot> {
         let mut published = None;
         self.tx.send_if_modified(|snapshot| {
-            if snapshot.entries == entries {
+            if snapshot.entries == entries && *snapshot.scope == *scope {
                 return false;
             }
+            let plans = Arc::new(send_plans(&entries, &scope));
+            log_plan_warnings(&plans);
             snapshot.generation += 1;
             snapshot.entries = entries.clone();
+            snapshot.scope = scope.clone();
+            snapshot.plans = plans;
             published = Some(snapshot.clone());
             true
         });
@@ -251,16 +473,55 @@ impl InterfaceRegistry {
     /// 发布的快照用的就是刚刚写入的这份新清单,不会被并发的 `refresh`
     /// 用旧清单抢先或延后发布而覆盖。
     pub fn set_excluded(&self, names: Vec<String>) -> (Vec<String>, Option<IfaceSnapshot>) {
-        let mut guard = self.excluded.lock().expect("excluded lock");
-        let old = std::mem::replace(&mut *guard, names);
+        let mut guard = self.policy.lock().expect("policy lock");
+        let old = std::mem::replace(&mut guard.excluded, names);
         let new_snapshot = self.refresh_locked(&guard);
         (old, new_snapshot)
+    }
+
+    /// 更新允许范围并立即 refresh。返回 (旧范围, 若快照因此变化则为新快照)。
+    /// 锁纪律同 `set_excluded`。
+    pub fn set_scope(&self, scope: Arc<NetScope>) -> (Arc<NetScope>, Option<IfaceSnapshot>) {
+        let mut guard = self.policy.lock().expect("policy lock");
+        let old = std::mem::replace(&mut guard.scope, scope);
+        let new_snapshot = self.refresh_locked(&guard);
+        (old, new_snapshot)
+    }
+
+    /// 一次更新排除清单 + 允许范围(`apply_settings` 用,只发布一次)。
+    /// 返回 (旧策略, 若快照因此变化则为新快照)。
+    pub fn set_policy(
+        &self,
+        excluded: Vec<String>,
+        scope: Arc<NetScope>,
+    ) -> (Policy, Option<IfaceSnapshot>) {
+        let mut guard = self.policy.lock().expect("policy lock");
+        let old = std::mem::replace(&mut *guard, Policy { excluded, scope });
+        let new_snapshot = self.refresh_locked(&guard);
+        (old, new_snapshot)
+    }
+
+    /// 当前策略(克隆)。
+    pub fn policy(&self) -> Policy {
+        self.policy.lock().expect("policy lock").clone()
+    }
+
+    /// 当前生效的允许范围(取自快照,与订阅者看到的一致;不 clone entries)。
+    pub fn scope(&self) -> Arc<NetScope> {
+        self.tx.borrow().scope.clone()
+    }
+
+    /// 给定快照下 mDNS 应禁用的网卡名集合(排除清单 ∪ 范围派生),供
+    /// `Core::start`/`apply_settings`/roster 线程刷新后幂等提交给 `Discovery`。
+    pub fn mdns_disabled_for(&self, snapshot: &IfaceSnapshot) -> Vec<String> {
+        let excluded = self.policy.lock().expect("policy lock").excluded.clone();
+        desired_mdns_disabled(&excluded, &snapshot.entries, &snapshot.scope)
     }
 
     /// 列出全部网卡(不滤排除项),标注 excluded 状态,供 UI 展示设置页。
     /// 仍滤 loopback/IPv6——它们从不构成一个可选的网卡条目。
     pub fn list_all(&self) -> Vec<IfaceView> {
-        let excluded = self.excluded.lock().expect("excluded lock").clone();
+        let excluded = self.policy.lock().expect("policy lock").excluded.clone();
         let ifaces = if_addrs::get_if_addrs().unwrap_or_default();
         let mut views: Vec<IfaceView> = ifaces
             .iter()
@@ -727,6 +988,201 @@ mod tests {
         assert_eq!(old, vec!["a".to_string()]);
     }
 
+    // ---------- 网络范围限定:send_plans / ipmsg_targets / mdns 决策 ----------
+
+    fn scope(v: &[&str]) -> Arc<NetScope> {
+        Arc::new(NetScope::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap())
+    }
+    fn m24() -> Ipv4Addr {
+        v4(255, 255, 255, 0)
+    }
+
+    #[test]
+    fn send_plans_unrestricted_is_broadcast_for_every_send_target() {
+        // 回归护栏:不限制时,计划与旧 send_targets 逐项等价(全部 Broadcast,
+        // 无跨网段单播),即行为与改造前逐字节一致。
+        let entries = vec![
+            entry("bridge0", v4(192, 168, 1, 20), m24(), true),
+            entry("en0", v4(192, 168, 1, 10), m24(), false),
+            entry("en5", v4(10, 0, 0, 2), m24(), false),
+        ];
+        let plans = send_plans(&entries, &NetScope::unrestricted());
+        let targets = send_targets(&entries);
+        assert_eq!(plans.per_subnet.len(), targets.len());
+        for (plan, target) in plans.per_subnet.iter().zip(targets.iter()) {
+            assert_eq!(plan.iface_ip, target.iface_ip);
+            assert_eq!(
+                plan.mode,
+                PlanMode::Broadcast {
+                    broadcast: target.broadcast
+                }
+            );
+        }
+        assert!(plans.off_link.is_empty());
+        assert!(!plans.off_link_truncated);
+        assert!(plans.skipped_entries.is_empty());
+    }
+
+    #[test]
+    fn send_plans_covered_subnet_stays_broadcast() {
+        let entries = vec![entry("en0", v4(192, 168, 1, 10), m24(), false)];
+        let plans = send_plans(&entries, &scope(&["192.168.0.0/16"]));
+        assert_eq!(
+            plans.per_subnet[0].mode,
+            PlanMode::Broadcast {
+                broadcast: v4(192, 168, 1, 255)
+            }
+        );
+    }
+
+    #[test]
+    fn send_plans_partially_covered_subnet_unicasts_hosts_excluding_all_local_ips_of_that_subnet() {
+        // 同子网两张卡(.10 物理、.20 桥接):代表为 .10,但单播枚举要把 .20 也排除,
+        // 否则会给自己另一张卡发宣告。
+        let entries = vec![
+            entry("bridge0", v4(192, 168, 1, 20), m24(), true),
+            entry("en0", v4(192, 168, 1, 10), m24(), false),
+        ];
+        let plans = send_plans(&entries, &scope(&["192.168.1.9-192.168.1.21"]));
+        assert_eq!(plans.per_subnet.len(), 1);
+        assert_eq!(plans.per_subnet[0].iface_ip, v4(192, 168, 1, 10));
+        let expected: Vec<Ipv4Addr> = [9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21]
+            .iter()
+            .map(|d| v4(192, 168, 1, *d))
+            .collect();
+        assert_eq!(
+            plans.per_subnet[0].mode,
+            PlanMode::Unicast {
+                hosts: expected,
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn send_plans_uncovered_subnet_is_silent_and_off_link_hosts_are_collected() {
+        let entries = vec![entry("en0", v4(192, 168, 1, 10), m24(), false)];
+        // 范围完全在别的网段:本网卡静默,范围内地址进入跨网段单播池
+        let plans = send_plans(&entries, &scope(&["10.9.9.1", "10.9.9.2"]));
+        assert_eq!(plans.per_subnet[0].mode, PlanMode::Silent);
+        assert_eq!(plans.off_link, vec![v4(10, 9, 9, 1), v4(10, 9, 9, 2)]);
+    }
+
+    #[test]
+    fn send_plans_reports_skipped_oversized_off_link_entries() {
+        let entries = vec![entry("en0", v4(192, 168, 1, 10), m24(), false)];
+        let plans = send_plans(&entries, &scope(&["10.0.0.0/8", "192.168.1.0/24"]));
+        // 本地 /24 被整段覆盖 → Broadcast;10/8 太大 → 跳过并记录
+        assert!(matches!(plans.per_subnet[0].mode, PlanMode::Broadcast { .. }));
+        assert!(plans.off_link.is_empty());
+        assert_eq!(plans.skipped_entries, vec!["10.0.0.0/8".to_string()]);
+    }
+
+    #[test]
+    fn ipmsg_targets_combines_broadcast_unicast_and_off_link() {
+        let plans = SendPlanSet {
+            per_subnet: vec![
+                SendPlan {
+                    iface_ip: v4(192, 168, 1, 10),
+                    netmask: m24(),
+                    mode: PlanMode::Broadcast {
+                        broadcast: v4(192, 168, 1, 255),
+                    },
+                },
+                SendPlan {
+                    iface_ip: v4(10, 0, 0, 2),
+                    netmask: m24(),
+                    mode: PlanMode::Unicast {
+                        hosts: vec![v4(10, 0, 0, 5), v4(10, 0, 0, 6)],
+                        truncated: false,
+                    },
+                },
+                SendPlan {
+                    iface_ip: v4(172, 16, 0, 2),
+                    netmask: m24(),
+                    mode: PlanMode::Silent,
+                },
+            ],
+            off_link: vec![v4(8, 8, 8, 8)],
+            off_link_truncated: false,
+            skipped_entries: vec![],
+        };
+        assert_eq!(
+            ipmsg_targets(&plans),
+            vec![v4(192, 168, 1, 255), v4(10, 0, 0, 5), v4(10, 0, 0, 6), v4(8, 8, 8, 8)]
+        );
+    }
+
+    #[test]
+    fn ipmsg_targets_unrestricted_equals_broadcast_targets() {
+        let entries = vec![
+            entry("en0", v4(192, 168, 1, 10), m24(), false),
+            entry("en5", v4(10, 0, 0, 2), m24(), false),
+        ];
+        let plans = send_plans(&entries, &NetScope::unrestricted());
+        assert_eq!(ipmsg_targets(&plans), broadcast_targets(&entries));
+    }
+
+    #[test]
+    fn mdns_disabled_names_marks_ifaces_not_fully_covered_conservatively() {
+        // en0 有两个地址:一个被覆盖、一个没有 → 保守禁用整张卡;en1 全覆盖 → 不禁
+        let entries = vec![
+            entry("en0", v4(192, 168, 1, 10), m24(), false),
+            entry("en0", v4(10, 0, 0, 2), m24(), false),
+            entry("en1", v4(192, 168, 2, 10), m24(), false),
+        ];
+        let names = mdns_disabled_names(&entries, &scope(&["192.168.0.0/16"]));
+        assert_eq!(names, vec!["en0".to_string()]);
+        // 不限制 → 空
+        assert!(mdns_disabled_names(&entries, &NetScope::unrestricted()).is_empty());
+    }
+
+    #[test]
+    fn desired_mdns_disabled_is_sorted_union_of_excluded_and_scope_derived() {
+        let entries = vec![entry("en0", v4(192, 168, 1, 10), m24(), false)];
+        let excluded = vec!["utun9".to_string(), "en7".to_string()];
+        let names = desired_mdns_disabled(&excluded, &entries, &scope(&["10.0.0.5"]));
+        assert_eq!(
+            names,
+            vec!["en0".to_string(), "en7".to_string(), "utun9".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_scope_bumps_generation_only_when_scope_changes() {
+        let registry = InterfaceRegistry::new(vec![]);
+        let g0 = registry.snapshot().generation;
+        let s1 = scope(&["10.0.0.5"]);
+        let (old, snap) = registry.set_scope(s1.clone());
+        assert!(old.is_unrestricted());
+        let snap = snap.expect("scope 变化应发布新快照");
+        assert_eq!(snap.generation, g0 + 1);
+        assert_eq!(*snap.scope, *s1);
+        assert_eq!(*registry.scope(), *s1, "scope() 应与快照一致");
+        // 同一 scope 再设一次:无变化,不发布
+        let (_, again) = registry.set_scope(scope(&["10.0.0.5"]));
+        assert!(again.is_none());
+        assert_eq!(registry.snapshot().generation, g0 + 1);
+    }
+
+    #[test]
+    fn set_policy_reports_old_policy_and_republishes_once() {
+        let registry = InterfaceRegistry::new(vec!["a".to_string()]);
+        let (old, snap) = registry.set_policy(vec!["b".to_string()], scope(&["10.0.0.5"]));
+        assert_eq!(old.excluded, vec!["a".to_string()]);
+        assert!(old.scope.is_unrestricted());
+        assert!(snap.is_some());
+        assert_eq!(registry.policy().excluded, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn mdns_disabled_for_uses_registry_excluded_and_snapshot_scope() {
+        let registry = InterfaceRegistry::new(vec!["zz-excluded".to_string()]);
+        let snap = registry.snapshot();
+        let names = registry.mdns_disabled_for(&snap);
+        assert_eq!(names, vec!["zz-excluded".to_string()]);
+    }
+
     // ---------- 并发:refresh/set_excluded 的丢失更新竞态(Task 7 评审修复) ----------
 
     /// 结构性证明 `excluded` 锁确实贯穿"读 excluded → 枚举 → 发布"整个
@@ -748,7 +1204,7 @@ mod tests {
         // 锁后按住不放,直到测试主线程发出放行信号。
         let registry_for_holder = registry.clone();
         let holder = std::thread::spawn(move || {
-            let _guard = registry_for_holder.excluded.lock().expect("excluded lock");
+            let _guard = registry_for_holder.policy.lock().expect("policy lock");
             holding_tx.send(()).expect("通知主线程已持锁");
             unblock_rx.recv().expect("等待放行信号");
         });

@@ -356,6 +356,12 @@ impl Core {
                 IPMSG_PORT,
                 ipmsg_evt_tx,
                 ipmsg_bcast_targets.clone(),
+                // 来源过滤(网络范围限定):闭包每次读 registry 最新 scope,
+                // 热更新免费;ipmsg crate 不依赖 core,故以闭包注入而非共享类型。
+                {
+                    let registry = registry.clone();
+                    Arc::new(move |ip| registry.scope().allows(ip))
+                },
             ) {
                 Ok(svc) => (Some(Arc::new(svc)), true),
                 Err(e) => {
@@ -386,7 +392,7 @@ impl Core {
         // 清单非空时才会真正 disable + unregister/re-register;为空时是
         // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)走
         // `apply_settings`,这里只做启动时这一次。
-        discovery.apply_exclusions(&settings.excluded_interfaces, &[])?;
+        discovery.set_disabled_interfaces(&settings.excluded_interfaces)?;
 
         // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
         // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
@@ -1117,7 +1123,8 @@ impl Core {
             |new, old| {
                 let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
                 if let Some(d) = discovery.as_mut() {
-                    if let Err(e) = d.apply_exclusions(new, old) {
+                    let _ = old;
+                    if let Err(e) = d.set_disabled_interfaces(new) {
                         eprintln!("mdns: 排除清单热生效失败: {e}");
                     }
                 }
@@ -2259,6 +2266,7 @@ mod tests {
         let stale = IfaceSnapshot {
             generation: 1,
             entries: stale_entries,
+            ..Default::default()
         };
 
         // "新"快照:对应 apply_settings 里 set_excluded 排除掉 en0 之后发布的
@@ -2271,6 +2279,7 @@ mod tests {
         let fresh = IfaceSnapshot {
             generation: 2,
             entries: fresh_entries.clone(),
+            ..Default::default()
         };
 
         // 交错顺序:新的先落地(apply_settings 抢先执行完覆写),旧的因为
@@ -2300,6 +2309,7 @@ mod tests {
         guard.apply_if_newer(&IfaceSnapshot {
             generation: 1,
             entries: e1,
+            ..Default::default()
         });
 
         let e2 = vec![iface_entry(
@@ -2310,6 +2320,7 @@ mod tests {
         guard.apply_if_newer(&IfaceSnapshot {
             generation: 2,
             entries: e2.clone(),
+            ..Default::default()
         });
 
         assert_eq!(*targets.lock().unwrap(), net_ifaces::broadcast_targets(&e2));
@@ -2329,6 +2340,7 @@ mod tests {
         let snapshot = IfaceSnapshot {
             generation: 1,
             entries: entries.clone(),
+            ..Default::default()
         };
 
         guard.apply_if_newer(&snapshot);
@@ -2379,6 +2391,7 @@ mod tests {
                 guard_a.apply_if_newer(&IfaceSnapshot {
                     generation: gen,
                     entries: entries_for_gen(gen),
+                    ..Default::default()
                 });
             }
         });
@@ -2394,6 +2407,7 @@ mod tests {
                 guard_b.apply_if_newer(&IfaceSnapshot {
                     generation: gen,
                     entries: entries_for_gen(gen),
+                    ..Default::default()
                 });
             }
         });
@@ -2873,6 +2887,7 @@ mod tests {
                 download_dir: None,
                 ipmsg_enabled: true,
                 excluded_interfaces: Vec::new(),
+                allowed_networks: Vec::new(),
             },
         )
         .unwrap();
@@ -2896,6 +2911,7 @@ mod tests {
                 download_dir: None,
                 ipmsg_enabled: false,
                 excluded_interfaces: Vec::new(),
+                allowed_networks: Vec::new(),
             },
         )
         .unwrap();

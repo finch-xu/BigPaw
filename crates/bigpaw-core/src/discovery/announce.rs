@@ -7,7 +7,7 @@
 //! - 启动快速宣告(2s/4s/8s 退避)后转周期(~25s),发送批次间隔 ≥1s。
 
 use crate::identity::Identity;
-use crate::net_ifaces::{multicast_diff, send_targets, IfaceEntry, IfaceSnapshot};
+use crate::net_ifaces::{multicast_diff, IfaceEntry, IfaceSnapshot, PlanMode, SendPlanSet};
 use crate::roster::{DiscoveryEvent, Protocol};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, SockRef, Socket, Type};
@@ -184,30 +184,46 @@ fn sync_multicast(socket: &UdpSocket, joined: &mut Vec<Ipv4Addr>, entries: &[Ifa
     }
 }
 
-/// 向组播组 + 各子网定向广播地址双发同一份报文。先用 `send_targets` 做子网
-/// 去重(同一子网多张网卡只发一次,防重复宣告/防飞秋对端列表重复),对每个
-/// 目标临时借用 `socket2::SockRef` 把 `IP_MULTICAST_IF` 切到该网卡再发一次
-/// 组播(否则组播出口网卡由系统路由表决定,不一定是我们想要的那张),随后
-/// 发一次该子网的定向广播——组播+广播双通道兜底(部分交换机 IGMP snooping
-/// 会让纯组播不可达)。`IP_MULTICAST_IF` 只影响组播发送方向,不影响本 socket
-/// 的接收或 `poke` 用到的单播发送。
+/// 按发送计划(`net_ifaces::send_plans`,已含子网去重与网络范围限定的决策)
+/// 发一份报文:
+/// - `Broadcast`:临时借用 `socket2::SockRef` 把 `IP_MULTICAST_IF` 切到该网卡
+///   再发一次组播(否则组播出口网卡由系统路由表决定,不一定是我们想要的那张),
+///   随后发一次该子网的定向广播——组播+广播双通道兜底(部分交换机 IGMP
+///   snooping 会让纯组播不可达)。`IP_MULTICAST_IF` 只影响组播发送方向,不
+///   影响本 socket 的接收或 `poke` 用到的单播发送。门控范围只包住组播发送:
+///   `set_multicast_if_v4` 失败只应跳过"这张卡的组播"这一份,定向广播必须
+///   无条件照发——组播出口切换失败恰恰是广播兜底要发挥作用的场景。
+/// - `Unicast`(范围只覆盖子网一部分,严格隐身):只对范围内主机逐台单播,
+///   **不组播不广播**,范围外主机收不到任何报文。
+/// - `Silent`:该网卡一个包都不发。
+/// - 末尾对跨网段单播池 `off_link` 逐台单播(路由可达即可)。
 ///
-/// 门控范围只包住组播发送:`set_multicast_if_v4` 失败只应跳过"这张卡的组播"
-/// 这一份,定向广播必须无条件照发——组播出口切换失败(权限/平台限制等)恰恰
-/// 是广播兜底要发挥作用的场景,如果连广播也被一并跳过,这张卡就完全哑火了,
-/// 违背"组播+广播双通道兜底"的设计初衷。单个目标的失败不影响其余目标
-/// (铁律:单网卡失败不拖垮整轮)。`entries` 为空(用户排除了全部网卡)时
-/// `send_targets` 返回空列表,本函数因此静默不发——即“全网隐身”。
-fn send_dual(socket: &UdpSocket, buf: &[u8], port: u16, entries: &[IfaceEntry]) {
-    for target in send_targets(entries) {
-        if SockRef::from(socket)
-            .set_multicast_if_v4(&target.iface_ip)
-            .is_ok()
-        {
-            let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
+/// 单个目标的失败不影响其余目标(铁律:单网卡失败不拖垮整轮)。计划为空
+/// (用户排除了全部网卡)时本函数静默不发——即"全网隐身";不限制时计划
+/// 全为 `Broadcast`,行为与改造前逐字节一致。
+fn send_dual(socket: &UdpSocket, buf: &[u8], port: u16, plans: &SendPlanSet) {
+    for plan in &plans.per_subnet {
+        match &plan.mode {
+            PlanMode::Broadcast { broadcast } => {
+                if SockRef::from(socket)
+                    .set_multicast_if_v4(&plan.iface_ip)
+                    .is_ok()
+                {
+                    let _ = socket.send_to(buf, SocketAddrV4::new(MULTICAST_GROUP, port));
+                }
+                // 定向广播不依赖 IP_MULTICAST_IF,组播出口切换失败也照发。
+                let _ = socket.send_to(buf, SocketAddrV4::new(*broadcast, port));
+            }
+            PlanMode::Unicast { hosts, .. } => {
+                for host in hosts {
+                    let _ = socket.send_to(buf, SocketAddrV4::new(*host, port));
+                }
+            }
+            PlanMode::Silent => {}
         }
-        // 定向广播不依赖 IP_MULTICAST_IF,组播出口切换失败也照发。
-        let _ = socket.send_to(buf, SocketAddrV4::new(target.broadcast, port));
+    }
+    for host in &plans.off_link {
+        let _ = socket.send_to(buf, SocketAddrV4::new(*host, port));
     }
 }
 
@@ -264,7 +280,7 @@ fn sleep_and_watch_ifaces(
             }
             if send_allowed(*last_send, Instant::now()) {
                 let b = buf.lock().expect("announce_buf lock").clone();
-                send_dual(socket, &b, port, &snapshot.entries);
+                send_dual(socket, &b, port, &snapshot.plans);
                 *last_send = Instant::now();
                 pending_send = false;
             } else {
@@ -274,9 +290,9 @@ fn sleep_and_watch_ifaces(
             // 之前被限速跳过的那批补发,现在限速窗口已过去,立即补上——
             // 用当前快照(不必是触发变化那一刻的快照,`ifaces_rx.borrow()`
             // 读最新值不消费变更标记,行为等价于"发最新状态",更准确)。
-            let entries = ifaces_rx.borrow().entries.clone();
+            let plans = ifaces_rx.borrow().plans.clone();
             let b = buf.lock().expect("announce_buf lock").clone();
-            send_dual(socket, &b, port, &entries);
+            send_dual(socket, &b, port, &plans);
             *last_send = Instant::now();
             pending_send = false;
         }
@@ -300,14 +316,17 @@ fn resync_and_maybe_send(
     joined: &Mutex<Vec<Ipv4Addr>>,
     last_send: &mut Instant,
 ) {
-    let entries = ifaces_rx.borrow().entries.clone();
+    let (entries, plans) = {
+        let snap = ifaces_rx.borrow();
+        (snap.entries.clone(), snap.plans.clone())
+    };
     {
         let mut joined_guard = joined.lock().expect("joined lock");
         sync_multicast(socket, &mut joined_guard, &entries);
     }
     if send_allowed(*last_send, Instant::now()) {
         let b = buf.lock().expect("announce_buf lock").clone();
-        send_dual(socket, &b, port, &entries);
+        send_dual(socket, &b, port, &plans);
         *last_send = Instant::now();
     }
 }
@@ -391,16 +410,11 @@ fn send_loop(
 /// 保持一致,不能只堵住"我方主动说话"这一半,却留着"别人问我方就答"这一半
 /// 敞开。
 ///
-/// 已知局限(留 TODO,本期接受,与 `bigpaw_ipmsg::discovery::dispatch` 里
-/// BR_ENTRY 分支的局限完全对应,复用同一条评审结论):这里只做"全排除时
-/// 完全不回应"这个最低版本,不做按来源地址与当前网卡快照的同网段过滤——
-/// `recv_loop` 绑定的是 0.0.0.0,不区分来源网卡是否在排除清单里,发送侧的
-/// `send_dual`/`send_targets` 只控制"我方主动宣告发给谁",不控制"谁发来的
-/// 宣告我方会限速单播回应"。所以只排除了部分网卡(而非全部)时,若被排除
-/// 网段的对端仍能把宣告发到本机(例如同网段内广播),这里依旧会限速回应
-/// ——即被排除网段对端的"看见我方"这半边,在"部分排除"场景下无法通过本次
-/// 修复完全消除。真正做到双向隔离需要 `recv_loop` 也按来源地址与
-/// `ifaces_rx` 快照做同网段过滤,留给后续任务。
+/// 来源过滤(网络范围限定):解码 + 自 fp 过滤之后,按当前快照的 `scope`
+/// 判定来源地址——范围外来源**既不上报 Seen 也不回应**,连同上面的"全排除
+/// 不回应"一起构成接收侧的严格隐身;`bigpaw_ipmsg::discovery::recv_loop`
+/// 用同一语义(经 `PeerFilter`)。scope 与网卡快照在同一个 watch 里原子发布,
+/// 这里 `borrow()` 一次即可拿到一致的视图。
 fn recv_loop(
     socket: Arc<UdpSocket>,
     stop: Arc<AtomicBool>,
@@ -440,6 +454,9 @@ fn recv_loop(
         }
 
         let src_ip = src.ip();
+        if !ifaces_rx.borrow().scope.allows(src_ip) {
+            continue; // 范围外来源:不上报、不回应(严格隐身)
+        }
         let ev = DiscoveryEvent::Seen {
             fingerprint: ann.fp,
             nickname: ann.nick,
@@ -487,6 +504,9 @@ pub struct AnnounceService {
     /// 互不覆盖对方的值(M7a)。
     nick: Mutex<String>,
     group: Mutex<Option<String>>,
+    /// 网卡/范围快照订阅句柄,`poke` 用来判定目标是否在允许范围内(只
+    /// `borrow()`,不消费变更标记,不影响 send_loop 的 has_changed 语义)。
+    ifaces_rx: watch::Receiver<IfaceSnapshot>,
     send_handle: Option<JoinHandle<()>>,
     recv_handle: Option<JoinHandle<()>>,
 }
@@ -525,6 +545,7 @@ impl AnnounceService {
         // 只读 `borrow()`、从不 `borrow_and_update()`,不会影响 send_loop
         // 那边的 has_changed 语义(watch 的多订阅者互不干扰,标准用法)。
         let ifaces_rx_for_recv = ifaces_rx.clone();
+        let ifaces_rx_for_poke = ifaces_rx.clone();
 
         let send_handle = {
             let socket = Arc::clone(&socket);
@@ -547,6 +568,7 @@ impl AnnounceService {
             stop,
             socket,
             joined,
+            ifaces_rx: ifaces_rx_for_poke,
             announce_buf: buf,
             fp: identity.fingerprint.clone(),
             tport,
@@ -577,8 +599,18 @@ impl AnnounceService {
     ///
     /// 只发一个包,不在内部做节流:调用方(见 `Core::start` 的历史探测线程)
     /// 负责串行调用、每次间隔 ≥50ms,避免看起来像扫描而触发 IDS 告警。
+    ///
+    /// 网络范围限定:目标不在当前 `scope` 内时直接跳过(严格隐身——历史 IP
+    /// 表里可能残留范围外的地址,不能因为"以前认识"就单播打扰它)。
     pub fn poke(&self, ip: IpAddr) {
-        let target = SocketAddr::new(ip, DEFAULT_ANNOUNCE_PORT);
+        self.poke_to(SocketAddr::new(ip, DEFAULT_ANNOUNCE_PORT));
+    }
+
+    /// `poke` 的带端口版本(测试观测用;生产恒为 `DEFAULT_ANNOUNCE_PORT`)。
+    fn poke_to(&self, target: SocketAddr) {
+        if !self.ifaces_rx.borrow().scope.allows(target.ip()) {
+            return;
+        }
         let buf = self.announce_buf.lock().expect("announce_buf lock").clone();
         let _ = self.socket.send_to(&buf, target);
     }
@@ -621,6 +653,8 @@ impl AnnounceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net_ifaces::SendPlan;
+    use crate::net_scope::NetScope;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn ann() -> Announcement {
@@ -742,6 +776,11 @@ mod tests {
 
     // ---------- send_dual ----------
 
+    /// 不限制范围下由条目派生的发送计划(等价于旧 send_targets)。
+    fn plans_for(entries: Vec<IfaceEntry>) -> SendPlanSet {
+        crate::net_ifaces::send_plans(&entries, &NetScope::unrestricted())
+    }
+
     #[test]
     fn send_dual_with_empty_entries_sends_nothing() {
         // 全部网卡被排除(entries 为空)= “全网隐身”:send_targets 返回空
@@ -753,7 +792,7 @@ mod tests {
             .unwrap();
         let port = receiver.local_addr().unwrap().port();
 
-        send_dual(&socket, b"hello", port, &[]);
+        send_dual(&socket, b"hello", port, &plans_for(vec![]));
 
         let mut buf = [0u8; 16];
         assert!(
@@ -778,7 +817,7 @@ mod tests {
         let mut entry = test_entry(Ipv4Addr::new(203, 0, 113, 5));
         entry.broadcast = Ipv4Addr::new(127, 0, 0, 1); // 指向本测试的接收端
 
-        send_dual(&socket, b"hello", port, &[entry]);
+        send_dual(&socket, b"hello", port, &plans_for(vec![entry]));
 
         let mut buf = [0u8; 16];
         let (n, _src) = receiver
@@ -863,6 +902,7 @@ mod tests {
         let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot {
             generation: 1,
             entries: vec![],
+            ..Default::default()
         });
         let (addr, stop, handle, _ev_rx) = spawn_recv_loop(ifaces_rx);
 
@@ -891,6 +931,7 @@ mod tests {
         let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot {
             generation: 1,
             entries: vec![test_entry(Ipv4Addr::new(203, 0, 113, 5))],
+            ..Default::default()
         });
         let (addr, stop, handle, _ev_rx) = spawn_recv_loop(ifaces_rx);
 
@@ -955,10 +996,11 @@ mod tests {
         // 让 `tx` 活到进程退出——测试场景下无害。
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            let _ = tx.send(IfaceSnapshot {
-                generation: 1,
-                entries: vec![entry],
-            });
+            let _ = tx.send(IfaceSnapshot::with_plans(
+                1,
+                vec![entry],
+                Arc::new(NetScope::unrestricted()),
+            ));
             std::mem::forget(tx);
         });
 
@@ -1017,6 +1059,158 @@ mod tests {
             "即使 watch 从未变化,resync_and_maybe_send 也该无条件跑一次 \
              sync_multicast(leave 掉快照里已经不存在的陈旧 IP)"
         );
+    }
+
+    // ---------- 网络范围限定:发送计划 / 来源过滤 / poke ----------
+
+    fn scope_of(v: &[&str]) -> Arc<NetScope> {
+        Arc::new(NetScope::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap())
+    }
+
+    /// 起一个 127.0.0.1 临时端口的接收端,返回 (socket, port)。
+    fn local_receiver(timeout_ms: u64) -> (UdpSocket, u16) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(timeout_ms)))
+            .unwrap();
+        let port = receiver.local_addr().unwrap().port();
+        (receiver, port)
+    }
+
+    fn count_packets(receiver: &UdpSocket) -> usize {
+        let mut buf = [0u8; 64];
+        let mut n = 0;
+        while receiver.recv_from(&mut buf).is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn send_dual_unicast_plan_sends_one_packet_per_host() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (receiver, port) = local_receiver(200);
+        let plans = SendPlanSet {
+            per_subnet: vec![SendPlan {
+                iface_ip: Ipv4Addr::new(203, 0, 113, 5),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                // 两个"主机"都指向本机接收端 → 恰好收到 2 份
+                mode: PlanMode::Unicast {
+                    hosts: vec![Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST],
+                    truncated: false,
+                },
+            }],
+            ..Default::default()
+        };
+        send_dual(&socket, b"hi", port, &plans);
+        assert_eq!(count_packets(&receiver), 2);
+    }
+
+    #[test]
+    fn send_dual_silent_plan_sends_nothing_but_off_link_still_unicasts() {
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let (receiver, port) = local_receiver(200);
+        let plans = SendPlanSet {
+            per_subnet: vec![SendPlan {
+                iface_ip: Ipv4Addr::new(203, 0, 113, 5),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                mode: PlanMode::Silent,
+            }],
+            off_link: vec![Ipv4Addr::LOCALHOST],
+            ..Default::default()
+        };
+        send_dual(&socket, b"hi", port, &plans);
+        assert_eq!(count_packets(&receiver), 1, "Silent 不发,off_link 单播 1 份");
+    }
+
+    #[test]
+    fn recv_loop_ignores_sources_outside_scope() {
+        // 网卡非空(未全排除),但 scope 不含 127.0.0.1 → 既不上报也不回应
+        let entries = vec![test_entry(Ipv4Addr::new(203, 0, 113, 5))];
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::with_plans(
+            1,
+            entries,
+            scope_of(&["10.9.9.0/24"]),
+        ));
+        let (addr, stop, handle, ev_rx) = spawn_recv_loop(ifaces_rx);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        sender.send_to(&encode(&ann()), addr).unwrap();
+
+        let mut buf = [0u8; 512];
+        assert!(sender.recv_from(&mut buf).is_err(), "范围外来源不该得到回应");
+        assert!(
+            ev_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "范围外来源不该产生 Seen 事件"
+        );
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn recv_loop_accepts_sources_inside_scope() {
+        let entries = vec![test_entry(Ipv4Addr::new(203, 0, 113, 5))];
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::with_plans(
+            1,
+            entries,
+            scope_of(&["127.0.0.1"]),
+        ));
+        let (addr, stop, handle, ev_rx) = spawn_recv_loop(ifaces_rx);
+
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        sender.send_to(&encode(&ann()), addr).unwrap();
+
+        let mut buf = [0u8; 512];
+        assert!(sender.recv_from(&mut buf).is_ok(), "范围内来源应照常得到回应");
+        assert!(matches!(
+            ev_rx.recv_timeout(Duration::from_millis(500)),
+            Ok(DiscoveryEvent::Seen { .. })
+        ));
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn poke_skips_ips_outside_scope_and_sends_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::with_plans(
+            1,
+            vec![],
+            scope_of(&["10.9.9.9"]),
+        ));
+        let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
+        let svc = AnnounceService::start(&identity, "n", None, 4600, 0, ev_tx, ifaces_rx).unwrap();
+        let (receiver, port) = local_receiver(300);
+
+        // 目标端口固定为 DEFAULT_ANNOUNCE_PORT,这里改用带端口的内部入口便于观测
+        svc.poke_to(std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        assert_eq!(count_packets(&receiver), 0, "127.0.0.1 不在范围内,poke 应跳过");
+
+        svc.shutdown();
+    }
+
+    #[test]
+    fn poke_sends_when_ip_inside_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::identity::Identity::load_or_create(dir.path()).unwrap();
+        let (_tx, ifaces_rx) = watch::channel(IfaceSnapshot::with_plans(
+            1,
+            vec![],
+            scope_of(&["127.0.0.1"]),
+        ));
+        let (ev_tx, _ev_rx) = std::sync::mpsc::channel();
+        let svc = AnnounceService::start(&identity, "n", None, 4600, 0, ev_tx, ifaces_rx).unwrap();
+        let (receiver, port) = local_receiver(300);
+        svc.poke_to(std::net::SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        assert_eq!(count_packets(&receiver), 1);
+        svc.shutdown();
     }
 
     // ---------- set_nick:昵称热生效(Task 2) ----------

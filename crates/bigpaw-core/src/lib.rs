@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod groups;
 pub mod identity;
 pub mod net_ifaces;
+pub mod net_scope;
 pub mod roster;
 pub mod settings;
 pub mod storage;
