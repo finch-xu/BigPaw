@@ -8,6 +8,7 @@ use crate::discovery::Discovery;
 use crate::groups::{fan_out_targets, Group, GroupMember, GroupsState, InfoOutcome};
 use crate::identity::{Identity, IdentityError};
 use crate::net_ifaces::{self, IfaceEntry, IfaceSnapshot, IfaceView, InterfaceRegistry};
+use crate::net_scope::NetScope;
 use crate::roster::{DiscoveryEvent, Peer, PeerState, Protocol, Roster};
 use crate::storage::Storage;
 use crate::transport::manager::{
@@ -99,32 +100,95 @@ fn addrs_to_record(addrs: &[IpAddr], iface_entries: &[IfaceEntry]) -> Vec<IpAddr
     }
 }
 
-/// `Core::apply_settings` 的核心决策 + 副作用编排(设计文档:网卡选择,
-/// Step 7)。抽成自由函数、把"清单变了怎么通知 mdns"外置成回调,是为了让
-/// 行为测试不必起一个真实的 `Discovery`/mdns daemon 就能用合成的排除清单
-/// (包括一个测试机上必然不存在的网卡名)确定性验证下面两条关键分离逻辑:
+/// `Core::apply_settings` 的核心决策 + 副作用编排(设计文档:网卡选择
+/// Step 7 + 网络范围限定)。抽成自由函数、把"策略变了怎么通知 mdns"外置成
+/// 回调,是为了让行为测试不必起一个真实的 `Discovery`/mdns daemon 就能用
+/// 合成的排除清单/范围(包括一个测试机上必然不存在的网卡名)确定性验证下面
+/// 几条关键分离逻辑:
 ///
-/// - ipmsg 定向广播目标表只在**快照**真的变化时才覆写(`registry.set_excluded`
-///   已经用 `send_if_modified` 语义保证这一点,这里只是消费它的返回值);
-/// - mdns 排除清单则要比较**清单本身**(`old_list != excluded`),而不是看
-///   快照变没变——排除一个当前系统里根本不存在的网卡名时,快照不会变
+/// - ipmsg 目标表只在**快照**真的变化时才覆写(`registry.set_policy` 已经用
+///   `send_if_modified` 语义保证这一点,这里只是消费它的返回值);
+/// - mdns 期望禁用集合则要比较**策略本身**(`old_policy != 新策略`),而不是
+///   看快照变没变——排除一个当前系统里根本不存在的网卡名时,快照不会变
 ///   (没有任何条目因此被滤掉),但 daemon 必须记住这个名字,不然它日后
-///   插上来还是会被广播出去。
-fn apply_excluded_interfaces(
+///   插上来还是会被广播出去;范围变化同理(mdns 决策由范围派生);
+/// - 返回 `scope` 是否变化,供调用方决定是否切断越界连接 + 剔除越界对端。
+fn apply_network_policy(
     registry: &InterfaceRegistry,
     ipmsg_bcast: &IpmsgBcastGuard,
     excluded: &[String],
-    mut on_list_changed: impl FnMut(&[String], &[String]),
-) {
-    let (old_list, new_snapshot) = registry.set_excluded(excluded.to_vec());
+    scope: Arc<NetScope>,
+    mut on_mdns_desired: impl FnMut(&[String]),
+) -> bool {
+    let (old_policy, new_snapshot) = registry.set_policy(excluded.to_vec(), scope.clone());
 
     if let Some(snapshot) = &new_snapshot {
         ipmsg_bcast.apply_if_newer(snapshot);
     }
 
-    if old_list != excluded {
-        on_list_changed(excluded, &old_list);
+    let policy_changed = old_policy.excluded != excluded || *old_policy.scope != *scope;
+    if policy_changed {
+        let desired = registry.mdns_disabled_for(&registry.snapshot());
+        on_mdns_desired(&desired);
     }
+    *old_policy.scope != *scope
+}
+
+/// roster 线程定期 `refresh()` 拿到新快照后,把 mDNS 期望禁用集合同步给
+/// `Discovery`(幂等:内部按已提交集合 diff,无变化不碰 daemon)。网络范围
+/// 限定的 mdns 决策由 `entries × scope` 派生,DHCP 换子网/热插拔后必须重算,
+/// 否则新出现的未覆盖网卡会一直做 mDNS 宣告(违反严格隐身)。锁内调用是
+/// 纯内存 + fire-and-forget 的 daemon 命令投递,不做阻塞网络等待。
+fn sync_mdns_disabled(
+    discovery: &Mutex<Option<Discovery>>,
+    registry: &InterfaceRegistry,
+    snapshot: &IfaceSnapshot,
+) {
+    let desired = registry.mdns_disabled_for(snapshot);
+    let mut guard = discovery.lock().expect("discovery lock poisoned");
+    if let Some(d) = guard.as_mut() {
+        if let Err(e) = d.set_disabled_interfaces(&desired) {
+            eprintln!("mdns: 网卡禁用集合同步失败: {e}");
+        }
+    }
+}
+
+/// 网络范围限定下 roster 入口的事件过滤(纯函数,roster 线程每收到一条事件
+/// 调一次):`Seen` 只保留范围内地址,一条都不剩则**整个事件丢弃**——不进
+/// storage、不刷新 last_seen、不 apply、不探测,范围外对端对本机而言就像
+/// 从未出现过;其他变体原样放行(Lost/Registered/Unreachable 只按 fp 作用于
+/// 已在 roster 里的对端,ScopeChanged 是控制事件)。
+fn scope_filter_event(ev: DiscoveryEvent, scope: &NetScope) -> Option<DiscoveryEvent> {
+    match ev {
+        DiscoveryEvent::Seen {
+            fingerprint,
+            nickname,
+            addrs,
+            port,
+            protocol,
+            group,
+        } => {
+            let addrs: Vec<IpAddr> = addrs.into_iter().filter(|a| scope.allows(*a)).collect();
+            if addrs.is_empty() {
+                return None;
+            }
+            Some(DiscoveryEvent::Seen {
+                fingerprint,
+                nickname,
+                addrs,
+                port,
+                protocol,
+                group,
+            })
+        }
+        other => Some(other),
+    }
+}
+
+/// 范围变化后 roster 剔除判定:地址未知的(离线预热)记录保留;否则任一
+/// 地址在范围内即保留。
+fn peer_in_scope(peer: &Peer, scope: &NetScope) -> bool {
+    peer.addrs.is_empty() || peer.addrs.iter().any(|a| scope.allows(*a))
 }
 
 /// ipmsg 定向广播目标表的写入守卫(Important 1,最终评审修复;经复审指出
@@ -185,7 +249,7 @@ impl IpmsgBcastGuard {
         let mut applied = self.applied_gen.lock().expect("applied gen lock");
         if snapshot.generation > *applied {
             *self.targets.lock().expect("ipmsg bcast lock") =
-                net_ifaces::broadcast_targets(&snapshot.entries);
+                net_ifaces::ipmsg_targets(&snapshot.plans);
             *applied = snapshot.generation;
         }
     }
@@ -231,7 +295,12 @@ pub struct Core {
     group: Mutex<Option<String>>,
     roster_rx: watch::Receiver<Vec<Peer>>,
     roster_handle: Arc<Mutex<Roster>>,
-    discovery: std::sync::Mutex<Option<Discovery>>,
+    /// `Arc` 包裹是因为 roster 线程在定期 `refresh()` 后也要同步 mDNS 的
+    /// 期望禁用集合(网络范围限定:DHCP 换子网/热插拔后决策自愈)。
+    discovery: Arc<Mutex<Option<Discovery>>>,
+    /// discovery 事件通道的发送端克隆:`apply_settings` 用它投递
+    /// `DiscoveryEvent::ScopeChanged`,让 roster 线程(持有 watch_tx)剔除越界对端。
+    discovery_tx: Sender<DiscoveryEvent>,
     /// `Arc` 包裹是因为启动时的历史 IP 唤醒线程也要短暂借用它调用
     /// `poke`(见 `Core::start`);`shutdown` 时 `.take()` 拿到唯一所有权后
     /// 按值传给 `AnnounceService::shutdown`,与 `discovery` 字段同样的幂等模式。
@@ -315,7 +384,14 @@ impl Core {
         // 共用的活跃网卡快照唯一真源。建在读 settings 之后、transport 起动
         // 之前(与其它组件一样以 registry 为准起步),subscribe() 句柄随后
         // 分发给 transport/announce/ipmsg 各自的接线点。
-        let registry = InterfaceRegistry::new(settings.excluded_interfaces.clone());
+        // 网络范围限定:启动读手改过的 settings.json 用宽松解析——坏行跳过并
+        // 记日志,全坏则不限制(不做"拒绝所有",避免"看似坏掉")。
+        let (net_scope, scope_errors) = NetScope::parse_lenient(&settings.allowed_networks);
+        for e in &scope_errors {
+            eprintln!("settings: allowedNetworks 忽略坏行: {e}");
+        }
+        let registry =
+            InterfaceRegistry::new_with_scope(settings.excluded_interfaces.clone(), Arc::new(net_scope));
 
         let (msg_tx, msg_rx) = std::sync::mpsc::channel();
         // 留一份克隆给 IPMsg 兼容层的事件转发线程(见下):TextReceived/
@@ -341,7 +417,7 @@ impl Core {
         // 发送时自动感知,不需要重启服务。
         let init_snapshot = registry.snapshot();
         let ipmsg_bcast_targets: BroadcastTargets = Arc::new(Mutex::new(
-            net_ifaces::broadcast_targets(&init_snapshot.entries),
+            net_ifaces::ipmsg_targets(&init_snapshot.plans),
         ));
         let ipmsg_bcast = Arc::new(IpmsgBcastGuard::new(
             ipmsg_bcast_targets.clone(),
@@ -388,11 +464,11 @@ impl Core {
             transport.port(),
             tx.clone(),
         )?;
-        // 网卡排除清单初始提交(Step 5):prev=[] 表示"还没提交过任何清单",
-        // 清单非空时才会真正 disable + unregister/re-register;为空时是
-        // no-op,不会多余重建 mDNS 服务。热生效(设置变更时再次调用)走
-        // `apply_settings`,这里只做启动时这一次。
-        discovery.set_disabled_interfaces(&settings.excluded_interfaces)?;
+        // mDNS 期望禁用集合初始提交(Step 5 + 网络范围限定):排除清单 ∪
+        // 范围未整段覆盖的网卡。集合为空时是 no-op,不会多余重建 mDNS 服务。
+        // 热生效(设置变更/定期刷新)分别走 `apply_settings` 与 roster 线程。
+        discovery.set_disabled_interfaces(&registry.mdns_disabled_for(&registry.snapshot()))?;
+        let discovery = Arc::new(Mutex::new(Some(discovery)));
 
         // UDP 宣告辅通道(设计文档 §4):与 mDNS 共用同一个 tx,两类事件天然
         // 串行喂给下面的 roster 线程,fingerprint 去重由 Roster::apply 保证。
@@ -422,6 +498,7 @@ impl Core {
         }
 
         let mut roster_init = Roster::new(identity.fingerprint.clone());
+        let seed_scope = registry.scope();
         match storage.known_peers() {
             Ok(known) => roster_init.seed_offline(
                 known
@@ -443,6 +520,8 @@ impl Core {
                         state: PeerState::Offline,
                         group: k.group,
                     })
+                    // 网络范围限定:范围外的历史联系人不预热(不展示)
+                    .filter(|p| peer_in_scope(p, &seed_scope))
                     .collect(),
             ),
             Err(e) => eprintln!("storage: 读取已知 peer 失败(跳过预热): {e}"),
@@ -457,17 +536,8 @@ impl Core {
         // 单播宣告,串行、间隔 ≥50ms,让对方回连/回宣告,走正常发现流程
         // 重新进入 roster——不做端口扫描、不直接建连接。
         //
-        // 已知局限(留 TODO,本期接受,镜像
-        // `bigpaw_ipmsg::discovery::dispatch` 里 BR_ENTRY 分支、以及
-        // `announce::recv_loop` 的同一条局限——见后者注释):`AnnounceService::poke`
-        // 直接对给定 IP 发一份定向单播,不看当前网卡快照/排除清单——即使用户
-        // 已经把这个历史 IP 所在的网段整张网卡都排除掉("隐身"=不主动宣告),
-        // 这条唤醒线程仍会向它发一个单播包,是"隐身"语义里尚未堵上的一个
-        // 缺口。之所以本期不修:`poke` 不经过 `send_targets`/`send_dual` 的
-        // 网卡枚举路径,要按来源网卡过滤就要么给它传网卡快照做同网段判断,
-        // 要么整条唤醒线程感知 registry——影响面超出本轮 Important 2 的最低
-        // 版本(被动应答/接收侧隐身)范围,留给后续任务按来源子网过滤时一并
-        // 处理。
+        // 网络范围限定:`AnnounceService::poke` 内部按当前 scope 过滤目标——历史
+        // IP 表里可能残留范围外地址,不会因"以前认识"就单播打扰它。
         {
             let announce_for_wake = announce.clone();
             let wake_ips = history.lock().expect("history lock").ips();
@@ -490,6 +560,8 @@ impl Core {
         let storage_for_roster = storage.clone();
         let registry_for_thread = registry.clone();
         let ipmsg_bcast_for_thread = ipmsg_bcast.clone();
+        let discovery_for_thread = discovery.clone();
+        let discovery_tx = tx.clone();
         let roster_thread = std::thread::spawn(move || {
             let transport = transport_for_thread;
             // last-seen 时间戳(不进 roster,保持 roster 纯状态机):任一
@@ -506,7 +578,30 @@ impl Core {
             let mut last_iface_refresh = Instant::now();
             loop {
                 match rx.recv_timeout(ROSTER_POLL) {
+                    Ok(DiscoveryEvent::ScopeChanged) => {
+                        // 网络范围限定热生效:剔除越界对端(移除而非标离线),
+                        // 同步清 last_seen;变则推快照。地址未知的离线记录保留。
+                        let scope = registry_for_thread.scope();
+                        let mut roster = roster_for_thread.lock().expect("roster lock");
+                        let changed = roster.retain_peers(|p| peer_in_scope(p, &scope));
+                        let snapshot = roster.snapshot();
+                        drop(roster);
+                        let kept: HashSet<String> =
+                            snapshot.iter().map(|p| p.fingerprint.clone()).collect();
+                        last_seen.retain(|fp, _| kept.contains(fp));
+                        if changed && watch_tx.send(snapshot).is_err() {
+                            break;
+                        }
+                    }
                     Ok(ev) => {
+                        // 网络范围限定:入口先按 scope 过滤,范围外的 Seen 整个丢弃
+                        // (不落库、不刷新 last_seen、不 apply、不探测)。
+                        let Some(ev) = scope_filter_event(ev, &registry_for_thread.scope()) else {
+                            if roster_stop_for_thread.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            continue;
+                        };
                         if let DiscoveryEvent::Seen {
                             fingerprint,
                             nickname,
@@ -598,6 +693,7 @@ impl Core {
                                 // 发布的更新一代覆盖过,这里会被识别为 stale 而
                                 // 静默跳过,不会覆写回旧的广播目标表。
                                 ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
+                                sync_mdns_disabled(&discovery_for_thread, &registry_for_thread, &snapshot);
                             }
                         }
                     }
@@ -616,6 +712,7 @@ impl Core {
                                 // 发布的更新一代覆盖过,这里会被识别为 stale 而
                                 // 静默跳过,不会覆写回旧的广播目标表。
                                 ipmsg_bcast_for_thread.apply_if_newer(&snapshot);
+                                sync_mdns_disabled(&discovery_for_thread, &registry_for_thread, &snapshot);
                             }
                         }
                         // 未到扫描节奏就继续轮询:这个分支现在每 ROSTER_POLL
@@ -705,7 +802,8 @@ impl Core {
             group: Mutex::new(group),
             roster_rx: watch_rx,
             roster_handle,
-            discovery: std::sync::Mutex::new(Some(discovery)),
+            discovery,
+            discovery_tx,
             announce,
             transport,
             registry,
@@ -1116,20 +1214,37 @@ impl Core {
     /// 真正的网络 IO;若此刻 `discovery` 已经是 `None`(`shutdown` 之后),
     /// 静默跳过。
     pub fn apply_settings(&self, s: &crate::settings::Settings) {
-        apply_excluded_interfaces(
+        // 网络范围限定:壳层 set_settings 已做权威校验,这里理论上不会失败;
+        // 万一失败(直接调用方传了坏值)记日志并沿用当前范围,不让其他设置项
+        // 的热生效跟着失效。
+        let scope = match NetScope::parse(&s.allowed_networks) {
+            Ok(sc) => Arc::new(sc),
+            Err(e) => {
+                eprintln!("settings: allowedNetworks 无效,沿用当前范围: {e}");
+                self.registry.scope()
+            }
+        };
+        let scope_changed = apply_network_policy(
             &self.registry,
             &self.ipmsg_bcast,
             &s.excluded_interfaces,
-            |new, old| {
+            scope.clone(),
+            |desired| {
                 let mut discovery = self.discovery.lock().expect("discovery lock poisoned");
                 if let Some(d) = discovery.as_mut() {
-                    let _ = old;
-                    if let Err(e) = d.set_disabled_interfaces(new) {
-                        eprintln!("mdns: 排除清单热生效失败: {e}");
+                    if let Err(e) = d.set_disabled_interfaces(desired) {
+                        eprintln!("mdns: 网卡禁用集合热生效失败: {e}");
                     }
                 }
             },
         );
+        if scope_changed {
+            // 先切断已建立的越界连接(锁内只 shutdown,不阻塞),再让 roster
+            // 线程剔除越界对端并推快照——它读到的 registry.scope() 已是新值
+            // (set_policy 在上面已发布)。
+            self.transport.enforce_scope(&scope);
+            let _ = self.discovery_tx.send(DiscoveryEvent::ScopeChanged);
+        }
 
         // 昵称热生效:diff 归一化后的新旧值,变了才逐路通知(幂等,未变零成本)。
         let new_nick = effective_nickname(s);
@@ -2151,16 +2266,14 @@ mod tests {
         assert!(addrs_to_record(&addrs, &entries).is_empty());
     }
 
-    // ---- apply_excluded_interfaces:apply_settings 的核心决策(Step 7) ----
+    // ---- apply_network_policy:apply_settings 的核心决策(Step 7 + 网络范围限定) ----
     //
-    // 用真实 InterfaceRegistry(网卡枚举依赖真实主机,没有 mock 钩子),但
-    // mdns 一侧换成记录调用参数的 spy 闭包,不必起真实 Discovery/mdns
-    // daemon——这是"清单变化 → registry 快照变化 → ipmsg targets 被覆写"
-    // 这条编排逻辑可确定性单测的关键(与 brief 要求的"合成数据"对应:
+    // 这些测试不起真实 mdns daemon:回调用 spy 闭包顶替(见函数文档注释),
+    // 网卡快照用真实 `InterfaceRegistry`(合成的排除清单足以覆盖两条分离逻辑:
     // 一个测试机上必然不存在的网卡名,以及测试机当前真实的网卡名清单)。
 
     /// 测试用:构造一份底层目标表 + generation=0 起步的 `IpmsgBcastGuard`,
-    /// 返回两者供测试既能调用 `apply_excluded_interfaces`,又能直接读底层
+    /// 返回两者供测试既能调用 `apply_network_policy`,又能直接读底层
     /// `BroadcastTargets` 断言写入结果。
     fn new_bcast_guard() -> (BroadcastTargets, IpmsgBcastGuard) {
         let targets: BroadcastTargets = bigpaw_ipmsg::discovery::default_broadcast_targets();
@@ -2168,23 +2281,32 @@ mod tests {
         (targets, guard)
     }
 
-    #[test]
-    fn apply_excluded_interfaces_skips_mdns_callback_when_list_unchanged() {
-        let registry = InterfaceRegistry::new(vec!["already-excluded".to_string()]);
-        let (_targets, ipmsg_bcast) = new_bcast_guard();
-        let mut calls = 0;
-        apply_excluded_interfaces(
-            &registry,
-            &ipmsg_bcast,
-            &["already-excluded".to_string()],
-            |_, _| calls += 1,
-        );
-        assert_eq!(calls, 0, "清单没变不该触碰 mdns");
+    fn unrestricted() -> Arc<NetScope> {
+        Arc::new(NetScope::unrestricted())
+    }
+
+    fn scope_of(v: &[&str]) -> Arc<NetScope> {
+        Arc::new(NetScope::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap())
     }
 
     #[test]
-    fn apply_excluded_interfaces_notifies_mdns_for_nonexistent_iface_name_even_if_snapshot_unchanged(
-    ) {
+    fn apply_network_policy_skips_mdns_callback_when_policy_unchanged() {
+        let registry = InterfaceRegistry::new(vec!["already-excluded".to_string()]);
+        let (_targets, ipmsg_bcast) = new_bcast_guard();
+        let mut calls = 0;
+        let scope_changed = apply_network_policy(
+            &registry,
+            &ipmsg_bcast,
+            &["already-excluded".to_string()],
+            unrestricted(),
+            |_| calls += 1,
+        );
+        assert_eq!(calls, 0, "策略没变不该触碰 mdns");
+        assert!(!scope_changed);
+    }
+
+    #[test]
+    fn apply_network_policy_notifies_mdns_for_nonexistent_iface_name_even_if_snapshot_unchanged() {
         // 关键分离逻辑:排除一个当前系统里根本不存在的网卡名——快照不会
         // 变(没有任何条目因此被滤掉),但 daemon 必须记住这个名字(不然它
         // 日后插上来还是会被广播出去),所以 mdns 回调仍然必须被调用。
@@ -2194,17 +2316,16 @@ mod tests {
         let before_bcast = targets.lock().unwrap().clone();
 
         let fake_name = "definitely-not-a-real-iface-zzz".to_string();
-        let mut calls: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-        apply_excluded_interfaces(
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        apply_network_policy(
             &registry,
             &ipmsg_bcast,
             std::slice::from_ref(&fake_name),
-            |new, old| {
-                calls.push((new.to_vec(), old.to_vec()));
-            },
+            unrestricted(),
+            |desired| calls.push(desired.to_vec()),
         );
 
-        assert_eq!(calls, vec![(vec![fake_name], vec![])], "清单变了必须通知 mdns");
+        assert_eq!(calls, vec![vec![fake_name]], "清单变了必须通知 mdns(期望禁用集合)");
         assert_eq!(
             registry.snapshot().entries,
             before_snapshot.entries,
@@ -2218,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_excluded_interfaces_overwrites_ipmsg_bcast_when_snapshot_changes() {
+    fn apply_network_policy_overwrites_ipmsg_bcast_when_snapshot_changes() {
         let registry = InterfaceRegistry::new(vec![]);
         let names: Vec<String> = registry.list_all().into_iter().map(|v| v.name).collect();
         if names.is_empty() {
@@ -2228,15 +2349,98 @@ mod tests {
         let (targets, ipmsg_bcast) = new_bcast_guard();
 
         let mut calls = 0;
-        apply_excluded_interfaces(&registry, &ipmsg_bcast, &names, |_, _| calls += 1);
+        apply_network_policy(&registry, &ipmsg_bcast, &names, unrestricted(), |_| calls += 1);
 
         assert_eq!(calls, 1, "清单从空变成非空,必须通知 mdns");
-        let expected = net_ifaces::broadcast_targets(&registry.snapshot().entries);
+        let expected = net_ifaces::ipmsg_targets(&registry.snapshot().plans);
         assert_eq!(
             *targets.lock().unwrap(),
             expected,
-            "快照真的变了,ipmsg 目标表必须原地覆写成新快照算出的广播地址"
+            "快照真的变了,ipmsg 目标表必须原地覆写成新快照算出的目标表"
         );
+    }
+
+    #[test]
+    fn apply_network_policy_scope_change_reports_true_and_pushes_unicast_targets() {
+        let registry = InterfaceRegistry::new(vec![]);
+        let (targets, ipmsg_bcast) = new_bcast_guard();
+        // TEST-NET-3 地址不属于任何本机子网 → 进入跨网段单播池
+        let scope = scope_of(&["203.0.113.7"]);
+        let mut calls = 0;
+        let changed = apply_network_policy(&registry, &ipmsg_bcast, &[], scope, |_| calls += 1);
+        assert!(changed, "scope 从不限制变为限制");
+        assert_eq!(calls, 1, "scope 变化影响 mDNS 决策,必须通知");
+        assert!(
+            targets.lock().unwrap().contains(&Ipv4Addr::new(203, 0, 113, 7)),
+            "ipmsg 目标表应包含范围内的跨网段单播地址"
+        );
+        // 同一 scope 再来一次:无变化
+        let mut calls2 = 0;
+        let changed2 =
+            apply_network_policy(&registry, &ipmsg_bcast, &[], scope_of(&["203.0.113.7"]), |_| {
+                calls2 += 1
+            });
+        assert!(!changed2);
+        assert_eq!(calls2, 0);
+    }
+
+    // ---- scope_filter_event / peer_in_scope(网络范围限定) ----
+
+    fn seen_with(addrs: Vec<IpAddr>) -> DiscoveryEvent {
+        DiscoveryEvent::Seen {
+            fingerprint: "f".repeat(64),
+            nickname: "n".into(),
+            addrs,
+            port: 1,
+            protocol: Protocol::Native,
+            group: None,
+        }
+    }
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn scope_filter_event_keeps_only_allowed_addrs() {
+        let scope = scope_of(&["10.0.0.0/24"]);
+        let ev = seen_with(vec![v4(8, 8, 8, 8), v4(10, 0, 0, 9)]);
+        match scope_filter_event(ev, &scope) {
+            Some(DiscoveryEvent::Seen { addrs, .. }) => assert_eq!(addrs, vec![v4(10, 0, 0, 9)]),
+            other => panic!("期望保留一条地址,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_filter_event_drops_seen_with_no_allowed_addr() {
+        let scope = scope_of(&["10.0.0.0/24"]);
+        assert!(scope_filter_event(seen_with(vec![v4(8, 8, 8, 8)]), &scope).is_none());
+    }
+
+    #[test]
+    fn scope_filter_event_passes_through_non_seen_and_unrestricted() {
+        let scope = scope_of(&["10.0.0.0/24"]);
+        assert!(matches!(
+            scope_filter_event(DiscoveryEvent::Lost { fingerprint: "x".into() }, &scope),
+            Some(DiscoveryEvent::Lost { .. })
+        ));
+        assert!(scope_filter_event(seen_with(vec![v4(8, 8, 8, 8)]), &unrestricted()).is_some());
+    }
+
+    #[test]
+    fn peer_in_scope_keeps_addressless_records_and_checks_any_addr() {
+        let scope = scope_of(&["10.0.0.0/24"]);
+        let mk = |addrs: Vec<IpAddr>| Peer {
+            fingerprint: "f".into(),
+            nickname: "n".into(),
+            addrs,
+            port: 0,
+            protocol: Protocol::Native,
+            state: PeerState::Offline,
+            group: None,
+        };
+        assert!(peer_in_scope(&mk(vec![]), &scope), "地址未知的离线记录保留");
+        assert!(peer_in_scope(&mk(vec![v4(8, 8, 8, 8), v4(10, 0, 0, 3)]), &scope));
+        assert!(!peer_in_scope(&mk(vec![v4(8, 8, 8, 8)]), &scope));
     }
 
     // ---- IpmsgBcastGuard:generation 守卫堵 stale 覆写竞态(Important 1,
@@ -2263,11 +2467,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 10),
             Ipv4Addr::new(255, 255, 255, 0),
         )];
-        let stale = IfaceSnapshot {
-            generation: 1,
-            entries: stale_entries,
-            ..Default::default()
-        };
+        let stale = IfaceSnapshot::with_plans(1, stale_entries, Arc::new(NetScope::unrestricted()));
 
         // "新"快照:对应 apply_settings 里 set_excluded 排除掉 en0 之后发布的
         // 那份,generation=2(严格新于 stale)。
@@ -2276,11 +2476,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 5),
             Ipv4Addr::new(255, 0, 0, 0),
         )];
-        let fresh = IfaceSnapshot {
-            generation: 2,
-            entries: fresh_entries.clone(),
-            ..Default::default()
-        };
+        let fresh = IfaceSnapshot::with_plans(2, fresh_entries.clone(), Arc::new(NetScope::unrestricted()));
 
         // 交错顺序:新的先落地(apply_settings 抢先执行完覆写),旧的因为
         // 线程调度延迟,后落地(roster 线程恢复执行、试图覆写回去)。
@@ -2306,22 +2502,14 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 10),
             Ipv4Addr::new(255, 255, 255, 0),
         )];
-        guard.apply_if_newer(&IfaceSnapshot {
-            generation: 1,
-            entries: e1,
-            ..Default::default()
-        });
+        guard.apply_if_newer(&IfaceSnapshot::with_plans(1, e1, Arc::new(NetScope::unrestricted())));
 
         let e2 = vec![iface_entry(
             "en1",
             Ipv4Addr::new(10, 0, 0, 5),
             Ipv4Addr::new(255, 0, 0, 0),
         )];
-        guard.apply_if_newer(&IfaceSnapshot {
-            generation: 2,
-            entries: e2.clone(),
-            ..Default::default()
-        });
+        guard.apply_if_newer(&IfaceSnapshot::with_plans(2, e2.clone(), Arc::new(NetScope::unrestricted())));
 
         assert_eq!(*targets.lock().unwrap(), net_ifaces::broadcast_targets(&e2));
     }
@@ -2337,11 +2525,7 @@ mod tests {
             Ipv4Addr::new(192, 168, 1, 10),
             Ipv4Addr::new(255, 255, 255, 0),
         )];
-        let snapshot = IfaceSnapshot {
-            generation: 1,
-            entries: entries.clone(),
-            ..Default::default()
-        };
+        let snapshot = IfaceSnapshot::with_plans(1, entries.clone(), Arc::new(NetScope::unrestricted()));
 
         guard.apply_if_newer(&snapshot);
         guard.apply_if_newer(&snapshot);
@@ -2388,11 +2572,7 @@ mod tests {
             barrier_a.wait(); // 尽量让两条线程同时起跑,加大交错概率
             for i in 1..=ITERS {
                 let gen = i * 2;
-                guard_a.apply_if_newer(&IfaceSnapshot {
-                    generation: gen,
-                    entries: entries_for_gen(gen),
-                    ..Default::default()
-                });
+                guard_a.apply_if_newer(&IfaceSnapshot::with_plans(gen, entries_for_gen(gen), Arc::new(NetScope::unrestricted())));
             }
         });
 
@@ -2404,11 +2584,7 @@ mod tests {
             barrier_b.wait();
             for i in 1..=ITERS {
                 let gen = i * 2 - 1;
-                guard_b.apply_if_newer(&IfaceSnapshot {
-                    generation: gen,
-                    entries: entries_for_gen(gen),
-                    ..Default::default()
-                });
+                guard_b.apply_if_newer(&IfaceSnapshot::with_plans(gen, entries_for_gen(gen), Arc::new(NetScope::unrestricted())));
             }
         });
 
@@ -2897,6 +3073,85 @@ mod tests {
         })
         .unwrap();
         assert_eq!(core.nickname(), "设置里的名字");
+        core.shutdown();
+    }
+
+    #[test]
+    fn start_reads_allowed_networks_into_registry_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::settings::save(
+            dir.path(),
+            &crate::settings::Settings {
+                ipmsg_enabled: false,
+                allowed_networks: vec!["203.0.113.7".to_string(), "not-an-ip".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        let scope = core.registry.scope();
+        assert!(scope.allows(v4(203, 0, 113, 7)));
+        assert!(!scope.allows(v4(8, 8, 8, 8)), "坏行被宽松跳过,好行仍生效");
+        core.shutdown();
+    }
+
+    #[test]
+    fn apply_settings_scope_change_prunes_out_of_scope_peers_and_keeps_in_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::settings::save(
+            dir.path(),
+            &crate::settings::Settings {
+                ipmsg_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+        // 注入两个对端(TEST-NET 地址,探测必然失败但不影响本测试的断言)
+        let mk = |fp: &str, ip: IpAddr| DiscoveryEvent::Seen {
+            fingerprint: fp.repeat(64),
+            nickname: fp.into(),
+            addrs: vec![ip],
+            port: 1,
+            protocol: Protocol::Native,
+            group: None,
+        };
+        core.discovery_tx.send(mk("a", v4(203, 0, 113, 7))).unwrap();
+        core.discovery_tx.send(mk("b", v4(198, 51, 100, 7))).unwrap();
+        let rx = core.subscribe();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rx.borrow().len() < 2 {
+            assert!(Instant::now() < deadline, "两个对端应先进入 roster");
+            let _ = rx.has_changed();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        core.apply_settings(&crate::settings::Settings {
+            ipmsg_enabled: false,
+            allowed_networks: vec!["203.0.113.0/24".to_string()],
+            ..Default::default()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let fps: Vec<String> = rx.borrow().iter().map(|p| p.fingerprint.clone()).collect();
+            if fps == vec!["a".repeat(64)] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "范围外对端 b 应被剔除、a 保留,当前 {fps:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 剔除后范围外的 Seen 也进不来
+        core.discovery_tx.send(mk("b", v4(198, 51, 100, 7))).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(rx.borrow().len(), 1, "范围外来源的 Seen 应被 roster 入口过滤");
         core.shutdown();
     }
 

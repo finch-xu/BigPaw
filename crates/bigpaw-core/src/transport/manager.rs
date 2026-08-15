@@ -1034,11 +1034,11 @@ mod tests {
     fn dial_is_scope_denied_when_every_addr_is_outside_scope() {
         let mgr = test_manager();
         mgr.set_iface_rx(scoped_rx(&["10.9.9.9"]));
-        let err = mgr
-            .dial(&"c".repeat(64), &[IpAddr::V4(Ipv4Addr::LOCALHOST)], 1)
-            .err()
-            .expect("范围外地址不该尝试拨号");
-        assert!(matches!(err, TransportError::ScopeDenied), "得到 {err:?}");
+        match mgr.dial(&"c".repeat(64), &[IpAddr::V4(Ipv4Addr::LOCALHOST)], 1) {
+            Err(TransportError::ScopeDenied) => {}
+            Err(other) => panic!("期望 ScopeDenied,得到 {other:?}"),
+            Ok(_) => panic!("范围外地址不该尝试拨号"),
+        }
     }
 
     /// 连到 mgr 的监听端口后立刻 read:被拒 → 服务端 shutdown,读到 EOF/错误;

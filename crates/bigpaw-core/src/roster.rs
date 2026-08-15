@@ -67,6 +67,11 @@ pub enum DiscoveryEvent {
     Unreachable {
         fingerprint: String,
     },
+    /// 控制事件(网络范围限定):允许范围已变化。`Roster::apply` 对它恒为
+    /// no-op——真正的剔除由 roster 线程执行(它持有 `watch_tx` 与
+    /// registry,`Core::apply_settings` 只能通过事件通道通知它),这样剔除与
+    /// 其他 roster 变更天然串行,不需要额外同步。
+    ScopeChanged,
 }
 
 pub struct Roster {
@@ -155,7 +160,17 @@ impl Roster {
                     _ => false,
                 }
             }
+            DiscoveryEvent::ScopeChanged => false, // 控制事件,见变体注释
         }
+    }
+
+    /// 只保留满足 `keep` 的对端(网络范围限定:范围外对端**移除**而非标
+    /// Offline——需求是"不展示")。返回是否有实际变化。Storage 不动,放宽
+    /// 范围后重新被发现/预热即恢复。
+    pub fn retain_peers(&mut self, mut keep: impl FnMut(&Peer) -> bool) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|_, p| keep(p));
+        self.peers.len() != before
     }
 
     /// 启动预热(M6):把持久化的已知 peer 以 Offline 态注入,让 UI 一打开
@@ -462,5 +477,28 @@ mod tests {
         assert_eq!(bob.nickname, "bob", "昵称保持在线版本");
         let carol = snap.iter().find(|p| p.fingerprint == "cccc").unwrap();
         assert_eq!(carol.state, PeerState::Offline);
+    }
+
+    // ---------- 网络范围限定:retain_peers / ScopeChanged ----------
+
+    #[test]
+    fn retain_peers_removes_rejected_and_reports_change() {
+        let mut r = Roster::new("me".into());
+        r.apply(seen("a", "A"));
+        r.apply(seen("b", "B"));
+        let changed = r.retain_peers(|p| p.fingerprint == "a");
+        assert!(changed);
+        let fps: Vec<String> = r.snapshot().into_iter().map(|p| p.fingerprint).collect();
+        assert_eq!(fps, vec!["a".to_string()]);
+        // 全部保留 → 无变化
+        assert!(!r.retain_peers(|_| true));
+    }
+
+    #[test]
+    fn scope_changed_is_a_control_event_and_never_changes_roster() {
+        let mut r = Roster::new("me".into());
+        r.apply(seen("a", "A"));
+        assert!(!r.apply(DiscoveryEvent::ScopeChanged));
+        assert_eq!(r.snapshot().len(), 1);
     }
 }
