@@ -107,6 +107,16 @@ const emptyConv = (): Conversation => ({ items: [], hasMore: true, loaded: false
 /** 分页游标用的条目 id:文本用消息 id,文件用 xferId。与后端复合游标 (ts_ms, id) 对齐。 */
 const idOf = (it: TimelineItem): string => (it.kind === "text" ? it.id : it.xferId);
 
+/** 更新流程状态机:idle → checking → latest | available → downloading → ready | error */
+export interface UpdateState {
+  status: "idle" | "checking" | "latest" | "available" | "downloading" | "ready" | "error";
+  /** 检测到的新版本号(available 及之后有效) */
+  version?: string;
+  /** 下载进度;total 为 null 表示服务端未给 Content-Length */
+  progress?: { done: number; total: number | null };
+  error?: string;
+}
+
 interface AppState {
   self: SelfInfo | null;
   peers: Peer[];
@@ -126,11 +136,14 @@ interface AppState {
   /** 搜索跳转的目标时间戳:ChatPane 据此高亮并滚动到该条 */
   highlightTs: number | null;
   showSettings: boolean;
+  /** 自动更新状态(见 updater.ts):「关于」页据此显示文案/进度 */
+  update: UpdateState;
 
   setSelf: (self: SelfInfo) => void;
   setPeers: (peers: Peer[]) => void;
   setIpmsg: (s: { available: boolean; enabled: boolean }) => void;
   setShowSettings: (v: boolean) => void;
+  setUpdate: (update: UpdateState) => void;
   setHighlightTs: (ts: number | null) => void;
 
   loadConversations: () => Promise<void>;
@@ -162,11 +175,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   searchHits: [],
   highlightTs: null,
   showSettings: false,
+  update: { status: "idle" },
 
   setSelf: (self) => set({ self }),
   setPeers: (peers) => set({ peers }),
   setIpmsg: (ipmsg) => set({ ipmsg }),
   setShowSettings: (showSettings) => set({ showSettings }),
+  // 整体替换而非合并:避免上一轮的 progress/error 残留到下一轮
+  setUpdate: (update) => set({ update }),
   setHighlightTs: (highlightTs) => set({ highlightTs }),
 
   loadConversations: async () => {

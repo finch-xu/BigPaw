@@ -377,6 +377,12 @@ struct FileFailedDto {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        // 自动更新:前端用 @tauri-apps/plugin-updater 的 check()/downloadAndInstall(),
+        // 端点与公钥在 tauri.conf.json plugins.updater;process 供安装后 relaunch;
+        // opener 给不能原地升级的 deb 用户打开 Release 页面。
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();

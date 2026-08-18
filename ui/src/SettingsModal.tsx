@@ -4,6 +4,7 @@ import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { useAppStore, type NetIface, type SelfInfo, type Settings } from "./store";
 import { getThemePref, setThemePref, type ThemePref } from "./theme";
 import { IS_TAURI } from "./mock";
+import AboutPanel from "./AboutPanel";
 
 const MOCK_SETTINGS: Settings = {
   nickname: null,
@@ -37,7 +38,7 @@ const THEME_OPTIONS: Array<[ThemePref, string]> = [
   ["system", "跟随系统"],
 ];
 
-type TabKey = "personal" | "appearance" | "transfer" | "network" | "data";
+type TabKey = "personal" | "appearance" | "transfer" | "network" | "data" | "about";
 
 const TABS: Array<{ key: TabKey; label: string }> = [
   { key: "personal", label: "个人" },
@@ -45,6 +46,7 @@ const TABS: Array<{ key: TabKey; label: string }> = [
   { key: "transfer", label: "传输" },
   { key: "network", label: "网络" },
   { key: "data", label: "数据" },
+  { key: "about", label: "关于" },
 ];
 
 export default function SettingsModal() {
@@ -393,6 +395,8 @@ export default function SettingsModal() {
               清空所有聊天记录
             </button>
           )}
+
+          {activeTab === "about" && <AboutPanel />}
 
           {needRestart && (
             <p className="mt-3 text-xs text-warning-fg">部分设置将在重启应用后生效。</p>
