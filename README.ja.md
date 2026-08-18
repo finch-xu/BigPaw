@@ -92,8 +92,10 @@ pnpm -C src-tauri tauri dev
 # または cargo から:
 cargo tauri dev
 
-# リリースビルド(各プラットフォーム向けインストーラー)
-cargo tauri build
+# リリースビルド(各プラットフォーム向けインストーラー)。自動更新用の署名
+# (createUpdaterArtifacts)が有効なため、updater 秘密鍵がない場合は --no-sign を付ける
+# (その成果物は自動更新には使えない)
+cargo tauri build --no-sign
 
 # Rust 側のテストを実行(検出 / 転送 / IPMsg の結合テストを含む)
 cargo test

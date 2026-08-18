@@ -12,11 +12,28 @@ concurrency:
   group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
+# 发布流水线总览:
+#   verify-version ─┬─ create-draft ─┬─ build-macos-arm64 ─┐
+#                   │                ├─ build-macos-x64   ─┤
+#                   │                ├─ build-linux-x64   ─┼─ generate-manifest ─ publish
+#                   │                ├─ build-linux-arm64 ─┤
+#                   │                ├─ build-windows-x64 ─┤
+#                   │                └─ build-windows-arm64┘
+# 所有构建 job 绑定 GitHub 环境 `prod`,secrets 在 Settings > Environments > prod 里配置:
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD  (全平台,updater .sig)
+#   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+#   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID                       (仅 macOS,签名 + 公证)
+# tauri.conf.json 开了 bundle.createUpdaterArtifacts,没有 TAURI_SIGNING_PRIVATE_KEY 的
+# `tauri build` 会直接失败,所以 Windows/Linux job 也必须注入这两个 secret。
+# 资产命名固定为 BigPaw-<os>-<arch>.<ext>(不带版本号,下载链接可长期固定,版本以
+# release tag 为准);"<os>-<arch>" 子串是
+# scripts/generate-latest-json.mjs 的路由键,改名时两边同步。
+
 jobs:
-  # 所有构建的前置闸门。版本号在根 Cargo.toml（workspace.package）和
-  # src-tauri/tauri.conf.json 里各存一份，二进制的真实版本取自 tauri.conf.json。
-  # tag 和它们不一致会发出一份"文件名声称 0.2.0、装上去还是 0.1.0"的 release，
-  # 所以在这里拦死。
+  # 所有构建的前置闸门。版本号在根 Cargo.toml(workspace.package)、
+  # src-tauri/tauri.conf.json、ui/package.json 里各存一份,二进制的真实版本取自
+  # tauri.conf.json。tag 和它们不一致会发出一份"文件名声称 0.2.0、装上去还是 0.1.0"
+  # 的 release,所以在这里拦死。
   verify-version:
     name: Verify version consistency
     runs-on: ubuntu-latest
@@ -37,19 +54,531 @@ jobs:
           echo "tag=$want  tauri.conf.json=$conf  ui/package.json=$pkg  Cargo.toml=$cargo"
 
           fail=0
-          [ "$conf"  = "$want" ] || { echo "::error::tauri.conf.json 是 $conf，tag 是 $want"; fail=1; }
-          [ "$pkg"   = "$want" ] || { echo "::error::ui/package.json 是 $pkg，tag 是 $want"; fail=1; }
-          [ "$cargo" = "$want" ] || { echo "::error::Cargo.toml 是 $cargo，tag 是 $want"; fail=1; }
+          [ "$conf"  = "$want" ] || { echo "::error::tauri.conf.json 是 $conf,tag 是 $want"; fail=1; }
+          [ "$pkg"   = "$want" ] || { echo "::error::ui/package.json 是 $pkg,tag 是 $want"; fail=1; }
+          [ "$cargo" = "$want" ] || { echo "::error::Cargo.toml 是 $cargo,tag 是 $want"; fail=1; }
           if [ "$fail" -eq 1 ]; then
-            echo "::error::跑 node scripts/set-version.mjs $want，提交后重新打 tag。"
+            echo "::error::跑 node scripts/set-version.mjs $want,提交后重新打 tag。"
             exit 1
           fi
           echo "版本号三处一致: $want"
 
+  # 单独建一次草稿:六个构建 job 并行往同一 tag 上传,如果让它们各自"没有就创建",
+  # 会出现两个 job 同时发现"没有"然后各建一份草稿(GitHub 草稿不按 tag 去重)。
+  # release notes 也只在这里生成一次(latest.json 的 notes 字段读它)。
+  create-draft:
+    name: Create draft release
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Create draft if missing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG 已存在,跳过创建"
+          else
+            gh release create "$RELEASE_TAG" --draft --generate-notes --title "$RELEASE_TAG"
+            echo "已创建草稿 release $RELEASE_TAG"
+          fi
+
+  build-macos-arm64:
+    name: Build macOS arm64
+    needs: [verify-version, create-draft]
+    runs-on: macos-latest
+    environment: prod
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Setup Rust (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # workspace 根在仓库根目录,产物落在 ./target 而不是 src-tauri/target。
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-arm64
+
+      - name: Install frontend deps
+        run: pnpm -C ui install --frozen-lockfile
+
+      - name: Verify signing & notarization secrets are present
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for var in TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+                     APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+                     APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var secret is empty — Apple signing/notarization or .sig generation will fail."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "::error::Configure missing secrets in repo Settings > Environments > prod."
+            exit 1
+          fi
+          echo "All 8 signing & notarization secrets present."
+
+      - name: Build, sign & notarize
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target aarch64-apple-darwin
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          bundle_dir="target/aarch64-apple-darwin/release/bundle"
+          if [ -d "$bundle_dir" ]; then
+            find "$bundle_dir" -maxdepth 3 -type f | sort
+          else
+            echo "Bundle dir does not exist: $bundle_dir"
+          fi
+
+      # 改成"应用名-平台-架构"的固定命名(不含版本号)。.app.tar.gz 是 updater 实际下载的
+      # 产物,跟随的 .sig 一并改名。
+      - name: Rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="target/aarch64-apple-darwin/release/bundle"
+          shopt -s nullglob
+          for f in "$bundle_dir"/dmg/*.dmg; do
+            mv -v "$f" "$bundle_dir/dmg/BigPaw-macos-arm64.dmg"
+          done
+          for f in "$bundle_dir"/macos/*.app.tar.gz; do
+            new="$bundle_dir/macos/BigPaw-macos-arm64.app.tar.gz"
+            mv -v "$f" "$new"
+            [ -f "${f}.sig" ] && mv -v "${f}.sig" "${new}.sig"
+          done
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-macos-arm64
+          path: target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: |
+            target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+            target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+
+  build-macos-x64:
+    name: Build macOS x64
+    needs: [verify-version, create-draft]
+    # macos-latest 是 Apple Silicon runner;x86_64 靠 rustup 交叉目标编译即可,
+    # 依赖里的 C 代码(bundled sqlite / ring)都能跟着交叉。
+    runs-on: macos-latest
+    environment: prod
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Setup Rust (x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-x64
+
+      - name: Install frontend deps
+        run: pnpm -C ui install --frozen-lockfile
+
+      - name: Verify signing & notarization secrets are present
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=0
+          for var in TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD \
+                     APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+                     APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!var:-}" ]; then
+              echo "::error::$var secret is empty — Apple signing/notarization or .sig generation will fail."
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "::error::Configure missing secrets in repo Settings > Environments > prod."
+            exit 1
+          fi
+          echo "All 8 signing & notarization secrets present."
+
+      - name: Build, sign & notarize
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target x86_64-apple-darwin
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          bundle_dir="target/x86_64-apple-darwin/release/bundle"
+          if [ -d "$bundle_dir" ]; then
+            find "$bundle_dir" -maxdepth 3 -type f | sort
+          else
+            echo "Bundle dir does not exist: $bundle_dir"
+          fi
+
+      - name: Rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="target/x86_64-apple-darwin/release/bundle"
+          shopt -s nullglob
+          for f in "$bundle_dir"/dmg/*.dmg; do
+            mv -v "$f" "$bundle_dir/dmg/BigPaw-macos-x64.dmg"
+          done
+          for f in "$bundle_dir"/macos/*.app.tar.gz; do
+            new="$bundle_dir/macos/BigPaw-macos-x64.app.tar.gz"
+            mv -v "$f" "$new"
+            [ -f "${f}.sig" ] && mv -v "${f}.sig" "${new}.sig"
+          done
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-macos-x64
+          path: target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: |
+            target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+            target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
+            target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+
+  build-linux-x64:
+    name: Build Linux x64
+    needs: [verify-version, create-draft]
+    # 选 22.04 而非 24.04:AppImage 只能向上兼容 glibc,构建机越老、能跑的发行版越多。
+    runs-on: ubuntu-22.04
+    environment: prod
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Setup Rust (x86_64-unknown-linux-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x64
+
+      # webkit2gtk-4.1 是 Tauri 2 的 WebView;appindicator 给托盘;patchelf/file 给 AppImage 打包。
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libayatana-appindicator3-dev \
+            file \
+            xdg-utils
+
+      - name: Install frontend deps
+        run: pnpm -C ui install --frozen-lockfile
+
+      - name: Verify Tauri signing secrets are present
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty - build will fail (createUpdaterArtifacts is on)."
+            echo "::error::Configure it in repo Settings > Environments > prod."
+            exit 1
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty - bundle signing will fail."
+            exit 1
+          fi
+          echo "TAURI signing secrets present."
+
+      - name: Build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # 只打 deb + AppImage;跳过 rpm(Ubuntu runner 上工具链不稳)。
+          args: --target x86_64-unknown-linux-gnu --bundles deb,appimage
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          bundle_dir="target/x86_64-unknown-linux-gnu/release/bundle"
+          if [ -d "$bundle_dir" ]; then
+            find "$bundle_dir" -maxdepth 3 -type f | sort
+          else
+            echo "Bundle dir does not exist: $bundle_dir"
+          fi
+
+      # AppImage 是 updater 产物,跟随的 .sig 一并改名;deb 不参与自动更新
+      # (客户端 deb 安装时会引导去 Release 页手动下载),.deb.sig 不上传。
+      - name: Rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="target/x86_64-unknown-linux-gnu/release/bundle"
+          shopt -s nullglob
+          for f in "$bundle_dir"/deb/*.deb; do
+            mv -v "$f" "$bundle_dir/deb/BigPaw-linux-x64.deb"
+          done
+          for f in "$bundle_dir"/appimage/*.AppImage; do
+            new="$bundle_dir/appimage/BigPaw-linux-x64.AppImage"
+            mv -v "$f" "$new"
+            [ -f "${f}.sig" ] && mv -v "${f}.sig" "${new}.sig"
+          done
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-linux-x64
+          path: target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: |
+            target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+            target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
+
+  build-linux-arm64:
+    name: Build Linux arm64
+    needs: [verify-version, create-draft]
+    # 原生 arm64 runner(公开仓库免费),避免交叉编译 webkit2gtk/glib 这类系统 C 库
+    # 所需的整套 sysroot;22.04 与 x64 job 保持同一 glibc(2.35)。
+    runs-on: ubuntu-22.04-arm
+    environment: prod
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Setup Rust (aarch64-unknown-linux-gnu)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-arm64
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf \
+            libayatana-appindicator3-dev \
+            file \
+            xdg-utils
+
+      - name: Install frontend deps
+        run: pnpm -C ui install --frozen-lockfile
+
+      - name: Verify Tauri signing secrets are present
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty - build will fail (createUpdaterArtifacts is on)."
+            echo "::error::Configure it in repo Settings > Environments > prod."
+            exit 1
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty - bundle signing will fail."
+            exit 1
+          fi
+          echo "TAURI signing secrets present."
+
+      - name: Build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target aarch64-unknown-linux-gnu --bundles deb,appimage
+
+      - name: List bundle contents (diagnostic)
+        if: always()
+        shell: bash
+        run: |
+          bundle_dir="target/aarch64-unknown-linux-gnu/release/bundle"
+          if [ -d "$bundle_dir" ]; then
+            find "$bundle_dir" -maxdepth 3 -type f | sort
+          else
+            echo "Bundle dir does not exist: $bundle_dir"
+          fi
+
+      - name: Rename artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle_dir="target/aarch64-unknown-linux-gnu/release/bundle"
+          shopt -s nullglob
+          for f in "$bundle_dir"/deb/*.deb; do
+            mv -v "$f" "$bundle_dir/deb/BigPaw-linux-arm64.deb"
+          done
+          for f in "$bundle_dir"/appimage/*.AppImage; do
+            new="$bundle_dir/appimage/BigPaw-linux-arm64.AppImage"
+            mv -v "$f" "$new"
+            [ -f "${f}.sig" ] && mv -v "${f}.sig" "${new}.sig"
+          done
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-linux-arm64
+          path: target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: |
+            target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb
+            target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+            target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
+
   build-windows-x64:
     name: Build Windows x64
-    needs: [verify-version]
+    needs: [verify-version, create-draft]
     runs-on: windows-latest
+    environment: prod
     env:
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
@@ -73,7 +602,6 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      # workspace 根在仓库根目录，产物落在 ./target 而不是 src-tauri/target。
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -82,10 +610,30 @@ jobs:
       - name: Install frontend deps
         run: pnpm -C ui install --frozen-lockfile
 
+      - name: Verify Tauri signing secrets are present
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty - build will fail (createUpdaterArtifacts is on)."
+            Write-Host "::error::Configure it in repo Settings > Environments > prod."
+            exit 1
+          }
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            Write-Host "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty - bundle signing will fail."
+            exit 1
+          }
+          Write-Host "TAURI signing secrets present."
+
       - name: Build
         uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          # 只打 nsis: WiX 不支持 arm64，x64 也一并对齐，两个架构产物统一为
+          # 只打 nsis: WiX 不支持 arm64,x64 也一并对齐,两个架构产物统一为
           # NSIS 的 *-setup.exe。
           args: --target x86_64-pc-windows-msvc --bundles nsis
 
@@ -100,30 +648,46 @@ jobs:
             Write-Host "Bundle dir does not exist: $bundleDir"
           }
 
-      # 改成"应用名_平台-架构"的固定命名，下载链接可长期固定。
+      # NSIS .exe 是 updater 在 Windows 上下载的产物(Tauri 2 直接对 .exe 签名),
+      # 改名时跟随的 .exe.sig 一起改。
       - name: Rename artifacts
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver = $env:RELEASE_TAG.TrimStart('v')
           Get-ChildItem -Path 'target/x86_64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' | ForEach-Object {
-            $newName = "BigPaw_${ver}_windows-x64-setup.exe"
+            $oldFull = $_.FullName
+            $oldSig = "$oldFull.sig"
+            $newName = "BigPaw-windows-x64-setup.exe"
             Write-Host "Renaming $($_.Name) -> $newName"
-            Rename-Item -LiteralPath $_.FullName -NewName $newName
+            Rename-Item -LiteralPath $oldFull -NewName $newName
+            if (Test-Path $oldSig) {
+              Rename-Item -LiteralPath $oldSig -NewName "$newName.sig"
+            }
           }
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload to draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
-          files: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          files: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
 
   build-windows-arm64:
     name: Build Windows arm64
-    needs: [verify-version]
-    # 原生 arm64 runner（公开仓库免费），避免从 x64 交叉编译的 C/汇编坑。
+    needs: [verify-version, create-draft]
+    # 原生 arm64 runner(公开仓库免费),避免从 x64 交叉编译的 C/汇编坑。
     runs-on: windows-11-arm
+    environment: prod
     env:
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
@@ -155,10 +719,30 @@ jobs:
       - name: Install frontend deps
         run: pnpm -C ui install --frozen-lockfile
 
+      - name: Verify Tauri signing secrets are present
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            Write-Host "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty - build will fail (createUpdaterArtifacts is on)."
+            Write-Host "::error::Configure it in repo Settings > Environments > prod."
+            exit 1
+          }
+          if ([string]::IsNullOrEmpty($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+            Write-Host "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is empty - bundle signing will fail."
+            exit 1
+          }
+          Write-Host "TAURI signing secrets present."
+
       - name: Build
         uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          # 只打 nsis: WiX 不支持 arm64，走 tauri.conf.json 的 targets:"all"
+          # 只打 nsis: WiX 不支持 arm64,走 tauri.conf.json 的 targets:"all"
           # 会触发 MSI 构建失败并拖垮整个 job。
           args: --target aarch64-pc-windows-msvc --bundles nsis
 
@@ -177,25 +761,86 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $ver = $env:RELEASE_TAG.TrimStart('v')
           Get-ChildItem -Path 'target/aarch64-pc-windows-msvc/release/bundle/nsis' -Filter '*-setup.exe' | ForEach-Object {
-            $newName = "BigPaw_${ver}_windows-arm64-setup.exe"
+            $oldFull = $_.FullName
+            $oldSig = "$oldFull.sig"
+            $newName = "BigPaw-windows-arm64-setup.exe"
             Write-Host "Renaming $($_.Name) -> $newName"
-            Rename-Item -LiteralPath $_.FullName -NewName $newName
+            Rename-Item -LiteralPath $oldFull -NewName $newName
+            if (Test-Path $oldSig) {
+              Rename-Item -LiteralPath $oldSig -NewName "$newName.sig"
+            }
           }
+
+      - name: Upload .sig artifact (for manifest job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-windows-arm64
+          path: target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload to draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           draft: true
-          files: target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+          files: |
+            target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe
+            target/aarch64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
 
-  # 草稿翻正式是最后一步: 两个构建都传完之前 release 一直是草稿，
-  # 外部看不到半成品。
+  # 汇总六个平台的 .sig,拼出 updater 清单 latest.json。客户端端点是
+  # releases/latest/download/latest.json,所以它必须和安装包同在一个 release 里。
+  generate-manifest:
+    name: Generate latest.json
+    needs:
+      - build-macos-arm64
+      - build-macos-x64
+      - build-linux-x64
+      - build-linux-arm64
+      - build-windows-x64
+      - build-windows-arm64
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download .sig artifacts from build jobs
+        uses: actions/download-artifact@v4
+        with:
+          path: sigs
+          pattern: sig-*
+          merge-multiple: true
+
+      - name: List collected .sig files
+        run: ls -la sigs
+
+      - name: Generate latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/generate-latest-json.mjs "$RELEASE_TAG" sigs latest.json
+
+      - name: Upload latest.json to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: true
+          files: latest.json
+
+  # 草稿翻正式是最后一步:所有产物 + latest.json 都传完之前 release 一直是草稿,
+  # 外部看不到半成品。显式 prerelease:false + make_latest:GitHub 的
+  # releases/latest 会跳过 Pre-release,标了预发布 updater 端点就 404。
   publish:
     name: Publish release
-    needs: [build-windows-x64, build-windows-arm64]
+    needs: [generate-manifest]
     runs-on: ubuntu-latest
     steps:
       - name: Flip draft to published
@@ -218,5 +863,7 @@ jobs:
               repo: context.repo.repo,
               release_id: release.id,
               draft: false,
+              prerelease: false,
+              make_latest: 'true',
             });
             core.info(`Published release ${tag} (id=${release.id})`);

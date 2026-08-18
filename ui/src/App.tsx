@@ -8,6 +8,10 @@ import CreateGroupModal from "./CreateGroupModal";
 import Sidebar from "./Sidebar";
 import EmptyState from "./EmptyState";
 import { IS_TAURI, installMocks } from "./mock";
+import { checkForUpdate } from "./updater";
+
+/** 启动后延迟多久静默检查更新:让主流程(发现/历史)先跑起来,不抢首屏 */
+const UPDATE_CHECK_DELAY_MS = 5_000;
 
 export default function App() {
   const selectedFp = useAppStore((s) => s.selectedFp);
@@ -23,6 +27,7 @@ export default function App() {
     const st = () => useAppStore.getState();
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
+    let updateTimer: ReturnType<typeof setTimeout> | null = null;
     (async () => {
       try {
         // 先订阅再拉快照:快照是全量状态,晚到的快照覆盖早到的事件也不会丢数据
@@ -64,12 +69,17 @@ export default function App() {
         st().setIpmsg(await invoke<{ available: boolean; enabled: boolean }>("ipmsg_status"));
         await st().loadConversations(); // 消息视图数据源(M7b)
         await st().loadGroups(); // 已加入的群(M7c)
+        // 静默检查更新:dev 构建版本号恒为 tauri.conf.json 里的值,检查只会误报,跳过
+        if (!import.meta.env.DEV) {
+          updateTimer = setTimeout(() => void checkForUpdate({ silent: true }), UPDATE_CHECK_DELAY_MS);
+        }
       } catch (e) {
         console.error("初始化失败:", e);
       }
     })();
     return () => {
       cancelled = true;
+      if (updateTimer) clearTimeout(updateTimer);
       unlisteners.forEach((u) => u());
     };
   }, []);

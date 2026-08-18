@@ -92,8 +92,9 @@ pnpm -C src-tauri tauri dev
 # 或使用 cargo:
 cargo tauri dev
 
-# 打包发布(各平台安装包)
-cargo tauri build
+# 打包发布(各平台安装包)。已开启自动更新产物签名(createUpdaterArtifacts),
+# 本地打包需要 updater 私钥;没有私钥就加 --no-sign 跳过签名(产物不能用于自动更新)
+cargo tauri build --no-sign
 
 # 运行 Rust 侧测试(含发现 / 传输 / IPMsg 集成用例)
 cargo test

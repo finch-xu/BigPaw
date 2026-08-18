@@ -96,8 +96,10 @@ pnpm -C src-tauri tauri dev
 # or with cargo:
 cargo tauri dev
 
-# Build release bundles (installers for each platform)
-cargo tauri build
+# Build release bundles (installers for each platform). Updater artifact signing
+# (createUpdaterArtifacts) is on; without the updater private key pass --no-sign
+# (the output then cannot be used for auto-update)
+cargo tauri build --no-sign
 
 # Run the Rust-side tests (including discovery / transport / IPMsg integration cases)
 cargo test
