@@ -39,3 +39,5 @@ src-tauri/gen/schemas/
 
 # 本地开发工具配置
 .claude/
+
+.DS_Store

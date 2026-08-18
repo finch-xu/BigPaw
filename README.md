@@ -1,7 +1,21 @@
+<div align="center">
+
+<img src="assets/logo.png" alt="BigPaw" width="128" />
+
 # BigPaw · 大脚猫
 
-> 无服务器的局域网即时通讯 + 高速文件传输工具,飞秋(IPMsg)替代品。
-> 桌面端:**Windows / macOS / Linux**。
+**无服务器的局域网即时通讯 + 高速文件传输工具**,飞秋 / LAN Messenger / IP Messenger 替代品
+
+![Windows](https://img.shields.io/badge/Windows-0078D4?logo=windows&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-4B4B4B?logo=apple&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?logo=linux&logoColor=black)
+![Tauri](https://img.shields.io/badge/Tauri_2-24C8DB?logo=tauri&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-CE422B?logo=rust&logoColor=white)
+![React](https://img.shields.io/badge/React_19-61DAFB?logo=react&logoColor=black)
+
+**简体中文** · [English](README.en.md) · [日本語](README.ja.md)
+
+</div>
 
 BigPaw 不需要任何服务器、账号或云。同一局域网内启动即互相发现,直接点对点收发消息与文件;既能和其它 BigPaw 节点走**加密原生协议**,也能和现有的**飞秋 / IPMsg** 客户端互通。
 
