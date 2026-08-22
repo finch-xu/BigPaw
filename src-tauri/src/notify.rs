@@ -75,6 +75,11 @@ pub fn paint_unread_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     if width == 0 || height == 0 {
         return out;
     }
+    // 缓冲长度来自入参,下标由 width/height 形参推出。两者不一致时原样返回,
+    // 绝不能 panic——该函数可能在消息接收路径上被调用。
+    if out.len() < width as usize * height as usize * 4 {
+        return out;
+    }
     let radius = (width.min(height) as f32 * 0.28).max(3.0);
     let cx = width as f32 - radius - 1.0;
     let cy = radius + 1.0;
@@ -243,5 +248,12 @@ mod tests {
     fn dot_leaves_bottom_left_untouched() {
         let out = paint_unread_dot(&blank(32, 32), 32, 32);
         assert_eq!(px(&out, 32, 2, 29), [0, 0, 0, 0], "左下角不该被改动");
+    }
+
+    #[test]
+    fn dot_returns_original_when_buffer_too_short() {
+        let tiny = vec![1u8, 2, 3, 4];
+        let out = paint_unread_dot(&tiny, 32, 32);
+        assert_eq!(out, tiny, "缓冲长度不足时应原样返回");
     }
 }
