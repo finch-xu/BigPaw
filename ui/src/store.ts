@@ -124,6 +124,32 @@ async function tellShellUnreadCleared(convId: string | null): Promise<void> {
   }
 }
 
+/** 选中会话的唯一入口(M8)。三件事绑成一体:设置 selectedFp、把该会话的未读
+ *  归零、把「当前会话」上报给壳层。
+ *
+ *  写 selectedFp 的地方有两处(openConversation 与 jumpToMessage),都必须走这里。
+ *  漏掉任何一处,壳层的 active 就会停在上一个打开过的会话上:窗口聚焦时决策
+ *  规则 2 会反过来压制用户**真正在看**的那个会话的通知,而给那个陈旧会话放行
+ *  ——漏消息正是本子系统要防的事。这与清零信号收敛到 tellShellUnreadCleared
+ *  是同一条纪律。
+ *
+ *  `extra` 放各入口特有的状态(高亮时间戳、搜索态、会话缓存),与上面三件事
+ *  合并进同一次 set,避免多余的一次渲染。 */
+function selectConversation(
+  set: (updater: (s: AppState) => Partial<AppState>) => void,
+  fp: string,
+  extra?: (s: AppState) => Partial<AppState>,
+): void {
+  set((s) => ({
+    ...(extra ? extra(s) : {}),
+    selectedFp: fp,
+    unread: { ...s.unread, [fp]: 0 },
+  }));
+  if (!IS_TAURI) return;
+  // set_active 本身就含「该会话已读」语义,不必再调 notify_clear_unread
+  void invoke("notify_set_active", { convId: fp }).catch(() => {});
+}
+
 const PAGE = 50;
 
 const emptyConv = (): Conversation => ({ items: [], hasMore: true, loaded: false });
@@ -228,15 +254,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setShowCreateGroup: (showCreateGroup) => set({ showCreateGroup }),
 
   openConversation: async (fp) => {
-    set((s) => ({
-      selectedFp: fp,
-      highlightTs: null,
-      unread: { ...s.unread, [fp]: 0 },
-    }));
-    if (IS_TAURI) {
-      // set_active 本身就含「该会话已读」语义,不必再调 clear_unread
-      void invoke("notify_set_active", { convId: fp }).catch(() => {});
-    }
+    selectConversation(set, fp, () => ({ highlightTs: null }));
     if (get().conversations[fp]?.loaded) return;
     const items = await invoke<TimelineItem[]>("get_history", {
       fingerprint: fp,
@@ -344,8 +362,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       fingerprint: fp,
       tsMs,
     });
-    set((s) => ({
-      selectedFp: fp,
+    selectConversation(set, fp, (s) => ({
       highlightTs: tsMs,
       searchQuery: "",
       searchHits: [],
