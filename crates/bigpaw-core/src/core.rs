@@ -3064,6 +3064,7 @@ mod tests {
                 ipmsg_enabled: true,
                 excluded_interfaces: Vec::new(),
                 allowed_networks: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -3167,6 +3168,7 @@ mod tests {
                 ipmsg_enabled: false,
                 excluded_interfaces: Vec::new(),
                 allowed_networks: Vec::new(),
+                ..Default::default()
             },
         )
         .unwrap();
