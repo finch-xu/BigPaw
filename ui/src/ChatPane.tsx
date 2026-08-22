@@ -39,6 +39,7 @@ export default function ChatPane({ fp }: { fp: string }) {
   const isGroup = !!group;
   // 群会话不依赖单个对端在线状态:发言逐成员尽力送达(spec 冻结)。
   const offline = isGroup ? false : !peer || peer.state === "offline";
+  const muted = useAppStore((s) => s.mutedConvs.includes(fp));
   const isIpmsg = peer?.protocol === "ipmsg";
   const title = isGroup ? group.name : (peer?.nickname ?? fp.slice(0, 8));
   const stateLabel = isGroup
@@ -149,6 +150,14 @@ export default function ChatPane({ fp }: { fp: string }) {
     }
   }
 
+  async function handleToggleMute() {
+    try {
+      await useAppStore.getState().toggleMute(fp);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   return (
     <section className="flex min-w-0 flex-1 flex-col">
       <header className="flex items-center gap-2.5 border-b border-border bg-panel px-4 py-2.5">
@@ -157,6 +166,18 @@ export default function ChatPane({ fp }: { fp: string }) {
           <div className="truncate text-sm font-medium">{title}</div>
           <div className="text-xs text-muted-foreground">{stateLabel}</div>
         </div>
+        <button
+          onClick={handleToggleMute}
+          title={muted ? "已静音,点击恢复提醒" : "消息免打扰"}
+          aria-label={muted ? "取消免打扰" : "开启免打扰"}
+          className="shrink-0 text-muted-foreground hover:text-fg2"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+            <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+            {muted && <line x1="3" y1="3" x2="21" y2="21" />}
+          </svg>
+        </button>
         {isGroup && (
           <button
             onClick={handleLeaveGroup}

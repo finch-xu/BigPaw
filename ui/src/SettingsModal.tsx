@@ -13,6 +13,10 @@ const MOCK_SETTINGS: Settings = {
   ipmsgEnabled: true,
   excludedInterfaces: [],
   allowedNetworks: [],
+  notifyEnabled: true,
+  notifySound: true,
+  notifyShowPreview: true,
+  mutedConversations: [],
 };
 
 /** 前端轻校验(只拦明显错误,权威校验在后端 validate_allowed_networks):
@@ -38,11 +42,12 @@ const THEME_OPTIONS: Array<[ThemePref, string]> = [
   ["system", "跟随系统"],
 ];
 
-type TabKey = "personal" | "appearance" | "transfer" | "network" | "data" | "about";
+type TabKey = "personal" | "appearance" | "notify" | "transfer" | "network" | "data" | "about";
 
 const TABS: Array<{ key: TabKey; label: string }> = [
   { key: "personal", label: "个人" },
   { key: "appearance", label: "外观" },
+  { key: "notify", label: "通知" },
   { key: "transfer", label: "传输" },
   { key: "network", label: "网络" },
   { key: "data", label: "数据" },
@@ -293,6 +298,63 @@ export default function SettingsModal() {
                 </button>
               ))}
             </div>
+          )}
+
+          {activeTab === "notify" && (
+            <>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={settings.notifyEnabled}
+                  onChange={(e) =>
+                    void save({ ...settings, notifyEnabled: e.target.checked }, false)
+                  }
+                  className="accent-(--primary)"
+                />
+                <span>接收消息通知</span>
+              </label>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                关闭后不再弹出系统通知,但托盘图标的未读红点仍会出现。
+              </p>
+
+              <label className="mt-4 flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  disabled={!settings.notifyEnabled}
+                  checked={settings.notifySound}
+                  onChange={(e) =>
+                    void save({ ...settings, notifySound: e.target.checked }, false)
+                  }
+                  className="accent-(--primary) disabled:opacity-40"
+                />
+                <span className={settings.notifyEnabled ? "" : "opacity-40"}>提示音</span>
+              </label>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                Windows 下的提示音可能由系统通知设置控制。
+              </p>
+
+              <label className="mt-4 flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  disabled={!settings.notifyEnabled}
+                  checked={settings.notifyShowPreview}
+                  onChange={(e) =>
+                    void save({ ...settings, notifyShowPreview: e.target.checked }, false)
+                  }
+                  className="accent-(--primary) disabled:opacity-40"
+                />
+                <span className={settings.notifyEnabled ? "" : "opacity-40"}>
+                  显示消息内容
+                </span>
+              </label>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                关闭后通知只显示「发来一条新消息」,适合投屏或共享桌面时使用。
+              </p>
+
+              <p className="mt-6 text-xs text-muted-foreground">
+                单个会话的免打扰在聊天窗口右上角的铃铛按钮里设置。
+              </p>
+            </>
           )}
 
           {activeTab === "transfer" && (

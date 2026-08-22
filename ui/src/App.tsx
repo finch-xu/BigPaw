@@ -69,6 +69,7 @@ export default function App() {
         st().setIpmsg(await invoke<{ available: boolean; enabled: boolean }>("ipmsg_status"));
         await st().loadConversations(); // 消息视图数据源(M7b)
         await st().loadGroups(); // 已加入的群(M7c)
+        await st().loadMuted(); // 会话静音清单(M8)
         // 静默检查更新:dev 构建版本号恒为 tauri.conf.json 里的值,检查只会误报,跳过
         if (!import.meta.env.DEV) {
           updateTimer = setTimeout(() => void checkForUpdate({ silent: true }), UPDATE_CHECK_DELAY_MS);
