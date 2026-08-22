@@ -6,7 +6,11 @@
 
 use bigpaw_core::settings::Settings;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tauri::image::Image;
+use tauri::{AppHandle, Manager};
+use tauri_plugin_notification::NotificationExt;
 
 /// 同一会话两次系统通知之间的最小间隔:对端连发时不刷屏。
 pub const NOTIFY_THROTTLE: Duration = Duration::from_secs(5);
@@ -202,6 +206,133 @@ impl NotifyState {
 impl Default for NotifyState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 通知正文的最大字符数。按字符而非字节截断,避免切断多字节 UTF-8 序列。
+const PREVIEW_MAX_CHARS: usize = 100;
+
+/// 提示音音名。插件的 `sound` 是「显式指定音源」而非开关:
+/// macOS / Linux 不设置即静音;Windows 的默认 toast 自带声音,故不设置。
+fn sound_name() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some("Ping")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some("message-new-instant")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 提醒子系统的副作用层:把 NotifyState 的结论落到系统通知与托盘图标上。
+/// Clone 出来的实例共享同一份状态(Arc),供事件泵线程与命令各持一份。
+#[derive(Clone)]
+pub struct Notifier(Arc<Inner>);
+
+struct Inner {
+    app: AppHandle,
+    tray_normal: Image<'static>,
+    tray_unread: Image<'static>,
+    /// 设置缓存:避免每条消息都去读一次 settings.json。
+    /// 唯一的一致性纪律点——set_settings / set_conversation_muted 落盘后必须
+    /// 调 reload_settings 刷新它。
+    settings: RwLock<Settings>,
+    state: Mutex<NotifyState>,
+}
+
+impl Notifier {
+    pub fn new(app: &AppHandle, settings: Settings) -> Self {
+        let icon = app
+            .default_window_icon()
+            .expect("tauri.conf.json 的 bundle.icon 保证窗口图标必然存在");
+        let (w, h) = (icon.width(), icon.height());
+        // 先在借用态取 rgba 作画,再把素面版转成 'static 存起来:
+        // Image::rgba(&'a self) 要求 &'a Image<'a>,对 Image<'static> 反而调不动。
+        let unread_rgba = paint_unread_dot(icon.rgba(), w, h);
+        Self(Arc::new(Inner {
+            app: app.clone(),
+            tray_normal: icon.clone().to_owned(),
+            tray_unread: Image::new_owned(unread_rgba, w, h),
+            settings: RwLock::new(settings),
+            state: Mutex::new(NotifyState::new()),
+        }))
+    }
+
+    pub fn reload_settings(&self, s: &Settings) {
+        if let Ok(mut g) = self.0.settings.write() {
+            *g = s.clone();
+        }
+    }
+
+    /// 窗口是否真的在用户眼前:可见且聚焦才算。
+    fn window_focused(&self) -> bool {
+        self.0
+            .app
+            .get_webview_window("main")
+            .map(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    fn apply_tray(&self, unread: Option<bool>) {
+        let Some(unread) = unread else { return };
+        let Some(tray) = self.0.app.tray_by_id("main") else { return };
+        let icon = if unread {
+            self.0.tray_unread.clone()
+        } else {
+            self.0.tray_normal.clone()
+        };
+        let _ = tray.set_icon(Some(icon));
+    }
+
+    /// 一条入站消息/文件到达。`preview` 是带内容的正文,`fallback` 是
+    /// 关闭「显示消息内容」后使用的替代文案。
+    pub fn on_incoming(&self, conv_id: &str, title: String, preview: String, fallback: &str) {
+        let Ok(settings) = self.0.settings.read() else { return };
+        let settings = settings.clone();
+        let focused = self.window_focused();
+        let outcome = {
+            let Ok(mut st) = self.0.state.lock() else { return };
+            st.on_incoming(conv_id, &settings, focused, Instant::now())
+        };
+        self.apply_tray(outcome.tray);
+        if !outcome.notify {
+            return;
+        }
+        let body = if settings.notify_show_preview {
+            preview.chars().take(PREVIEW_MAX_CHARS).collect::<String>()
+        } else {
+            fallback.to_string()
+        };
+        let mut builder = self.0.app.notification().builder().title(title).body(body);
+        if settings.notify_sound {
+            if let Some(s) = sound_name() {
+                builder = builder.sound(s);
+            }
+        }
+        // 通知失败(Linux 无 notify daemon、macOS 未授权等)一律吞掉:
+        // 提醒不能拖累消息接收链路。
+        let _ = builder.show();
+    }
+
+    pub fn set_active(&self, conv_id: Option<String>) {
+        let outcome = {
+            let Ok(mut st) = self.0.state.lock() else { return };
+            st.set_active(conv_id)
+        };
+        self.apply_tray(outcome.tray);
+    }
+
+    pub fn clear_unread(&self, conv_id: Option<&str>) {
+        let outcome = {
+            let Ok(mut st) = self.0.state.lock() else { return };
+            st.clear_unread(conv_id)
+        };
+        self.apply_tray(outcome.tray);
     }
 }
 

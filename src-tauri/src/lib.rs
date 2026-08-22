@@ -30,6 +30,41 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+/// 会话标题:群聊取群名,单聊取对端昵称;都查不到时回退 id 前 8 位
+/// ——与前端 ConversationList 的 `fp.slice(0, 8)` 行为保持一致。
+fn conv_title(app: &AppHandle, conv_id: &str) -> String {
+    let Some(core) = app.try_state::<AppCore>() else {
+        return conv_id.chars().take(8).collect();
+    };
+    if let Some(g) = core.0.list_groups().into_iter().find(|g| g.group_id == conv_id) {
+        return g.name;
+    }
+    core.0
+        .roster_snapshot()
+        .into_iter()
+        .find(|p| p.fingerprint == conv_id)
+        .map(|p| p.nickname)
+        .unwrap_or_else(|| conv_id.chars().take(8).collect())
+}
+
+/// 群成员昵称反查:优先用群成员表里记录的昵称,退回 roster,再退回指纹前 8 位。
+fn member_nick(app: &AppHandle, group_id: &str, sender_fp: &str) -> String {
+    let Some(core) = app.try_state::<AppCore>() else {
+        return sender_fp.chars().take(8).collect();
+    };
+    if let Some(g) = core.0.list_groups().into_iter().find(|g| g.group_id == group_id) {
+        if let Some(m) = g.members.into_iter().find(|m| m.fp == sender_fp) {
+            return m.nick;
+        }
+    }
+    core.0
+        .roster_snapshot()
+        .into_iter()
+        .find(|p| p.fingerprint == sender_fp)
+        .map(|p| p.nickname)
+        .unwrap_or_else(|| sender_fp.chars().take(8).collect())
+}
+
 /// dev 裸二进制(`cargo tauri dev`)没有 .app bundle 图标:Tauri 只在启动
 /// Ready 时运行时设置一次 Dock 图标,而 Accessory→Regular 重新入 Dock 后
 /// 该图标丢失,macOS 回退为通用可执行文件("控制台")图标。切回 Regular 后
@@ -385,6 +420,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
@@ -403,6 +439,15 @@ pub fn run() {
                 nickname: None,
             })?;
 
+            // 提醒子系统(M8):必须在事件泵线程之前建好,线程要 clone 一份进去。
+            // 注意:上面的局部变量 data_dir 已经把文件顶部同名的 data_dir() 辅助
+            // 函数遮蔽掉了(且其值已 move 进 CoreConfig),这里直接重新问一次
+            // app.path().app_data_dir() 取路径,不能指望调用那个函数。
+            let notifier = notify::Notifier::new(
+                app.handle(),
+                settings::load(&app.path().app_data_dir()?),
+            );
+
             let mut rx = core.subscribe();
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -416,10 +461,24 @@ pub fn run() {
 
             if let Some(events_rx) = core.take_events() {
                 let handle = app.handle().clone();
+                let notifier_ev = notifier.clone();
                 std::thread::spawn(move || {
                     while let Ok(ev) = events_rx.recv() {
                         match ev {
                             TransportEvent::Message(ev) => {
+                                let conv_id = ev.peer_fp.clone();
+                                let title = conv_title(&handle, &conv_id);
+                                let preview = match &ev.sender_fp {
+                                    // 群消息:正文前缀发送者昵称
+                                    Some(sfp) => format!("{}: {}", member_nick(&handle, &conv_id, sfp), ev.body),
+                                    None => ev.body.clone(),
+                                };
+                                let fallback = if ev.sender_fp.is_some() {
+                                    "群里有新消息"
+                                } else {
+                                    "发来一条新消息"
+                                };
+                                notifier_ev.on_incoming(&conv_id, title, preview, fallback);
                                 let _ = handle.emit(
                                     "message://received",
                                     MessageDto {
@@ -438,6 +497,13 @@ pub fn run() {
                                 size,
                                 is_dir,
                             } => {
+                                let title = conv_title(&handle, &peer_fp);
+                                let preview = if is_dir {
+                                    format!("发来文件夹:{name}")
+                                } else {
+                                    format!("发来文件:{name}")
+                                };
+                                notifier_ev.on_incoming(&peer_fp, title, preview, "发来一个文件");
                                 let _ = handle.emit(
                                     "file://offered",
                                     FileOfferedDto {
@@ -516,6 +582,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            app.manage(notifier);
             app.manage(AppCore(core));
             Ok(())
         })
