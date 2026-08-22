@@ -1,3 +1,5 @@
+mod notify;
+
 use bigpaw_core::core::{Core, CoreConfig};
 use bigpaw_core::roster::Peer;
 use bigpaw_core::net_scope::NetScope;
