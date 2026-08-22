@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "BigPaw",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "identifier": "com.bigpaw.app",
   "build": {
     "beforeDevCommand": "pnpm -C ../ui dev",
