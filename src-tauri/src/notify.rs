@@ -66,6 +66,41 @@ pub fn decide(i: DecideInput<'_>) -> Decision {
     Decision { notify: true, mark_unread: true }
 }
 
+/// 在图标右上角画一个带白边的实心红点,返回新的 RGBA 缓冲(长度与入参一致)。
+///
+/// 白边的作用:菜单栏/任务栏的底色深浅不定,纯红圆点在深色背景上会糊成一团,
+/// 一圈 1.5px 的白边能让它在任何底色上都保持可辨认。
+pub fn paint_unread_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    if width == 0 || height == 0 {
+        return out;
+    }
+    let radius = (width.min(height) as f32 * 0.28).max(3.0);
+    let cx = width as f32 - radius - 1.0;
+    let cy = radius + 1.0;
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist > radius {
+                continue;
+            }
+            let idx = ((y * width + x) * 4) as usize;
+            let (r, g, b) = if dist > radius - 1.5 {
+                (255, 255, 255) // 外圈白边
+            } else {
+                (229, 57, 53) // Material Red 600,与前端 destructive 色接近
+            };
+            out[idx] = r;
+            out[idx + 1] = g;
+            out[idx + 2] = b;
+            out[idx + 3] = 255;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +212,36 @@ mod tests {
         let mut i = input("abc", &s, now);
         i.last_notify = Some(last);
         assert_eq!(decide(i), Decision { notify: true, mark_unread: true });
+    }
+
+    /// 构造一张全透明的测试图,便于断言「只有红点区域被改动」。
+    fn blank(w: u32, h: u32) -> Vec<u8> {
+        vec![0u8; (w * h * 4) as usize]
+    }
+
+    fn px(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]
+    }
+
+    #[test]
+    fn dot_preserves_buffer_size() {
+        let out = paint_unread_dot(&blank(32, 32), 32, 32);
+        assert_eq!(out.len(), 32 * 32 * 4);
+    }
+
+    #[test]
+    fn dot_paints_top_right_corner_red() {
+        let out = paint_unread_dot(&blank(32, 32), 32, 32);
+        // 红点圆心在右上角:半径 ≈ 32*0.28 ≈ 9,圆心 ≈ (32-9-1, 9+1) = (22, 10)
+        let [r, g, b, a] = px(&out, 32, 22, 10);
+        assert_eq!(a, 255, "红点必须不透明");
+        assert!(r > 180 && g < 100 && b < 100, "圆心应为红色,实际 {r},{g},{b}");
+    }
+
+    #[test]
+    fn dot_leaves_bottom_left_untouched() {
+        let out = paint_unread_dot(&blank(32, 32), 32, 32);
+        assert_eq!(px(&out, 32, 2, 29), [0, 0, 0, 0], "左下角不该被改动");
     }
 }
