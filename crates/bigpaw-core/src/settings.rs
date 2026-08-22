@@ -75,6 +75,11 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        // 这里**故意**穷举全部字段、不写 `..Settings::default()`:它是一根绊线。
+        // 新增字段时本测试会编译失败,提醒开发者回头检查所有消费点
+        // (Core::apply_settings、壳层命令、Notifier 的设置缓存、前端 Settings
+        // 接口与设置页)。本文件其余测试保持 spread 写法,只有这一处担此职责,
+        // 所以**不要**给它补 spread。
         let s = Settings {
             nickname: Some("大脚猫".to_string()),
             group: None,
@@ -82,7 +87,10 @@ mod tests {
             ipmsg_enabled: false,
             excluded_interfaces: Vec::new(),
             allowed_networks: Vec::new(),
-            ..Settings::default()
+            notify_enabled: false,
+            notify_sound: false,
+            notify_show_preview: false,
+            muted_conversations: vec!["abc123".to_string()],
         };
         save(dir.path(), &s).unwrap();
         assert_eq!(load(dir.path()), s);
