@@ -187,6 +187,22 @@ impl NotifyState {
         }
     }
 
+    /// 窗口获得焦点:此刻用户眼前的就是 active 会话,把它的未读清掉。
+    ///
+    /// 这是「窗口隐藏期间 active 会话来消息 → 红点亮起」之后唯一的清除边:
+    /// 用户回到窗口时该会话本来就是选中的,前端不会再发一次 set_active,
+    /// 缺了这条边红点会永久卡红,而会话列表却一个角标都没有(前端因
+    /// 会话 == selectedFp 跳过了自增),用户没有任何地方可以消掉它。
+    ///
+    /// active 为 None(还没打开过任何会话)时什么都不做——**绝不能**退化成
+    /// `clear_unread(None)`,那会把其他会话的未读一并抹掉。
+    pub fn on_window_focused(&mut self) -> Outcome {
+        let Some(active) = self.active.clone() else {
+            return Outcome { notify: false, tray: None };
+        };
+        self.clear_unread(Some(&active))
+    }
+
     /// 清未读:Some(id) = 单个会话,None = 全部。
     pub fn clear_unread(&mut self, conv_id: Option<&str>) -> Outcome {
         let was_empty = self.unread.is_empty();
@@ -339,6 +355,18 @@ impl Notifier {
         };
         self.apply_tray(outcome.tray);
     }
+
+    /// 窗口获得焦点:由 lib.rs 的 `WindowEvent::Focused(true)` 驱动。
+    /// 焦点只在 Rust 侧消费,前端不再上报一遍(设计 §11 的约束是「前端不额外
+    /// 上报焦点」,不是「Rust 侧不响应焦点事件」)。
+    pub fn on_window_focused(&self) {
+        // 与其他入口同一纪律:锁在内层块里用完即放,不跨 apply_tray 的主线程往返。
+        let outcome = {
+            let Ok(mut st) = self.0.state.lock() else { return };
+            st.on_window_focused()
+        };
+        self.apply_tray(outcome.tray);
+    }
 }
 
 #[cfg(test)]
@@ -370,12 +398,30 @@ mod tests {
     }
 
     #[test]
-    fn mute_wins_over_everything_else() {
-        // 静音 + 窗口隐藏 + 通知全局开启 → 仍然什么都不做,连红点都不点
+    fn mute_wins_over_global_switch_off() {
+        // 顺序回归测试:规则 1(静音)必须先于规则 3(全局关闭)判定。
+        // 把静音判断挪到规则 3 之后,这里会先命中规则 3 返回 mark_unread = true,
+        // 给一个已静音的会话点亮托盘红点——违反规则 1「静音会话不参与全局红点」。
+        // 断言的关键是 mark_unread == false,而不是 notify == false(后者两种
+        // 顺序下都成立,验不出优先级)。
         let mut s = settings();
         s.muted_conversations = vec!["abc".to_string()];
-        let mut i = input("abc", &s, Instant::now());
-        i.window_focused = false;
+        s.notify_enabled = false;
+        assert_eq!(
+            decide(input("abc", &s, Instant::now())),
+            Decision { notify: false, mark_unread: false }
+        );
+    }
+
+    #[test]
+    fn mute_wins_over_throttle() {
+        // 顺序回归测试:规则 1(静音)必须先于规则 4(节流)判定。
+        // 若静音排在节流之后,节流分支会先返回 mark_unread = true,同样点亮红点。
+        let mut s = settings();
+        s.muted_conversations = vec!["abc".to_string()];
+        let last = Instant::now();
+        let mut i = input("abc", &s, last + Duration::from_secs(1));
+        i.last_notify = Some(last);
         assert_eq!(decide(i), Decision { notify: false, mark_unread: false });
     }
 
@@ -542,6 +588,59 @@ mod tests {
         st.on_incoming("b", &s, false, t);
         let o = st.clear_unread(None);
         assert_eq!(o.tray, Some(false));
+    }
+
+    #[test]
+    fn state_feeds_active_conversation_into_decide() {
+        // 连线回归测试:on_incoming 必须把 self.active 喂给 decide。
+        // 若那里退化成 active_conv: None,规则 2 永远不触发,本例会弹通知并点红点。
+        let s = settings();
+        let mut st = NotifyState::new();
+        st.set_active(Some("a".to_string()));
+        let o = st.on_incoming("a", &s, true, Instant::now());
+        assert!(!o.notify, "窗口聚焦且正是 active 会话 → 不该弹通知");
+        assert_eq!(o.tray, None, "同上,也不该点亮托盘红点");
+    }
+
+    #[test]
+    fn window_focus_clears_active_conversation_unread() {
+        // 主场景回归:窗口隐藏期间 active 会话来消息 → 红点亮;用户切回窗口
+        // (该会话本来就是选中的,前端不会再发 set_active)→ 红点必须熄灭。
+        let s = settings();
+        let mut st = NotifyState::new();
+        st.set_active(Some("a".to_string()));
+        let o = st.on_incoming("a", &s, false, Instant::now());
+        assert_eq!(o.tray, Some(true), "窗口不可见 → 该点亮红点");
+        let o = st.on_window_focused();
+        assert!(st.unread.is_empty(), "active 会话的未读应被清空");
+        assert_eq!(o.tray, Some(false), "唯一的未读被清掉 → 托盘熄灭");
+    }
+
+    #[test]
+    fn window_focus_keeps_other_conversations_unread() {
+        // 只清 active 自己那一个:别的会话仍未读,托盘继续亮红。
+        let s = settings();
+        let mut st = NotifyState::new();
+        st.set_active(Some("a".to_string()));
+        let t = Instant::now();
+        st.on_incoming("a", &s, false, t);
+        st.on_incoming("b", &s, false, t);
+        let o = st.on_window_focused();
+        assert_eq!(o.tray, None, "b 仍未读,托盘保持红点");
+        assert!(!st.unread.contains("a"));
+        assert!(st.unread.contains("b"));
+    }
+
+    #[test]
+    fn window_focus_without_active_keeps_all_unread() {
+        // active 为 None 时必须什么都不做:一旦退化成 clear_unread(None),
+        // 用户只是切回窗口就会把所有会话的未读一起抹掉。
+        let s = settings();
+        let mut st = NotifyState::new();
+        st.on_incoming("a", &s, false, Instant::now());
+        let o = st.on_window_focused();
+        assert_eq!(o.tray, None);
+        assert!(st.unread.contains("a"), "尚未打开任何会话时不该清未读");
     }
 
     #[test]

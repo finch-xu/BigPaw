@@ -366,10 +366,16 @@ fn set_conversation_muted(
     let mut s = settings::load(&data_dir(&app));
     s.muted_conversations.retain(|c| c != &conv_id);
     if muted {
-        s.muted_conversations.push(conv_id);
+        s.muted_conversations.push(conv_id.clone());
     }
     settings::save(&data_dir(&app), &s).map_err(|e| e.to_string())?;
     notifier.reload_settings(&s);
+    // 规则 1「静音会话不参与全局红点」是个状态断言,不只是对后续消息的过滤:
+    // 刚被静音的会话可能还挂在未读集合里,不摘掉的话托盘会继续为一个
+    // 已经不该提醒的会话亮红。
+    if muted {
+        notifier.clear_unread(Some(&conv_id));
+    }
     Ok(())
 }
 
@@ -456,8 +462,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 // macOS:关窗即切成 Accessory(菜单栏应用),Dock 图标消失
                 #[cfg(target_os = "macos")]
@@ -466,6 +472,17 @@ pub fn run() {
                     .set_activation_policy(tauri::ActivationPolicy::Accessory);
                 api.prevent_close(); // 阻止真正关闭 → 应用继续后台运行
             }
+            // 窗口获得焦点(M8):用户此刻看到的就是 active 会话,清掉它的未读。
+            // 少了这条边,「隐藏窗口 → active 会话来消息 → 点回窗口读完」之后
+            // 托盘红点会永久卡住:该会话本来就是选中的,前端不会再发 set_active。
+            // 必须走窗口事件而不是只在 show_main_window 里做——否则 alt-tab、
+            // 直接点击窗口这些不经过托盘/Dock 的获得焦点方式全都漏掉。
+            tauri::WindowEvent::Focused(true) if window.label() == "main" => {
+                if let Some(n) = window.app_handle().try_state::<notify::Notifier>() {
+                    n.on_window_focused();
+                }
+            }
+            _ => {}
         })
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -482,6 +499,41 @@ pub fn run() {
                 app.handle(),
                 settings::load(&app.path().app_data_dir()?),
             );
+
+            // 系统托盘 / macOS 菜单栏:关窗后应用常驻此处,并提供唯一的"退出"入口。
+            //
+            // **必须建在任何会往 Notifier 里灌事件的线程之前**:apply_tray 在
+            // tray_by_id("main") 取不到托盘时直接 return,若有消息落在「事件泵
+            // 已在跑、托盘还没 build」的窗口里,未读会被记上但「空→非空」这条
+            // 跃迁被丢弃;此后集合恒为非空,tray_transition 永远返回 None,
+            // 图标余生都不会再变红。
+            // 提前建没有代价:托盘只依赖 app 与 default_window_icon,不依赖
+            // core / notifier 的 manage,菜单事件也都是运行时才回调。
+            let show_i = MenuItem::with_id(app, "show", "显示 BigPaw", true, None::<&str>)?;
+            let sep = PredefinedMenuItem::separator(app)?;
+            let quit_i = MenuItem::with_id(app, "quit", "退出 BigPaw", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_i, &sep, &quit_i])?;
+
+            TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false) // 左键=显示窗口,右键=弹菜单(桌面 IM 常见范式)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => app.exit(0), // 真正退出:触发 ExitRequested → core.shutdown()
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
 
             let mut rx = core.subscribe();
             let handle = app.handle().clone();
@@ -523,8 +575,11 @@ pub fn run() {
                                         sender_fp: ev.sender_fp,
                                     },
                                 );
-                                // 提醒放在 emit 之后:builder.show() 在 Linux 上是一次同步
-                                // D-Bus 往返,通知守护进程卡住时不能让前端也跟着收不到消息。
+                                // 提醒一律排在 emit 之后:设计文档的头号铁律是
+                                // 「提醒失败绝不影响消息接收链路」,所以提醒路径上
+                                // 任何耗时或故障都不该挡在前端拿到消息之前。这条顺序
+                                // 与通知插件当下是同步还是异步实现无关——它守的是
+                                // 铁律本身,插件换实现、或提醒路径 panic 时同样成立。
                                 notifier_ev.on_incoming(&conv_id, title, preview, fallback);
                             }
                             TransportEvent::FileOffered {
@@ -553,8 +608,11 @@ pub fn run() {
                                         is_dir,
                                     },
                                 );
-                                // 提醒放在 emit 之后:builder.show() 在 Linux 上是一次同步
-                                // D-Bus 往返,通知守护进程卡住时不能让前端也跟着收不到消息。
+                                // 提醒一律排在 emit 之后:设计文档的头号铁律是
+                                // 「提醒失败绝不影响消息接收链路」,所以提醒路径上
+                                // 任何耗时或故障都不该挡在前端拿到消息之前。这条顺序
+                                // 与通知插件当下是同步还是异步实现无关——它守的是
+                                // 铁律本身,插件换实现、或提醒路径 panic 时同样成立。
                                 notifier_ev.on_incoming(&conv_id, title, preview, "发来一个文件");
                             }
                             TransportEvent::FileProgress {
@@ -596,33 +654,6 @@ pub fn run() {
                     }
                 });
             }
-
-            // 系统托盘 / macOS 菜单栏:关窗后应用常驻此处,并提供唯一的"退出"入口
-            let show_i = MenuItem::with_id(app, "show", "显示 BigPaw", true, None::<&str>)?;
-            let sep = PredefinedMenuItem::separator(app)?;
-            let quit_i = MenuItem::with_id(app, "quit", "退出 BigPaw", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &sep, &quit_i])?;
-
-            TrayIconBuilder::with_id("main")
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(false) // 左键=显示窗口,右键=弹菜单(桌面 IM 常见范式)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0), // 真正退出:触发 ExitRequested → core.shutdown()
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_main_window(tray.app_handle());
-                    }
-                })
-                .build(app)?;
 
             app.manage(notifier);
             app.manage(AppCore(core));
