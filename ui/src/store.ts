@@ -89,6 +89,14 @@ export interface Settings {
   excludedInterfaces: string[];
   /** 允许的对端网段清单(网络范围限定):每项单 IP / CIDR / 起-止区间;空 = 不限制 */
   allowedNetworks: string[];
+  /** 全局通知开关(M8) */
+  notifyEnabled: boolean;
+  /** 提示音开关(M8) */
+  notifySound: boolean;
+  /** 通知是否显示消息内容(M8) */
+  notifyShowPreview: boolean;
+  /** 已静音的会话 id(M8) */
+  mutedConversations: string[];
 }
 
 /** 与后端 `list_network_interfaces` 返回的 IfaceDto 一一对应。 */
@@ -98,6 +106,22 @@ export interface NetIface {
   netmask: string;
   isVirtual: boolean;
   excluded: boolean;
+}
+
+/** Tauri 环境检测。刻意不从 ./mock 导入:mock.ts 反过来 import 本文件,
+ *  引入循环依赖不值当——这是个一行常量。 */
+const IS_TAURI = "__TAURI_INTERNALS__" in window;
+
+/** 通知壳层「这个会话的未读清了」。托盘红点由壳层独立维护,三个清零入口
+ *  (打开会话 / 清空单会话 / 清空全部)都必须经过这里,否则红点会和
+ *  列表数字分叉。null = 全部清空。 */
+async function tellShellUnreadCleared(convId: string | null): Promise<void> {
+  if (!IS_TAURI) return;
+  try {
+    await invoke("notify_clear_unread", { convId });
+  } catch {
+    // 清红点失败不该阻断 UI:最坏是红点多亮一会儿,下次打开会话会再清一次
+  }
 }
 
 const PAGE = 50;
@@ -126,6 +150,8 @@ interface AppState {
   convSummaries: Record<string, ConvSummary>;
   /** 未读计数(内存态,重启清零):仅非当前选中会话的入站消息/文件计数 */
   unread: Record<string, number>;
+  /** 已静音的会话 id(M8):启动拉取一次,切换时先落盘再改 UI */
+  mutedConvs: string[];
   /** 已加入的群(M7c):启动拉取 + group://updated 全量替换 */
   groups: Group[];
   /** 建群面板开关(M7c) */
@@ -159,6 +185,8 @@ interface AppState {
   runSearch: (q: string) => Promise<void>;
   clearConversation: (fp: string) => Promise<void>;
   clearAll: () => Promise<void>;
+  loadMuted: () => Promise<void>;
+  toggleMute: (convId: string) => Promise<void>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -168,6 +196,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   conversations: {},
   convSummaries: {},
   unread: {},
+  mutedConvs: [],
   groups: [],
   showCreateGroup: false,
   ipmsg: null,
@@ -204,6 +233,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       highlightTs: null,
       unread: { ...s.unread, [fp]: 0 },
     }));
+    if (IS_TAURI) {
+      // set_active 本身就含「该会话已读」语义,不必再调 clear_unread
+      void invoke("notify_set_active", { convId: fp }).catch(() => {});
+    }
     if (get().conversations[fp]?.loaded) return;
     const items = await invoke<TimelineItem[]>("get_history", {
       fingerprint: fp,
@@ -337,6 +370,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   clearConversation: async (fp) => {
     await invoke("clear_history", { fingerprint: fp }); // 后端删成功才清 UI
+    await tellShellUnreadCleared(fp);
     set((s) => {
       const { [fp]: _dropped, ...restSummaries } = s.convSummaries;
       const { [fp]: _droppedUnread, ...restUnread } = s.unread;
@@ -353,6 +387,26 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   clearAll: async () => {
     await invoke("clear_history", {});
+    await tellShellUnreadCleared(null);
     set({ conversations: {}, searchHits: [], convSummaries: {}, unread: {} });
+  },
+
+  loadMuted: async () => {
+    if (!IS_TAURI) return;
+    const s = await invoke<Settings>("get_settings");
+    set({ mutedConvs: s.mutedConversations });
+  },
+
+  toggleMute: async (convId) => {
+    const muted = !get().mutedConvs.includes(convId);
+    if (IS_TAURI) {
+      // 先落盘再改 UI:失败时 UI 不会显示一个其实没保存上的状态
+      await invoke("set_conversation_muted", { convId, muted });
+    }
+    set((s) => ({
+      mutedConvs: muted
+        ? [...s.mutedConvs, convId]
+        : s.mutedConvs.filter((c) => c !== convId),
+    }));
   },
 }));

@@ -335,6 +335,41 @@ fn set_settings(app: AppHandle, core: State<'_, AppCore>, value: Settings) -> Re
     NetScope::parse(&value.allowed_networks).map_err(|e| e.to_string())?;
     settings::save(&data_dir(&app), &value).map_err(|e| e.to_string())?;
     core.0.apply_settings(&value);
+    // 设置缓存必须跟着落盘一起更新,否则通知开关改了要等重启才生效
+    if let Some(n) = app.try_state::<notify::Notifier>() {
+        n.reload_settings(&value);
+    }
+    Ok(())
+}
+
+/// 前端切换会话时上报当前会话(M8)。顺带把该会话移出未读集合。
+#[tauri::command]
+fn notify_set_active(notifier: State<'_, notify::Notifier>, conv_id: Option<String>) {
+    notifier.set_active(conv_id);
+}
+
+/// 清未读(M8):None = 全部。供前端 clearConversation / clearAll 调用,
+/// 保证托盘红点与会话列表数字不分叉。
+#[tauri::command]
+fn notify_clear_unread(notifier: State<'_, notify::Notifier>, conv_id: Option<String>) {
+    notifier.clear_unread(conv_id.as_deref());
+}
+
+/// 会话静音开关(M8):落盘后立刻刷新 Notifier 的设置缓存。
+#[tauri::command]
+fn set_conversation_muted(
+    app: AppHandle,
+    notifier: State<'_, notify::Notifier>,
+    conv_id: String,
+    muted: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&data_dir(&app));
+    s.muted_conversations.retain(|c| c != &conv_id);
+    if muted {
+        s.muted_conversations.push(conv_id);
+    }
+    settings::save(&data_dir(&app), &s).map_err(|e| e.to_string())?;
+    notifier.reload_settings(&s);
     Ok(())
 }
 
@@ -615,7 +650,10 @@ pub fn run() {
             get_settings,
             set_settings,
             list_network_interfaces,
-            validate_allowed_networks
+            validate_allowed_networks,
+            notify_set_active,
+            notify_clear_unread,
+            set_conversation_muted
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

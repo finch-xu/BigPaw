@@ -13,6 +13,10 @@ const MOCK_SETTINGS: Settings = {
   ipmsgEnabled: true,
   excludedInterfaces: [],
   allowedNetworks: [],
+  notifyEnabled: true,
+  notifySound: true,
+  notifyShowPreview: true,
+  mutedConversations: [],
 };
 
 /** 前端轻校验(只拦明显错误,权威校验在后端 validate_allowed_networks):
