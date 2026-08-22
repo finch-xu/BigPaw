@@ -5,6 +5,7 @@
 //! 发通知与换图标。GUI 特性通常最难测,这条分界线是本模块可测性的来源。
 
 use bigpaw_core::settings::Settings;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// 同一会话两次系统通知之间的最小间隔:对端连发时不刷屏。
@@ -104,6 +105,104 @@ pub fn paint_unread_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// 状态机对一次输入的处理结论。
+#[derive(Debug, PartialEq, Eq)]
+pub struct Outcome {
+    /// 是否要弹系统通知
+    pub notify: bool,
+    /// 托盘图标是否需要变更:Some(true)=红点版,Some(false)=素面版,None=不动。
+    /// 只在未读集合空↔非空的跃迁时刻才是 Some。
+    pub tray: Option<bool>,
+}
+
+/// 提醒子系统的纯状态机:不持有 AppHandle,不做任何 IO。
+pub struct NotifyState {
+    active: Option<String>,
+    unread: HashSet<String>,
+    last_notify: HashMap<String, Instant>,
+}
+
+impl NotifyState {
+    pub fn new() -> Self {
+        Self {
+            active: None,
+            unread: HashSet::new(),
+            last_notify: HashMap::new(),
+        }
+    }
+
+    /// 未读集合发生变化后,算出托盘要不要换图标。
+    fn tray_transition(was_empty: bool, is_empty: bool) -> Option<bool> {
+        if was_empty == is_empty {
+            None
+        } else {
+            Some(!is_empty)
+        }
+    }
+
+    pub fn on_incoming(
+        &mut self,
+        conv_id: &str,
+        settings: &Settings,
+        window_focused: bool,
+        now: Instant,
+    ) -> Outcome {
+        let d = decide(DecideInput {
+            conv_id,
+            settings,
+            window_focused,
+            active_conv: self.active.as_deref(),
+            last_notify: self.last_notify.get(conv_id).copied(),
+            now,
+        });
+        let was_empty = self.unread.is_empty();
+        if d.mark_unread {
+            self.unread.insert(conv_id.to_string());
+        }
+        if d.notify {
+            self.last_notify.insert(conv_id.to_string(), now);
+        }
+        Outcome {
+            notify: d.notify,
+            tray: Self::tray_transition(was_empty, self.unread.is_empty()),
+        }
+    }
+
+    /// 前端切换会话时上报。Some(id) 顺带把该会话移出未读集合。
+    pub fn set_active(&mut self, conv_id: Option<String>) -> Outcome {
+        let was_empty = self.unread.is_empty();
+        if let Some(id) = &conv_id {
+            self.unread.remove(id);
+        }
+        self.active = conv_id;
+        Outcome {
+            notify: false,
+            tray: Self::tray_transition(was_empty, self.unread.is_empty()),
+        }
+    }
+
+    /// 清未读:Some(id) = 单个会话,None = 全部。
+    pub fn clear_unread(&mut self, conv_id: Option<&str>) -> Outcome {
+        let was_empty = self.unread.is_empty();
+        match conv_id {
+            Some(id) => {
+                self.unread.remove(id);
+            }
+            None => self.unread.clear(),
+        }
+        Outcome {
+            notify: false,
+            tray: Self::tray_transition(was_empty, self.unread.is_empty()),
+        }
+    }
+}
+
+impl Default for NotifyState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +354,67 @@ mod tests {
         let tiny = vec![1u8, 2, 3, 4];
         let out = paint_unread_dot(&tiny, 32, 32);
         assert_eq!(out, tiny, "缓冲长度不足时应原样返回");
+    }
+
+    #[test]
+    fn first_unread_turns_tray_on() {
+        let s = settings();
+        let mut st = NotifyState::new();
+        let o = st.on_incoming("a", &s, false, Instant::now());
+        assert!(o.notify);
+        assert_eq!(o.tray, Some(true), "首条未读应点亮托盘");
+    }
+
+    #[test]
+    fn second_unread_does_not_touch_tray_again() {
+        let s = settings();
+        let mut st = NotifyState::new();
+        let t = Instant::now();
+        st.on_incoming("a", &s, false, t);
+        let o = st.on_incoming("b", &s, false, t);
+        assert_eq!(o.tray, None, "已是红点态,不该重复调系统 API");
+    }
+
+    #[test]
+    fn opening_the_conversation_clears_its_unread() {
+        let s = settings();
+        let mut st = NotifyState::new();
+        st.on_incoming("a", &s, false, Instant::now());
+        let o = st.set_active(Some("a".to_string()));
+        assert_eq!(o.tray, Some(false), "唯一的未读被清掉,托盘应熄灭");
+    }
+
+    #[test]
+    fn throttle_is_per_conversation() {
+        // 会话 a 刚弹过,会话 b 立刻来消息仍应弹——节流不能跨会话串味
+        let s = settings();
+        let mut st = NotifyState::new();
+        let t = Instant::now();
+        st.on_incoming("a", &s, false, t);
+        let o = st.on_incoming("b", &s, false, t);
+        assert!(o.notify, "不同会话不共享节流窗口");
+        let again = st.on_incoming("a", &s, false, t + Duration::from_secs(1));
+        assert!(!again.notify, "同会话 1 秒内不重复弹");
+    }
+
+    #[test]
+    fn clear_unread_all_turns_tray_off() {
+        let s = settings();
+        let mut st = NotifyState::new();
+        let t = Instant::now();
+        st.on_incoming("a", &s, false, t);
+        st.on_incoming("b", &s, false, t);
+        let o = st.clear_unread(None);
+        assert_eq!(o.tray, Some(false));
+    }
+
+    #[test]
+    fn muted_conversation_never_lights_the_tray() {
+        let mut s = settings();
+        s.muted_conversations = vec!["a".to_string()];
+        let mut st = NotifyState::new();
+        let o = st.on_incoming("a", &s, false, Instant::now());
+        assert!(!o.notify);
+        assert_eq!(o.tray, None, "静音会话不点亮托盘");
     }
 }
