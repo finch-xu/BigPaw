@@ -478,7 +478,6 @@ pub fn run() {
                                 } else {
                                     "发来一条新消息"
                                 };
-                                notifier_ev.on_incoming(&conv_id, title, preview, fallback);
                                 let _ = handle.emit(
                                     "message://received",
                                     MessageDto {
@@ -489,6 +488,9 @@ pub fn run() {
                                         sender_fp: ev.sender_fp,
                                     },
                                 );
+                                // 提醒放在 emit 之后:builder.show() 在 Linux 上是一次同步
+                                // D-Bus 往返,通知守护进程卡住时不能让前端也跟着收不到消息。
+                                notifier_ev.on_incoming(&conv_id, title, preview, fallback);
                             }
                             TransportEvent::FileOffered {
                                 xfer_id,
@@ -497,13 +499,15 @@ pub fn run() {
                                 size,
                                 is_dir,
                             } => {
-                                let title = conv_title(&handle, &peer_fp);
+                                // peer_fp 马上要被 emit 的 FileOfferedDto 移走,提醒要用的
+                                // 会话 id 得先克隆一份(与 Message 分支的 conv_id 同一思路)。
+                                let conv_id = peer_fp.clone();
+                                let title = conv_title(&handle, &conv_id);
                                 let preview = if is_dir {
                                     format!("发来文件夹:{name}")
                                 } else {
                                     format!("发来文件:{name}")
                                 };
-                                notifier_ev.on_incoming(&peer_fp, title, preview, "发来一个文件");
                                 let _ = handle.emit(
                                     "file://offered",
                                     FileOfferedDto {
@@ -514,6 +518,9 @@ pub fn run() {
                                         is_dir,
                                     },
                                 );
+                                // 提醒放在 emit 之后:builder.show() 在 Linux 上是一次同步
+                                // D-Bus 往返,通知守护进程卡住时不能让前端也跟着收不到消息。
+                                notifier_ev.on_incoming(&conv_id, title, preview, "发来一个文件");
                             }
                             TransportEvent::FileProgress {
                                 xfer_id,

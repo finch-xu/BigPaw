@@ -1017,8 +1017,10 @@ impl Core {
     }
 
     /// 当前已知群列表(M7c),按群名排序。
+    // 锁毒化时返回空列表而非 panic:本方法在消息接收线程上被每条入站消息调用,
+    // 一次 panic 会杀掉整条接收链路。与 settings::load 对损坏文件回退默认值同一思路。
     pub fn list_groups(&self) -> Vec<Group> {
-        self.groups.lock().expect("groups lock").list()
+        self.groups.lock().map(|g| g.list()).unwrap_or_default()
     }
 
     /// 建群(M7c):成员必须全部是 roster 里的 native 协议对端;成员表自动
@@ -2149,6 +2151,31 @@ mod tests {
         .unwrap();
         core.shutdown();
         core.shutdown(); // 第二次调用不得 panic
+    }
+
+    #[test]
+    fn list_groups_survives_poisoned_lock() {
+        // list_groups 在消息接收线程上被每条入站消息调用:锁毒化时必须降级为
+        // 空列表,绝不能把 expect() 的 panic 带进接收链路(M8 通知子系统接线
+        // 时发现,详见 core.rs list_groups 的注释)。
+        let dir = tempfile::tempdir().unwrap();
+        let core = Core::start(CoreConfig {
+            data_dir: dir.path().to_path_buf(),
+            nickname: Some("tester".to_string()),
+        })
+        .unwrap();
+
+        let groups = core.groups.clone();
+        // 另起一个线程,持锁期间 panic,毒化这把锁——join() 的 Err 分支
+        // 本身就吞掉了那次 panic,不需要额外的 catch_unwind。
+        let poisoner = std::thread::spawn(move || {
+            let _g = groups.lock().unwrap();
+            panic!("deliberately poison the groups lock for the test above");
+        });
+        assert!(poisoner.join().is_err(), "poisoner 线程应当 panic");
+
+        assert_eq!(core.list_groups(), Vec::new(), "锁毒化后应返回空列表而非 panic");
+        core.shutdown();
     }
 
     #[test]

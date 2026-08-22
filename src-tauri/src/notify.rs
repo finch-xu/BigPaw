@@ -292,8 +292,13 @@ impl Notifier {
     /// 一条入站消息/文件到达。`preview` 是带内容的正文,`fallback` 是
     /// 关闭「显示消息内容」后使用的替代文案。
     pub fn on_incoming(&self, conv_id: &str, title: String, preview: String, fallback: &str) {
-        let Ok(settings) = self.0.settings.read() else { return };
-        let settings = settings.clone();
+        // 内层块:克隆完立刻释放读锁,不让它横跨下面的窗口查询/托盘/通知 IO——
+        // 否则 Task 6 的 set_settings → reload_settings(需要 .write())会被
+        // 一次正在发送的通知卡住。
+        let settings = {
+            let Ok(g) = self.0.settings.read() else { return };
+            g.clone()
+        };
         let focused = self.window_focused();
         let outcome = {
             let Ok(mut st) = self.0.state.lock() else { return };
