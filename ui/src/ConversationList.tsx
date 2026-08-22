@@ -20,6 +20,7 @@ export default function ConversationList() {
   const groups = useAppStore((s) => s.groups);
   const convSummaries = useAppStore((s) => s.convSummaries);
   const unread = useAppStore((s) => s.unread);
+  const mutedConvs = useAppStore((s) => s.mutedConvs);
   const selectedFp = useAppStore((s) => s.selectedFp);
 
   const rows: Array<[string, { tsMs: number; snippet: string; kind: "text" | "file" }]> =
@@ -46,6 +47,7 @@ export default function ConversationList() {
         const peer = peers.find((p) => p.fingerprint === fp);
         const name = group ? group.name : (peer?.nickname ?? fp.slice(0, 8));
         const n = unread[fp] ?? 0;
+        const isMuted = mutedConvs.includes(fp);
         return (
           <li
             key={fp}
@@ -71,6 +73,13 @@ export default function ConversationList() {
                     <span className="shrink-0 rounded-md bg-border2 px-1.5 py-0.5 text-[10px] font-medium text-fg2">
                       群
                     </span>
+                  )}
+                  {isMuted && (
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0 text-muted-foreground" aria-label="已免打扰">
+                      <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+                      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+                      <line x1="3" y1="3" x2="21" y2="21" />
+                    </svg>
                   )}
                 </span>
                 <span className="shrink-0 text-[10px] text-muted-foreground">
